@@ -1996,6 +1996,20 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             if not result.kickoff:
                 _cp(_dim_line(_t("goal.continuing") if queued else _t("goal.send_to_kick")))
 
+    def _handle_goal_set_command(self, cmd: str) -> None:
+        from hermes_cli.goal_command import dispatch_goal_set_command
+
+        mgr = self._session_manager(self._get_goal_manager, _t("goal.label"))
+        if mgr is None:
+            return
+        result = dispatch_goal_set_command(
+            mgr, _command_arg(cmd), progress=lambda text: _cp(_dim_line(text)),
+        )
+        for line in result.output.splitlines():
+            _cp(f"  {line}")
+        if result.prompt:
+            self._kick_goal(result.prompt)
+
     def _kick_goal(self, prompt: str) -> bool:
         """Queue the next turn without mutating cached conversation history."""
         try:

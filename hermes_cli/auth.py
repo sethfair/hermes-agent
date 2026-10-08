@@ -1301,6 +1301,14 @@ def _explicit_env_credentials_present(normalized: str) -> bool:
             return False
     if pconfig.auth_type == "api_key":
         return any(_env_secret(v) for v in pconfig.api_key_env_vars if v not in _IMPLICIT_ENV_VARS)
+    if pconfig.auth_type == "external_process":
+        # A deliberately configured launcher is explicit even when the subprocess
+        # keeps its login in an OS keyring that Hermes cannot inspect.
+        from providers import get_provider_profile
+        from hermes_cli.config import get_env_value_prefer_dotenv as _explicit_process_env
+        profile = get_provider_profile(normalized)
+        return bool(profile and any(
+            _explicit_process_env(v) for v in profile.process_command_env_vars))
     if pconfig.auth_type == "aws_sdk":
         return _env_secret("AWS_BEARER_TOKEN_BEDROCK") or (
             _env_secret("AWS_ACCESS_KEY_ID") and _env_secret("AWS_SECRET_ACCESS_KEY"))

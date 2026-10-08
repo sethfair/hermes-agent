@@ -257,6 +257,33 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 )
 
 
+# /goal-set: unlike /goal draft, this produces a whole staged campaign and fails closed
+# when any required field is missing. No deployment/approval is implied by a drafted stage.
+DRAFT_CAMPAIGN_SYSTEM_PROMPT = (
+    "Turn the user's objective into a well-developed, actionable standing-goal campaign. "
+    "Return ONLY one JSON object with keys headline, outcome, verification, constraints, "
+    "boundaries, stop_when, quality_bar, stages. Use the user's language. "
+    "headline is a concise end-state title; outcome is the final deliverable; "
+    "verification names observable evidence and how to check it; constraints protect against "
+    "regression and unsafe action; boundaries define in-scope and out-of-scope activity; "
+    "stop_when names a genuine missing human decision/access gate and its resolver if known. "
+    "quality_bar is a testable WELL-DEVELOPED criterion for the deliverable, beyond merely "
+    "existing (e.g. coverage of happy/negative cases, independent review when material, "
+    "safety and evidence at current inputs). stages is an ordered list of 3 to 6 objects, "
+    "each with title, action, evidence. Stages should cover discovery/input validation, "
+    "work, adversarial verification, and handoff where relevant, with dependencies in order; "
+    "each evidence must be observable. Each field must be specific but concise (under 350 "
+    "characters); stage action/evidence under 180 characters. Do not invent exact paths, "
+    "commands, versions, approvals, authorities, access or facts absent the objective: "
+    "name a discovery step or a conditional gate instead. Do not add runnable shell gates. "
+    "A plan/review request must not silently authorise code, deployments or live writes. "
+    "Never substitute generic filler such as TBD, do it, or tests pass. "
+    "Example shape: {\"headline\":\"...\",\"outcome\":\"...\",\"verification\":\"...\","
+    "\"constraints\":\"...\",\"boundaries\":\"...\",\"stop_when\":\"...\","
+    "\"quality_bar\":\"...\",\"stages\":[{\"title\":\"...\",\"action\":\"...\","
+    "\"evidence\":\"...\"}, ...]}"
+)
+
 # ── Completion contract ───────────────────────────────────────────────
 
 # The five contract fields, in display order (after OpenAI Codex's "strong goal" guidance: what
@@ -1072,6 +1099,24 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
     return None if contract.is_empty() else contract
 
 
+def draft_campaign(objective: str, *, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Generate a staged /goal-set campaign; leave persistence to the validated caller."""
+    objective = (objective or "").strip()
+    if not objective:
+        return None
+    try:
+        from agent.auxiliary_client import call_llm
+        raw = _call_goal_judge_llm(
+            call_llm, DRAFT_CAMPAIGN_SYSTEM_PROMPT,
+            f"Objective:\n{_truncate(objective, 4000)}", timeout or _goal_judge_timeout(),
+        )
+        data = _extract_json_object(raw)
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        logger.info("goal-set campaign draft failed (%s)", exc)
+        return None
+
+
 # ── GoalManager — the orchestration surface CLI + gateway talk to ──────
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
@@ -1164,7 +1209,8 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None,
+            subgoals: Optional[List[str]] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1172,6 +1218,7 @@ class GoalManager:
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
+            subgoals=list(subgoals or []),
         )
         return self._save()
 

@@ -910,6 +910,23 @@ def _cmd_goal(rid, params, session, name, arg):
         return _ok(rid, payload)
 
 
+def _cmd_goal_set(rid, params, session, name, arg):
+    with _session_profile_runtime_scope(session or {}):
+        sid_key, goals, err = _session_key_or_err(rid, session, "hermes_cli.goals", "goals")
+        if err:
+            return err
+        try:
+            max_turns = int((_load_cfg().get("goals") or {}).get("max_turns", 20) or 20)
+        except Exception:
+            max_turns = 20
+        mgr = goals.GoalManager(session_id=sid_key, default_max_turns=max_turns)
+        from hermes_cli.goal_command import dispatch_goal_set_command
+        result = dispatch_goal_set_command(mgr, arg)
+        if result.error:
+            return _err(rid, 4004, result.output)
+        return _ok(rid, {"type": "send", "notice": result.output, "message": result.prompt})
+
+
 def _cmd_loop(rid, params, session, name, arg):
     sid_key, loops, err = _session_key_or_err(rid, session, "hermes_cli.loops", "loops")
     if err:
@@ -1085,7 +1102,8 @@ def _cmd_skills(rid, params, session, name, arg):
 
 _SLASH_BUILTINS = {
     "queue": _cmd_queue, "q": _cmd_queue, "learn": _cmd_learn, "plan": _cmd_plan, "init": _cmd_init,
-    "moa": _cmd_moa, "focus": _cmd_focus, "retry": _cmd_retry, "steer": _cmd_steer, "goal": _cmd_goal,
+    "moa": _cmd_moa, "focus": _cmd_focus, "retry": _cmd_retry, "steer": _cmd_steer,
+    "goal": _cmd_goal, "goal-set": _cmd_goal_set,
     "loop": _cmd_loop, "undo": _cmd_undo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
     "compress": _cmd_compress, "compact": _cmd_compress,
     "memory": _cmd_memory, "skills": _cmd_skills}

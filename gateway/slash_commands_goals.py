@@ -59,6 +59,20 @@ class GatewayGoalCommandsMixin:
             self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
         return result.output
 
+    async def _handle_goal_set_command(self, event: MessageEvent) -> str:
+        from hermes_cli.goal_command import dispatch_goal_set_command
+
+        mgr, _session_entry = await self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+        # Profile-scoped credentials and synchronous goal DB writes stay off-loop.
+        result = await self._run_in_executor_with_context(
+            lambda: dispatch_goal_set_command(mgr, event.get_command_args() or "")
+        )
+        if result.prompt:
+            self._enqueue_goal_turn(event, result.prompt, label="campaign enqueue", kickoff=True)
+        return result.output
+
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
         try:
             adapter, quick_key = self._adapter_and_key_for(event)

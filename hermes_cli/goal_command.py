@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import logging
+import re
 from typing import Callable
 
 from hermes_cli import goals
@@ -32,7 +33,10 @@ def _status(mgr, arg, render):
 
 
 def _show(mgr, arg, render):
-    return GoalCommandResult(f"{mgr.status_line()}\n{mgr.render_contract()}")
+    lines = [mgr.status_line(), mgr.render_contract()]
+    if mgr.state is not None and mgr.state.subgoals:
+        lines.extend(("Campaign stages / additional criteria:", mgr.render_subgoals()))
+    return GoalCommandResult("\n".join(lines))
 
 
 def _pause(mgr, arg, render):
@@ -170,6 +174,76 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
                    "Hermes keeps working until it is, you pause/clear it, or the budget is "
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
     return GoalCommandResult(output, goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
+
+
+def _campaign_value(value, label: str, limit: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be text")
+    text = value.strip()
+    if len(text) < 12 or len(text) > limit or re.search(r"\b(?:TBD|TODO|placeholder)\b|\.{3}", text, re.I):
+        raise ValueError(f"{label} needs specific, complete text (12–{limit} characters)")
+    return text
+
+
+def _validated_campaign(data):
+    """Deterministic well-developed *structural* bar. Semantic truth still needs review."""
+    if not isinstance(data, dict):
+        raise ValueError("model returned no structured campaign")
+    headline = _campaign_value(data.get("headline"), "headline", 180)
+    contract = goals.GoalContract(**{
+        field: _campaign_value(data.get(field), field, 350)
+        for field in ("outcome", "verification", "constraints", "boundaries", "stop_when")
+    })
+    quality = _campaign_value(data.get("quality_bar"), "well-developed criterion", 350)
+    stages = data.get("stages")
+    if not isinstance(stages, list) or not 3 <= len(stages) <= 6:
+        raise ValueError("campaign needs 3–6 ordered stages with actions and proof")
+    criteria = []
+    titles = set()
+    for index, stage in enumerate(stages, start=1):
+        if not isinstance(stage, dict):
+            raise ValueError(f"stage {index} must be an object")
+        title = _campaign_value(stage.get("title"), f"stage {index} title", 90)
+        action = _campaign_value(stage.get("action"), f"stage {index} action", 180)
+        evidence = _campaign_value(stage.get("evidence"), f"stage {index} evidence", 180)
+        if title.casefold() in titles:
+            raise ValueError(f"stage {index} duplicates a previous stage")
+        titles.add(title.casefold())
+        criteria.append(f"Stage {index} — {title}: {action} Proof: {evidence}")
+    criteria.append(f"Well-developed criterion: {quality}")
+    # The judge intentionally truncates its contract block at 2500 chars. Never
+    # silently drop the last stage or quality bar from its completion decision.
+    judge_block = contract.render_block() + "\n" + goals._render_extra_criteria(criteria)
+    if len(judge_block) > 2400:
+        raise ValueError("campaign exceeds judge context budget; shorten the stages")
+    return headline, contract, criteria
+
+
+def dispatch_goal_set_command(mgr: goals.GoalManager, prompt: str, *, progress=None) -> GoalCommandResult:
+    """Generate, validate, persist and kick a full campaign; fail closed on bad drafts."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return GoalCommandResult("Usage: /goal-set <objective in plain language>", error=True)
+    if progress is not None:
+        progress("Developing goal campaign…")
+    try:
+        headline, contract, criteria = _validated_campaign(goals.draft_campaign(prompt))
+    except (ValueError, TypeError) as exc:
+        return GoalCommandResult(f"/goal-set did not change the active goal: {exc}. "
+                                 "Refine the prompt or try again; /goal show inspects the current goal.", error=True)
+    previous = mgr.state.goal if mgr.has_goal() else ""
+    state = mgr.set(headline, contract=contract, subgoals=criteria)
+    output = (f"⊙ Goal campaign set ({state.max_turns}-turn budget): {state.goal}\n"
+              f"Completion contract:\n{contract.render_block()}\n"
+              "Ordered campaign criteria (each needs observable evidence):\n"
+              f"{state.render_subgoals_block()}\n"
+              "Well-developed check: a concrete outcome, proof, limits, stop gate, "
+              "ordered evidence-bearing stages and a testable quality bar are present. "
+              "Review factual assumptions with /goal show; generated text is not proof "
+              "that sources, approvals or access exist.")
+    if previous and previous != state.goal:
+        output += f"\n(replaced the previous goal)\n  was: {previous}"
+    return GoalCommandResult(output, mgr.next_continuation_prompt(), kickoff=True)
 
 
 def is_goal_control(arg: str) -> bool:

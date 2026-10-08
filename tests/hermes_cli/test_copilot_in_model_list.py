@@ -71,6 +71,24 @@ def test_copilot_acp_listed_when_executable_resolves(tmp_path, monkeypatch, _no_
     assert acp["models"], "copilot-acp row must offer at least the curated fallback models"
 
 
+def test_desktop_picker_shows_explicit_copilot_acp_command_with_keyring_auth(
+        tmp_path, monkeypatch, _no_other_copilot_creds):
+    """The CLI can use OS keyring credentials invisible to Hermes' file-based auth probe."""
+    from hermes_cli.inventory import ConfigContext, _filter_explicit_provider_rows
+    import hermes_cli.auth as auth
+
+    fake = tmp_path / "copilot-wrapper"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", str(fake))
+    monkeypatch.setattr(auth, "_copilot_acp_auth_evidence", lambda: (False, None))
+    ctx = ConfigContext("openai-codex", "gpt-6-sol", "", {}, [])
+    row = {"slug": "copilot-acp", "models": ["auto"], "authenticated": True}
+
+    assert auth.get_external_process_provider_status("copilot-acp")["auth_verified"] is False
+    assert _filter_explicit_provider_rows([row], ctx) == [row]
+
+
 def test_copilot_acp_hidden_when_executable_missing(monkeypatch, _no_other_copilot_creds):
     # `copilot` may genuinely be installed on a dev machine — force the
     # resolution miss so the test pins behaviour, not the host's PATH.
