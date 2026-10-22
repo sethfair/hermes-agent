@@ -166,8 +166,7 @@ def apply_stop_gates(
             os.environ.get("HERMES_KANBAN_TASK", ""),
         )
         agent._emit_diagnostic_status(
-            "⚠️ Kanban worker tried to exit without a terminal board call "
-            "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
+            "⚠️ Kanban handoff not yet recorded — bounded work/continuation check"
         )
         return verdict
     return StopGateVerdict(

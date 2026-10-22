@@ -13,7 +13,7 @@ from agent.kanban_stop import (
 
 @pytest.fixture
 def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE", "HERMES_KANBAN_GOAL_MODE"):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
 
@@ -71,6 +71,29 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert "kanban_complete" in nudge
     assert "kanban_block" in nudge
     assert "t_46be8aa5" in nudge
+
+
+def test_goal_nudge_repetition_accepts_progress_not_premature_handoff(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_goal")
+    clear_kanban_env.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    first = build_kanban_stop_nudge(messages=[], attempts=0)
+    second = build_kanban_stop_nudge(messages=[], attempts=1)
+    assert first and "Another bounded check may follow" in first
+    assert second and "repeated bounded check, not a rejection" in second
+    assert "progress receipt" in first and "progress receipt" in second
+    assert "Do not complete, request review, schedule or block just for ordinary progress" in first
+    assert build_kanban_stop_nudge(messages=[], attempts=2) is None
+
+
+def test_non_goal_mode_keeps_ordinary_nudge(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_plain")
+    for mode in (None, "0", "true", " 1 "):
+        if mode is None:
+            clear_kanban_env.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+        else:
+            clear_kanban_env.setenv("HERMES_KANBAN_GOAL_MODE", mode)
+        nudge = build_kanban_stop_nudge(messages=[])
+        assert nudge is not None and "protocol violation" in nudge
 
 
 def test_no_nudge_after_kanban_complete(clear_kanban_env):

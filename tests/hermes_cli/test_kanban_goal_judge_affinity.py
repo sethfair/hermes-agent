@@ -97,16 +97,19 @@ def test_goal_loop_judge_binds_per_task_affinity_scope():
         seen.append(get_affinity_scope())
         return ("continue", "not yet", False, None, False)
 
+    from hermes_cli.kanban_goal_result import GoalLoopProgress, GoalTurnResult
+    first = GoalTurnResult("first", {"final_response": "first", "completed": True}, 0)
     with patch.object(goals, "judge_goal", side_effect=fake_judge):
         result = goals.run_kanban_goal_loop(
             task_id="task-7",
             goal_text="goal",
-            run_turn=lambda prompt: "still working",
+            run_turn=lambda prompt: GoalTurnResult("still working", {"completed": True}, 0),
             task_status_fn=lambda: "running",
-            block_fn=lambda msg: None,
+            block_fn=lambda msg: True,
             max_turns=2,
-            first_response="first",
+            first_turn=first, progress=GoalLoopProgress(first),
+            infrastructure_exit_code=lambda exc: 1,
         )
-    assert result["outcome"] == "blocked_budget"
+    assert result.outcome == "blocked_budget"
     assert seen == ["kanban:task-7", "kanban:task-7"]
     assert get_affinity_scope() is None

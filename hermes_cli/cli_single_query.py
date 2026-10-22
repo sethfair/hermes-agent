@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import logging
 import os
+import re
+import sqlite3
 import sys
 import time
 from agent.i18n import t
@@ -50,77 +52,87 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
         pass  # never block signal handling
 
 
-def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, log=None) -> None:
-    """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
-
-    ``run_turn`` defaults to the bare ``-Q`` turn (final answer only). The ``-q`` worker path
-    passes ``cli.chat`` so every follow-up turn keeps the tool activity feed that the Kanban
-    worker log is made of. The caller swallows all errors: a broken loop must never wedge a worker.
-    """
-    from cli import _int_or, _sync_cli_session_id_from_agent
-    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task_id:
-        return
-    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
-    worker_run_id = _int_or(raw_run_id, None) if raw_run_id else None
-    if raw_run_id and worker_run_id is None:
-        logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
-
+def _run_kanban_goal_loop_q(cli: HermesCLI, first_turn, run_turn=None, log=None, emitter=None, *, progress):
+    """Bind a validated worker run and preserve whole-result evidence on every follow-up."""
+    from cli import _sync_cli_session_id_from_agent
+    from hermes_cli.kanban_goal_result import goal_loop_outcome
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
-    # Goal text = title + body (the acceptance criteria the judge evaluates against).
-    with _kbc.connect_closing() as conn:
-        task = _kb.get_task(conn, task_id)
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+    if not task_id or not re.fullmatch(r"[1-9][0-9]*", raw_run_id):
+        return goal_loop_outcome(progress, "stopped", "lookup: missing task or invalid run ID", 1)
+    worker_run_id = int(raw_run_id)
+    try:
+        with _kbc.connect_closing() as conn:
+            task = _kb.get_task(conn, task_id)
+    except KeyboardInterrupt:
+        return goal_loop_outcome(progress, "stopped", "lookup: KeyboardInterrupt", 130, interrupted=True)
+    except Exception as exc:
+        logger.exception("kanban goal lookup failed")
+        return goal_loop_outcome(progress, "stopped", f"lookup: {type(exc).__name__}: {exc}",
+                                 _goal_infrastructure_exit_code(exc))
     if task is None:
-        return
-
+        return goal_loop_outcome(progress, "stopped", "lookup: task missing", 1)
     goal_text = "\n\n".join(p for p in (task.title or "", task.body) if p).strip()
     if not goal_text:
-        return
+        return goal_loop_outcome(progress, "stopped", "lookup: empty goal", 1)
 
-    def _quiet_turn(prompt: str) -> dict:
+    def _quiet_turn(prompt: str):
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
+        turn = _classify_kanban_goal_turn(result)
+        progress.last_turn = turn
         _sync_cli_session_id_from_agent(cli)
-        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
-        if resp:
-            print(resp)
-        # Carry failed/failure_reason so run_kanban_goal_loop can stop on a failed
-        # worker turn instead of grinding out empty continuation turns (#91264).
-        return {
-            "response": resp or "",
-            "failed": result.get("failed", False) if isinstance(result, dict) else False,
-            "failure_reason": result.get("failure_reason") if isinstance(result, dict) else None,
-        }
+        if isinstance(result, dict) and "messages" in result:
+            cli.conversation_history = result["messages"]
+        if turn.response and emitter is None:
+            print(turn.response)
+        return turn
 
-    def _task_status() -> str | None:
-        with _kbc.connect_closing() as c:
-            return _kb.goal_run_status(c, task_id, worker_run_id)
+    def _task_status():
+        with _kbc.connect_closing() as conn:
+            return _kb.goal_run_status(conn, task_id, worker_run_id)
 
-    def _block(reason: str) -> None:
-        with _kbc.connect_closing() as c:
-            _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
+    def _block(reason: str) -> bool:
+        with _kbc.connect_closing() as conn:
+            return _kb.block_task(conn, task_id, reason=reason, expected_run_id=worker_run_id)
 
-    _run_loop(
+    return _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
         task_status_fn=_task_status, block_fn=_block,
-        max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
+        infrastructure_exit_code=_goal_infrastructure_exit_code,
+        max_turns=task.goal_max_turns or _DEF_TURNS, first_turn=first_turn, progress=progress,
         log=log or (lambda m: logger.info("%s", m)),
     )
 
 
-def _run_kanban_goal_loop_chat(cli: HermesCLI, first_response: str) -> None:
-    """``-q`` worker variant: follow-up turns go through ``cli.chat`` (tool feed stays on stdout,
-    which is the Kanban worker log) and judge verdicts are printed there too, so a goal_mode card's
-    log reads like any other worker's instead of staying blank until the final answer."""
+def _run_kanban_goal_loop_chat(cli: HermesCLI, first_turn, *, progress):
+    """Rendered -q follow-ups use chat settlement, never the display string as authority."""
     from cli import _run_kanban_goal_loop_q
 
     def _log(msg: str) -> None:
         logger.info("%s", msg)
         print(msg, flush=True)
 
-    _run_kanban_goal_loop_q(cli, first_response, run_turn=lambda p: cli.chat(p) or "", log=_log)
+    def _chat_turn(prompt: str):
+        cli._last_turn_result = None
+        try:
+            display = cli.chat(prompt)
+        except BaseException:
+            if isinstance(cli._last_turn_result, dict):
+                progress.last_turn = _classify_kanban_goal_turn(cli._last_turn_result, response=None)
+            raise
+        turn = _classify_kanban_goal_turn(
+            cli._last_turn_result, response=display,
+            credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),
+            credentials_terminal=getattr(cli, "_credentials_terminal", False),
+        )
+        progress.last_turn = turn
+        return turn
+
+    return _run_kanban_goal_loop_q(cli, first_turn, run_turn=_chat_turn, log=_log, progress=progress)
 
 
 def _sync_cli_session_id_from_agent(cli) -> None:
@@ -194,6 +206,47 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
             from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
     return 1
+
+
+_OMITTED_RESPONSE = object()
+
+
+def _classify_kanban_goal_turn(result, response=_OMITTED_RESPONSE, *,
+                               credentials_rate_limited=False, credentials_terminal=False):
+    from hermes_cli.kanban_goal_result import GoalTurnResult
+    raw = dict(result) if isinstance(result, dict) else None
+    text = (raw.get("final_response") or "") if response is _OMITTED_RESPONSE and raw is not None else response
+    if text is _OMITTED_RESPONSE or text is None:
+        text = ""
+    return GoalTurnResult(str(text), raw, _single_query_exit_code(
+        raw, credentials_rate_limited=credentials_rate_limited, credentials_terminal=credentials_terminal))
+
+
+def _goal_infrastructure_exit_code(exc: Exception) -> int:
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    from hermes_cli.kanban_goal_result import GoalLoopInfrastructureError
+    if isinstance(exc, GoalLoopInfrastructureError):
+        return exc.exit_code
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return KANBAN_RATE_LIMIT_EXIT_CODE
+    if isinstance(exc, sqlite3.OperationalError) and isinstance(getattr(exc, "sqlite_errorcode", None), int):
+        if exc.sqlite_errorcode & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            return KANBAN_RATE_LIMIT_EXIT_CODE
+    return 1
+
+
+def _goal_caught_outcome(progress, exc, phase="adapter"):
+    from hermes_cli.kanban_goal_result import GoalLoopInfrastructureError, goal_loop_outcome
+    code = 130 if isinstance(exc, KeyboardInterrupt) else (
+        exc.exit_code if isinstance(exc, GoalLoopInfrastructureError) else 1)
+    return goal_loop_outcome(progress, "stopped", f"{phase}: {type(exc).__name__}: {exc}", code,
+                             interrupted=isinstance(exc, KeyboardInterrupt))
+
+
+def _finish_goal_interrupt(cli, outcome):
+    if outcome.interrupt_session_end_required:
+        from cli import _emit_interrupted_session_end
+        _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
 
 
 def _run_quiet_single_query(cli, effective_query, emitter=None):
@@ -331,17 +384,32 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # not the claim lock or either expiry, so an unreaped expired-lease row still
     # reports "running" and a continue verdict would re-enter the model under an
     # authority this process can no longer prove (round-3 finding).
+    from hermes_cli.kanban_goal_result import GoalLoopProgress
+    goal_process_result = result
     if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _exit_code == 0:
+        if isinstance(result, dict) and "messages" in result:
+            cli.conversation_history = result["messages"]
+        first_turn = _classify_kanban_goal_turn(result)
+        progress = GoalLoopProgress(first_turn)
         try:
-            _run_kanban_goal_loop_q(cli, response)
-        except Exception as _goal_exc:
-            logger.debug("kanban goal loop failed: %s", _goal_exc)
+            outcome = _run_kanban_goal_loop_q(cli, first_turn, progress=progress, emitter=emitter)
+        except KeyboardInterrupt as exc:
+            outcome = _goal_caught_outcome(progress, exc)
+        except Exception as exc:
+            logger.exception("kanban goal adapter escaped in quiet mode")
+            outcome = _goal_caught_outcome(progress, exc)
+        _sync_cli_session_id_from_agent(cli)
+        _finish_goal_interrupt(cli, outcome)
+        _exit_code = outcome.exit_code
+        goal_process_result = outcome.process_result
+        if emitter is None and _exit_code and isinstance(goal_process_result, dict) and goal_process_result.get("error"):
+            print(goal_process_result["error"], file=sys.stderr)
 
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
     if emitter is not None:
-        _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
+        _exit_code = emitter.emit_result(goal_process_result, session_id=cli.session_id or "", exit_code=_exit_code)
     exit_single_query(_exit_code)
 
 
@@ -591,17 +659,25 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # interrupt, terminal settlement) — must reach the shared exit path below with zero
         # further model entry, because goal_run_status() checks run identity only and would
         # otherwise continue under an authority this process can no longer prove.
-        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _single_query_exit_code(cli._last_turn_result) == 0:
-            try:
-                _run_kanban_goal_loop_chat(cli, response or "")
-            except Exception as _goal_exc:
-                logger.debug("kanban goal loop failed: %s", _goal_exc)
-        cli._print_exit_summary(clear_screen=False)
-        # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
-        # the exit code. This path used to fall through to an implicit 0 for every outcome.
-        exit_single_query(_single_query_exit_code(
-            cli._last_turn_result,
+        from hermes_cli.kanban_goal_result import GoalLoopProgress
+        first_turn = _classify_kanban_goal_turn(
+            cli._last_turn_result, response=response,
             credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),
-            credentials_terminal=getattr(cli, "_credentials_terminal", False)))
+            credentials_terminal=getattr(cli, "_credentials_terminal", False))
+        final_code = first_turn.exit_code
+        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and final_code == 0:
+            progress = GoalLoopProgress(first_turn)
+            try:
+                outcome = _run_kanban_goal_loop_chat(cli, first_turn, progress=progress)
+            except KeyboardInterrupt as exc:
+                outcome = _goal_caught_outcome(progress, exc)
+            except Exception as exc:
+                logger.exception("kanban goal adapter escaped in rendered mode")
+                outcome = _goal_caught_outcome(progress, exc)
+            _sync_cli_session_id_from_agent(cli)
+            _finish_goal_interrupt(cli, outcome)
+            final_code = outcome.exit_code
+        cli._print_exit_summary(clear_screen=False)
+        exit_single_query(final_code)
     finally:
         _finalize_single_query(cli)

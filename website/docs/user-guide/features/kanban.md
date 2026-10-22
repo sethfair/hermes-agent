@@ -600,11 +600,15 @@ dispatcher does; a worker killed before it reaches that line is a plain
 `crashed` (`pid <n> not alive`).
 
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
-synthetic nudges when it detects the model is about to stop without a terminal
-board tool call. This catches the common case where the model narrates the next
-step ("Let me write the report") and stops with `finish_reason=stop`. The nudge
-reminds the model to call `kanban_complete`, `kanban_request_review` or `kanban_block`
-immediately. A worker that already handed its card off (`kanban_request_review`, or
+synthetic nudges per AIAgent instance when it detects a text stop without a terminal
+board tool call. Ordinary workers are reminded to make a genuine handoff. In goal
+mode, a successful inner turn may instead produce a concrete progress receipt;
+the driver then checks status, judge and budget before any further turn. A repeated
+bounded check is not a rejection of that receipt or a demand to manufacture a
+terminal handoff. Continuation is not guaranteed: a failed, partial or interrupted
+turn stops immediately with its process disposition. A rebuilt agent can receive
+its own nudge budget, so the reminder remains safe when repeated. A worker that
+already handed its card off (`kanban_request_review`, or
 `kanban_request_changes` from a reviewer) is never nudged — the handoff is its terminal
 call, and the nudge never asks it to `kanban_complete` a card that is under review. This
 guard is active only for the dispatcher-spawned worker itself (`HERMES_KANBAN_TASK` is

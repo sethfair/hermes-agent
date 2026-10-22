@@ -356,16 +356,19 @@ def test_goal_loop_stops_after_reviewer_requests_changes(
             "a terminal review verdict must not be judged"
         ),
     )
+    from hermes_cli.kanban_goal_result import GoalLoopProgress, GoalTurnResult
+    first = GoalTurnResult("Changes requested.", {"completed": True}, 0)
     result = goals.run_kanban_goal_loop(
         task_id="t_review",
         goal_text="review the change",
         run_turn=lambda prompt: pytest.fail("must not run another reviewer turn"),
         task_status_fn=lambda: "changes_requested",
         block_fn=lambda reason: pytest.fail("must not block"),
-        first_response="Changes requested.",
+        first_turn=first, progress=GoalLoopProgress(first),
+        infrastructure_exit_code=lambda exc: 1,
     )
-    assert result["outcome"] == "changes_requested_by_reviewer"
-    assert result["turns_used"] == 1
+    assert result.outcome == "changes_requested_by_reviewer"
+    assert result.turns_used == 1
 
 
 def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(

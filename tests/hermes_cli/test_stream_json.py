@@ -4,6 +4,8 @@ import json
 import signal
 
 import pytest
+import cli
+import hermes_cli.main as cli_entry
 
 from hermes_cli.stream_json import StreamJsonEmitter
 
@@ -45,8 +47,6 @@ def test_emitter_event_stream_is_valid_jsonl(capsys):
 
 def _run_stream_json_chat(monkeypatch, capsys, run_conversation, credentials_ok=True):
     """parser → cmd_chat → cli.main → quiet single-query path with a deterministic fake agent."""
-    import cli
-    import hermes_cli.main as cli_entry
     from hermes_cli._parser import build_top_level_parser
 
     class FakeAgent:
@@ -132,7 +132,6 @@ def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, caps
     (["--tui", "chat", "-q", "hi", "--format", "stream-json"], "cannot be used with --tui"),
 ])
 def test_chat_stream_json_rejects_interactive_combinations(monkeypatch, capsys, argv, message):
-    import hermes_cli.main as cli_entry
     from hermes_cli._parser import build_top_level_parser
 
     monkeypatch.setattr(cli_entry, "_launch_tui", lambda *_a, **_k: pytest.fail("TUI launched"))

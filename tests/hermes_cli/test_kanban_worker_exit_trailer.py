@@ -132,6 +132,48 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
         assert kb.get_task(conn, tids[1]).status == "ready"
 
 
+def test_goal_loop_local_exits_preserve_dispatcher_booking_distinction(kanban_home):
+    from hermes_cli.cli_single_query import _goal_infrastructure_exit_code
+    transient = _goal_infrastructure_exit_code(TimeoutError("status unavailable"))
+    deterministic = _goal_infrastructure_exit_code(ValueError("schema mismatch"))
+    assert transient == 75 and deterministic == 1
+    with kbc.connect() as conn:
+        tids = [kb.create_task(conn, title=f"transient-{i}", assignee="a") for i in range(3)]
+        for i, tid in enumerate(tids):
+            _dead_worker_with_log(conn, tid, 80001 + i, transient)
+        kbd.detect_crashed_workers(conn)
+        for tid in tids:
+            task = kb.get_task(conn, tid)
+            run = kb.latest_run(conn, tid)
+            assert task.status == "ready" and task.consecutive_failures == 0
+            assert run is not None and run.outcome == "rate_limited"
+        broken = kb.create_task(conn, title="deterministic", assignee="a")
+        _dead_worker_with_log(conn, broken, 80009, deterministic)
+        kbd.detect_crashed_workers(conn)
+        task = kb.get_task(conn, broken)
+        run = kb.latest_run(conn, broken)
+        assert task.consecutive_failures == 1
+        assert run is not None and run.outcome == "crashed"
+
+
+def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_home):
+    from hermes_cli.cli_single_query import _goal_infrastructure_exit_code
+    code = _goal_infrastructure_exit_code(ValueError("deterministic schema failure"))
+    assert code == 1
+    with kbc.connect() as conn:
+        tids = [kb.create_task(conn, title=f"schema-{i}", assignee="a") for i in range(3)]
+        for i, tid in enumerate(tids):
+            _dead_worker_with_log(conn, tid, 82001 + i, code)
+        kbd.detect_crashed_workers(conn)
+        for tid in tids:
+            task = kb.get_task(conn, tid)
+            run = kb.latest_run(conn, tid)
+            assert task is not None and task.status == "blocked" and task.consecutive_failures >= 1
+            assert run is not None and run.outcome == "crashed"
+        assert kb.recompute_ready(conn, failure_limit=10) == 0
+        assert all(kb.get_task(conn, tid).status == "blocked" for tid in tids)
+
+
 def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, capsys):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     with pytest.raises(SystemExit) as exc:

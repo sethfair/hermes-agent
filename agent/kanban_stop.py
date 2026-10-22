@@ -80,6 +80,22 @@ def build_kanban_stop_nudge(
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
     # The transcript is the status source: this text is only reached when the session made no
     # handoff call, so it never tells a worker to close a card it already sent to review.
+    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+        repeat = ("This is a repeated bounded check, not a rejection of your progress receipt. "
+                  if attempts else "Another bounded check may follow this one. ")
+        return (
+            f"[Kanban handoff not yet recorded — bounded work/continuation check for `{tid}`.] "
+            "The full original task acceptance, review and ownership contract remains authoritative. "
+            "Do the next feasible concrete work or verification now, not merely a promise. "
+            "A successful inner turn may end with a durable evidence/progress receipt and remaining work; "
+            "the native driver decides eligibility, status, judge and budget, and continuation is not guaranteed. "
+            "An unsuccessful or partial turn result never uses this permission. " + repeat +
+            "Do not complete, request review, schedule or block just for ordinary progress or this check. "
+            "Complete only when genuinely done without review; request review only when genuinely ready; "
+            "reviewers retain request-changes; block only for a genuine dependency or needs-input blocker. "
+            "Final worker exit still requires native handoff or driver/dispatcher failure, exhaustion, "
+            "lost-ownership or protocol disposition. Do not fabricate a terminal call or alter counters."
+        )
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"

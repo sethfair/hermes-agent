@@ -16,10 +16,35 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import cli
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import goals
+from hermes_cli.kanban_goal_result import GoalLoopProgress, GoalTurnResult
+
+
+def _turn(response, **fields):
+    raw = {"final_response": response, "completed": True, **fields}
+    return GoalTurnResult(response, raw, cli._single_query_exit_code(raw))
+
+
+def _loop(**kwargs):
+    first = _turn(kwargs.pop("first_response"))
+    run_turn = kwargs.pop("run_turn")
+    block_fn = kwargs.pop("block_fn")
+    def typed(prompt):
+        result = run_turn(prompt)
+        if isinstance(result, dict):
+            raw = {"final_response": result.get("response", ""), **result}
+            return GoalTurnResult(raw["final_response"], raw, cli._single_query_exit_code(raw))
+        return _turn(result)
+    result = goals.run_kanban_goal_loop(
+        **kwargs, first_turn=first, progress=GoalLoopProgress(first), run_turn=typed,
+        block_fn=lambda reason: block_fn(reason) is None,
+        infrastructure_exit_code=lambda exc: 1,
+    )
+    return {"outcome": result.outcome, "reason": result.reason, "turns_used": result.turns_used}
 
 
 @pytest.fixture
@@ -117,7 +142,7 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     _patch_judge(monkeypatch, ["continue"])  # should never be consulted
     turns = []
 
-    res = goals.run_kanban_goal_loop(
+    res = _loop(
         task_id="t1",
         goal_text="do the thing",
         run_turn=lambda p: turns.append(p) or "x",
@@ -139,7 +164,7 @@ def test_loop_stops_on_judge_transport_failure(monkeypatch):
     monkeypatch.setattr(goals, "judge_goal", _failing_judge)
     turns = []
 
-    res = goals.run_kanban_goal_loop(
+    res = _loop(
         task_id="t1",
         goal_text="do the thing",
         run_turn=lambda p: turns.append(p) or "x",
@@ -157,7 +182,7 @@ def test_loop_stops_on_worker_failed_flag(monkeypatch):
     immediately with the failure reason."""
     _patch_judge(monkeypatch, ["continue", "continue"])
 
-    res = goals.run_kanban_goal_loop(
+    res = _loop(
         task_id="t1",
         goal_text="do the thing",
         run_turn=lambda p: {
@@ -178,7 +203,7 @@ def test_loop_stops_on_worker_failed_flag_default_reason(monkeypatch):
     uses 'unknown' as fallback."""
     _patch_judge(monkeypatch, ["continue", "continue"])
 
-    res = goals.run_kanban_goal_loop(
+    res = _loop(
         task_id="t1",
         goal_text="do the thing",
         run_turn=lambda p: {

@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import cli
 
 from agent.kanban_turn_recovery import (
     DEFAULT_MAX_RECOVERY_ATTEMPTS,
@@ -547,11 +548,13 @@ def goal_spy(monkeypatch):
     invariant under test is the call-site veto this PR adds."""
     import cli as cli_mod
 
+    from hermes_cli.kanban_goal_result import goal_loop_outcome
     calls: list = []
-    monkeypatch.setattr(cli_mod, "_run_kanban_goal_loop_q",
-                        lambda c, resp: calls.append((resp, "quiet")))
-    monkeypatch.setattr(cli_mod, "_run_kanban_goal_loop_chat",
-                        lambda c, resp: calls.append((resp, "chat")))
+    def spy(c, turn, *args, progress, **kwargs):
+        calls.append((turn.response, "quiet" if "emitter" in kwargs else "chat"))
+        return goal_loop_outcome(progress, "stopped", "test terminal status")
+    monkeypatch.setattr(cli_mod, "_run_kanban_goal_loop_q", spy)
+    monkeypatch.setattr(cli_mod, "_run_kanban_goal_loop_chat", spy)
     return calls
 
 

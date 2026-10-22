@@ -1596,8 +1596,11 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "is genuinely finished, call kanban_complete with a summary. If it is a "
     "code change that needs same-card review before counting as done, call "
     "kanban_request_review with a summary instead. If you are blocked and "
-    "need human input, call kanban_block with a reason. Do not stop without "
-    "calling one of them."
+    "need human input, call kanban_block with a reason. A successful inner turn may "
+    "end with a concrete progress receipt; the driver decides eligibility for further "
+    "turns. This check may repeat and does not reject a valid receipt. Never make a "
+    "terminal call solely to satisfy this check. Final process exit still requires "
+    "native handoff or driver/dispatcher disposition."
 )
 
 # Judge says done but the worker never made a terminal board call
@@ -1631,9 +1634,11 @@ def run_kanban_goal_loop(
     task_status_fn,
     block_fn,
     max_turns: int = DEFAULT_MAX_TURNS,
-    first_response: str = "",
+    first_turn,
+    progress,
+    infrastructure_exit_code,
     log=None,
-) -> dict[str, Any]:
+):
     """Drive a kanban worker through a Ralph-style goal loop.
 
     Each iteration: stop if the worker already terminated the task (``kanban_complete`` /
@@ -1649,104 +1654,115 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
-    def _block(message: str) -> None:
-        try:
-            block_fn(message)
-        except Exception as exc:
-            _log(f"kanban goal loop: block_fn failed ({exc})")
+    from hermes_cli.kanban_goal_result import GoalTurnResult, goal_loop_outcome
 
-    def _result(outcome: str, reason: str) -> dict[str, Any]:
-        return {"outcome": outcome, "turns_used": turns_used, "reason": reason}
+    def _result(outcome: str, reason: str, code: int = 0, *, interrupted: bool = False, preserve_raw: bool = False):
+        _log(f"kanban goal loop: {outcome}: {reason} (exit {code})")
+        return goal_loop_outcome(progress, outcome, reason, code, interrupted=interrupted, preserve_raw=preserve_raw)
+
+    def _block(message: str, outcome: str, reason: str):
+        error = None
+        try:
+            if block_fn(message):
+                return _result(outcome, reason)
+        except KeyboardInterrupt:
+            return _result("stopped", "block: KeyboardInterrupt", 130, interrupted=True)
+        except Exception as exc:
+            logger.exception("kanban goal block mutation failed")
+            error = exc
+        try:
+            status = task_status_fn()
+        except KeyboardInterrupt:
+            return _result("stopped", "block readback: KeyboardInterrupt", 130, interrupted=True)
+        except Exception as exc:
+            logger.exception("kanban goal block readback failed")
+            return _result("stopped", f"block readback: {type(exc).__name__}: {exc}; original={error}",
+                           infrastructure_exit_code(exc))
+        terminal = _KANBAN_TERMINAL_STATUSES.get(status)
+        if terminal:
+            return _result(terminal[0], terminal[1])
+        if status not in ("running", "ready"):
+            return _result("stopped", f"block readback: status={status}")
+        code = infrastructure_exit_code(error) if error else 1
+        return _result("stopped", f"block refused: {type(error).__name__ if error else 'False'}: {error}", code)
 
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
-
-    last_response = first_response or ""
-    turns_used = 1   # the first turn already consumed one unit of budget
+    progress.last_turn = first_turn
     nudged_to_finalize = False
 
     while True:
         try:
             status = task_status_fn()
+        except KeyboardInterrupt:
+            return _result("stopped", "status: KeyboardInterrupt", 130, interrupted=True)
         except Exception as exc:
-            _log(f"kanban goal loop: status check failed ({exc}); stopping")
-            return _result("stopped", "status check failed")
+            logger.exception("kanban goal status failed")
+            return _result("stopped", f"status: {type(exc).__name__}: {exc}", infrastructure_exit_code(exc))
 
         terminal = _KANBAN_TERMINAL_STATUSES.get(status)
         if terminal is not None:
             outcome, reason, log_fmt = terminal
-            _log("kanban goal loop: " + log_fmt.format(task_id=task_id, turns=turns_used))
+            _log("kanban goal loop: " + log_fmt.format(task_id=task_id, turns=progress.turns_used))
             return _result(outcome, reason)
         if status not in ("running", "ready"):
-            # Reclaimed / archived / unexpected — let the dispatcher own it.
-            _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return _result("stopped", f"status={status}")
 
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
         try:
-            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, progress.last_turn.response)
+        except KeyboardInterrupt:
+            return _result("stopped", "judge: KeyboardInterrupt", 130, interrupted=True)
+        except Exception as exc:
+            logger.exception("kanban goal judge failed")
+            return _result("stopped", f"judge: {type(exc).__name__}: {exc}", infrastructure_exit_code(exc))
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
         if _transport_failed:
-            _log(f"kanban goal loop: judge transport failed on turn {turns_used}; stopping")
-            return _result("stopped", "judge transport failure")
+            return _result("stopped", "judge transport failure", 1)
         if verdict == "wait":
             verdict = "continue"
-        _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+        _log(f"kanban goal loop: turn {progress.turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "blocked":
-            # Unachievable is NOT done: block the card with the judge's reason now instead of
-            # re-poking an impossible goal, and never let it land in done.
-            # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
-            _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
-            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
-            return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
+            return _block(f"Goal-mode judge ruled the goal unachievable: {reason}",
+                          "blocked_unachievable", f"judge verdict blocked: {reason}")
 
         if verdict == "done":
             if nudged_to_finalize:
-                # Already asked once to call kanban_complete — block for review rather than spin.
-                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                _block(
+                return _block(
                     f"Goal-mode worker's output looked complete but it never "
-                    f"called kanban_complete after a finalize nudge ({reason})."
-                )
-                return _result("blocked_budget", "judged done, never finalized")
+                    f"called kanban_complete after a finalize nudge ({reason}).",
+                    "blocked_budget", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
 
-        # Budget check BEFORE spending another turn.
-        if turns_used >= max_turns:
-            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            _block(
+        if progress.turns_used >= max_turns:
+            return _block(
                 f"Goal-mode worker exhausted its turn budget "
-                f"({turns_used}/{max_turns}) without completing the task. "
-                f"Last judge verdict: {_truncate(reason, 300)}"
-            )
-            return _result("blocked_budget", "turn budget exhausted")
+                f"({progress.turns_used}/{max_turns}) without completing the task. "
+                f"Last judge verdict: {_truncate(reason, 300)}",
+                "blocked_budget", "turn budget exhausted")
 
+        progress.turns_used += 1
         try:
             result = run_turn(prompt)
-            if isinstance(result, dict):
-                last_response = result.get("response", "") or ""
-                failed = bool(result.get("failed", False))
-                failure_reason = result.get("failure_reason") or "unknown"
-            else:
-                # backward compatibility: assume it's a string
-                last_response = result or ""
-                failed = False
-                failure_reason = None
+        except KeyboardInterrupt:
+            return _result("stopped", "worker: KeyboardInterrupt", 130, interrupted=True)
         except Exception as exc:
-            _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return _result("stopped", f"run_turn error: {type(exc).__name__}")
-        if failed:
-            _log(f"kanban goal loop: worker failed on turn {turns_used} (reason={failure_reason}); stopping")
-            return _result("stopped", f"worker failed: {failure_reason}")
-        turns_used += 1
+            logger.exception("kanban goal worker follow-up raised")
+            return _result("stopped", f"worker: {type(exc).__name__}: {exc}", 1)
+        if not isinstance(result, GoalTurnResult):
+            return _result("stopped", "worker: invalid typed turn result", 1)
+        progress.last_turn = result
+        if result.exit_code:
+            return _result("stopped", f"worker failed: {(result.result or {}).get('failure_reason') or 'unknown'}",
+                           result.exit_code, preserve_raw=result.result is not None)
 
 
 __all__ = [
