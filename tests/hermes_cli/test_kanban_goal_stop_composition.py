@@ -458,8 +458,11 @@ def test_real_agent_goal_followup_retains_two_nudges_and_three_successful_turns(
         assert not any("kanban-stop" in str(row) for row in messages)
 
 
-@pytest.mark.parametrize("fail_followup", [False, True])
-def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeypatch, tmp_path, fail_followup):
+@pytest.mark.parametrize("fail_followup,display_mode", [
+    (False, "normal"), (True, "normal"), (False, "mute"), (False, "caught_render_error"),
+])
+def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(
+        monkeypatch, tmp_path, fail_followup, display_mode):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_testowned")
@@ -474,8 +477,14 @@ def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeyp
     monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda c, tid: SimpleNamespace(title="task", body="test receipt", goal_max_turns=3))
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect_closing", lambda: _Connection())
     checks = []
-    monkeypatch.setattr(kb, "goal_run_status", lambda c, tid, run: "review" if checks else "running")
-    monkeypatch.setattr(goals, "judge_goal", lambda goal, response: checks.append(response) or ("continue", "one more slice", False, None, False))
+    monkeypatch.setattr(kb, "goal_run_status", lambda c, tid, run: "review" if checks and display_mode == "normal" else "running")
+    blocks = []
+    monkeypatch.setattr(kb, "block_task", lambda *a, **k: blocks.append(k) or True)
+    def judge(goal, response):
+        checks.append(response)
+        return ("blocked" if display_mode != "normal" and len(checks) == 2 else "continue",
+                "one more slice", False, None, False)
+    monkeypatch.setattr(goals, "judge_goal", judge)
     instance = _real_agent(tmp_path)
     answers = iter([_model_answer("fixture first receipt") for _ in range(3)] +
                    [_model_answer("fixture second receipt")])
@@ -494,7 +503,10 @@ def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeyp
         _prompt_start_time=None, _last_turn_result=None, _voice_continuous=False, _voice_tts=False,
         _flush_stream=lambda: None, _chat_resolve_interrupt=lambda *a: (None, False),
         _chat_print_reasoning_box=lambda turn: None,
-        _chat_print_response_panel=lambda turn, response: rendered.append(response),
+        _chat_print_response_panel=lambda turn, response: (
+            (_ for _ in ()).throw(RuntimeError("fixture display failure"))
+            if display_mode == "caught_render_error" and len(checks) == 1
+            else rendered.append(response)),
         _emit_focus_recovery_line=lambda: None, _ring_bell=lambda **k: None,
         provider="openai-compat", model="test/model",
     )
@@ -505,9 +517,13 @@ def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeyp
             # agent's failed settlement, with only its display field blanked.
             raw = {**raw, "final_response": ""}
         turn = SimpleNamespace(result=raw, use_streaming_tts=False, text_queue=None,
-                               mute_notification_reply=False)
+                               mute_notification_reply=display_mode == "mute" and len(checks) == 1)
         cli.HermesCLI._chat_settle_turn(stub, turn)
-        return cli.HermesCLI._chat_render_turn(stub, turn, None, None)
+        try:
+            return cli.HermesCLI._chat_render_turn(stub, turn, None, None)
+        except RuntimeError as exc:
+            assert display_mode == "caught_render_error" and str(exc) == "fixture display failure"
+            return None  # the real chat orchestrator catches a post-settle render error
     stub.chat = chat
     with (patch("hermes_cli.plugins.has_hook", return_value=False),
           patch("hermes_cli.plugins.invoke_hook", return_value=[])):
@@ -520,9 +536,12 @@ def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeyp
         assert "fixture provider failure" in rendered[1]
         assert stub._last_turn_result["failed"] is True
         assert not stub._last_turn_result.get("final_response")
-    else:
+    elif display_mode == "normal":
         assert rendered == ["fixture first receipt", "fixture second receipt"]
-    assert checks == ["fixture first receipt"]
+    else:
+        assert rendered == ["fixture first receipt"]
+    assert checks == (["fixture first receipt", ""] if display_mode != "normal" else ["fixture first receipt"])
+    assert len(blocks) == (1 if display_mode != "normal" else 0)
     if not fail_followup:
         assert stub._last_turn_result["final_response"] == "fixture second receipt"
 
