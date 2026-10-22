@@ -120,7 +120,7 @@ def _run_kanban_goal_loop_chat(cli: HermesCLI, first_turn, *, progress):
         cli._last_turn_result = None
         try:
             display = cli.chat(prompt)
-        except BaseException:
+        except (KeyboardInterrupt, Exception):
             if isinstance(cli._last_turn_result, dict):
                 progress.last_turn = _classify_kanban_goal_turn(cli._last_turn_result, response=None)
             raise

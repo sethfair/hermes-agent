@@ -20,6 +20,38 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER, exit_single_query
 
 
+def _selected_goal_code(monkeypatch, error, *, real_judge=False):
+    """Select a disposition through the real goal loop before native booking."""
+    from unittest.mock import patch
+    from hermes_cli import goals
+    from hermes_cli.cli_single_query import _goal_infrastructure_exit_code
+    from hermes_cli.kanban_goal_result import GoalLoopProgress, GoalTurnResult
+    first = GoalTurnResult("test receipt", {"completed": True, "final_response": "test receipt"}, 0)
+    if real_judge:
+        actual = goals.judge_goal
+        seen = []
+        def observe(*args, **kwargs):
+            result = actual(*args, **kwargs)
+            seen.append(result)
+            return result
+        monkeypatch.setattr(goals, "judge_goal", observe)
+        with patch("agent.auxiliary_client.call_llm", side_effect=error):
+            outcome = goals.run_kanban_goal_loop(
+                task_id="t_testowned", goal_text="test-owned task", first_turn=first,
+                progress=GoalLoopProgress(first), run_turn=lambda p: pytest.fail("no model"),
+                task_status_fn=lambda: "running", block_fn=lambda p: pytest.fail("no block"),
+                infrastructure_exit_code=_goal_infrastructure_exit_code)
+        assert seen and seen[0][-1] is True
+    else:
+        monkeypatch.setattr(goals, "judge_goal", lambda *a: (_ for _ in ()).throw(error))
+        outcome = goals.run_kanban_goal_loop(
+            task_id="t_testowned", goal_text="test-owned task", first_turn=first,
+            progress=GoalLoopProgress(first), run_turn=lambda p: pytest.fail("no model"),
+            task_status_fn=lambda: "running", block_fn=lambda p: pytest.fail("no block"),
+            infrastructure_exit_code=_goal_infrastructure_exit_code)
+    return outcome.exit_code
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
@@ -132,33 +164,37 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
         assert kb.get_task(conn, tids[1]).status == "ready"
 
 
-def test_goal_loop_local_exits_preserve_dispatcher_booking_distinction(kanban_home):
-    from hermes_cli.cli_single_query import _goal_infrastructure_exit_code
-    transient = _goal_infrastructure_exit_code(TimeoutError("status unavailable"))
-    deterministic = _goal_infrastructure_exit_code(ValueError("schema mismatch"))
+def test_goal_loop_local_exits_preserve_dispatcher_booking_distinction(kanban_home, monkeypatch):
+    transient = _selected_goal_code(monkeypatch, TimeoutError("judge unavailable"))
+    deterministic = _selected_goal_code(monkeypatch, ValueError("schema mismatch"))
     assert transient == 75 and deterministic == 1
+    seen_crashes = []
+    original_account = kbd._account_crashes
+    def account(conn, crash_details, *args, **kwargs):
+        seen_crashes.extend(crash_details)
+        return original_account(conn, crash_details, *args, **kwargs)
+    monkeypatch.setattr(kbd, "_account_crashes", account)
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=f"transient-{i}", assignee="a") for i in range(3)]
         for i, tid in enumerate(tids):
             _dead_worker_with_log(conn, tid, 80001 + i, transient)
+        broken = kb.create_task(conn, title="deterministic", assignee="a")
+        _dead_worker_with_log(conn, broken, 80009, deterministic)
         kbd.detect_crashed_workers(conn)
+        assert len(seen_crashes) == 1 and seen_crashes[0][0] == broken
         for tid in tids:
             task = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
             assert task.status == "ready" and task.consecutive_failures == 0
             assert run is not None and run.outcome == "rate_limited"
-        broken = kb.create_task(conn, title="deterministic", assignee="a")
-        _dead_worker_with_log(conn, broken, 80009, deterministic)
-        kbd.detect_crashed_workers(conn)
         task = kb.get_task(conn, broken)
         run = kb.latest_run(conn, broken)
         assert task.consecutive_failures == 1
         assert run is not None and run.outcome == "crashed"
 
 
-def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_home):
-    from hermes_cli.cli_single_query import _goal_infrastructure_exit_code
-    code = _goal_infrastructure_exit_code(ValueError("deterministic schema failure"))
+def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_home, monkeypatch):
+    code = _selected_goal_code(monkeypatch, ValueError("deterministic schema failure"))
     assert code == 1
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=f"schema-{i}", assignee="a") for i in range(3)]
@@ -172,6 +208,21 @@ def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_
             assert run is not None and run.outcome == "crashed"
         assert kb.recompute_ready(conn, failure_limit=10) == 0
         assert all(kb.get_task(conn, tid).status == "blocked" for tid in tids)
+
+
+@pytest.mark.parametrize("error", [
+    ValueError("bad auxiliary config"), TimeoutError("swallowed transient"),
+])
+def test_real_judge_catch_all_selected_one_books_native_crash(kanban_home, monkeypatch, error):
+    code = _selected_goal_code(monkeypatch, error, real_judge=True)
+    assert code == 1 and kbd._exit_code_kind(code)[0] == "nonzero_exit"
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="real judge flag", assignee="a")
+        _dead_worker_with_log(conn, tid, 83001, code)
+        kbd.detect_crashed_workers(conn)
+        task, run = kb.get_task(conn, tid), kb.latest_run(conn, tid)
+    assert task is not None and task.consecutive_failures == 1 and task.status == "ready"
+    assert run is not None and run.outcome == "crashed"
 
 
 def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, capsys):

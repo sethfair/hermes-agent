@@ -371,6 +371,43 @@ def test_goal_loop_stops_after_reviewer_requests_changes(
     assert result.turns_used == 1
 
 
+def test_goal_worker_native_registration_and_review_handoff(monkeypatch, tmp_path):
+    """The real goal gate sees the registered test-owned worker before native handoff."""
+    from tools import kanban_tools as tools
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="real handoff", body="test-owned acceptance",
+                                 assignee="builder", goal_mode=True)
+        claimed = kb.claim_task(conn, task_id, claimer="builder:review")
+        assert claimed is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "builder:review")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
+    assert tools.register_current_worker_from_env() is True
+    seen = []
+    monkeypatch.setattr(tools, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(tools, "judge_goal", lambda goal, last_response: (
+        seen.append((goal, last_response)) or "done", "complete", False, None, False))
+    reply = json.loads(tools._handle_request_review({"summary": "Verified test-owned receipt"}))
+    assert reply["ok"] is True
+    assert seen and "real handoff" in seen[0][0] and "test-owned acceptance" in seen[0][0]
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        events = kb.list_events(conn, task_id)
+    assert task is not None and task.status == "review" and task.goal_mode is True
+    assert run is not None and run.outcome == "review_requested"
+    assert any(e.kind == "review_requested" for e in events)
+
+
 def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

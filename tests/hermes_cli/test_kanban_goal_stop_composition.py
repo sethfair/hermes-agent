@@ -4,6 +4,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
+from functools import wraps
+from itertools import pairwise
 import sqlite3
 
 import pytest
@@ -20,11 +22,21 @@ from hermes_cli.kanban_goal_result import GoalLoopProgress, GoalTurnResult
 @pytest.mark.parametrize("fail_on_turn", [2, 3])
 @pytest.mark.parametrize("failure,expected_code", [
     ({"completed": False, "failed": True, "failure_reason": "auth"}, 78),
+    ({"failed": True}, 1),
     ({"partial": True}, 1),
     ({"completed": False}, 1),
-    ({"failed": True, "failure_reason": "timeout"}, 75),
+    ({"failed": True, "partial": True, "completed": False, "failure_reason": "unknown"}, 1),
+    *[({"failed": True, "failure_reason": reason}, 75) for reason in
+      ("rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout")],
+    *[({"failed": True, "failure_reason": reason}, 78) for reason in
+      ("auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked")],
     ({"interrupted": True, "failed": True, "failure_reason": "auth"}, 130),
     (None, 1),
+    ("non-dict-result", 1),
+    ("no_fresh_settlement", 1),
+    (ValueError("worker error"), 1),
+    (TimeoutError("worker timeout is not infrastructure"), 1),
+    (KeyboardInterrupt(), 130),
 ])
 def test_followup_failed_provider_turn_reaches_process_exit(monkeypatch, quiet, fail_on_turn, failure, expected_code, capsys):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_followup")
@@ -34,7 +46,10 @@ def test_followup_failed_provider_turn_reaches_process_exit(monkeypatch, quiet, 
     monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
     monkeypatch.setattr(cli, "_collect_query_images", lambda q, i: (q, []))
     monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda imgs: [])
-    monkeypatch.setattr(cli, "_finalize_single_query", lambda c: None)
+    finalizations = []
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda c: finalizations.append(c.session_id))
+    hooks = []
+    monkeypatch.setattr(cli, "_emit_interrupted_session_end", lambda *a, **k: hooks.append(k))
     monkeypatch.setattr(cli, "_sync_cli_session_id_from_agent", lambda c: None)
     monkeypatch.setattr(cli, "_route_single_query_images", lambda c, q, e, i, u: e)
     monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda c, tid: SimpleNamespace(title="task", body="acceptance", goal_max_turns=5))
@@ -49,13 +64,26 @@ def test_followup_failed_provider_turn_reaches_process_exit(monkeypatch, quiet, 
 
     monkeypatch.setattr(goals, "judge_goal", judge)
     initial = {"final_response": "first receipt", "completed": True, "messages": []}
-    failed = None if failure is None else {"final_response": "provider error", "messages": [], **failure}
+    failed = {"final_response": "provider error", "messages": [], "input_tokens": 37, **failure} if isinstance(failure, dict) else failure
     calls = []
-    agent = SimpleNamespace(session_id="s1", run_conversation=lambda **kw: calls.append(kw) or (failed if len(calls) == fail_on_turn else initial))
+    def run_conversation(**kw):
+        calls.append(kw)
+        result = failed if len(calls) == fail_on_turn else initial
+        if result == "no_fresh_settlement":
+            return None
+        if isinstance(result, BaseException):
+            raise result
+        return result
+    agent = SimpleNamespace(session_id="s1", run_conversation=run_conversation)
 
     def chat(*args, **kwargs):
         calls.append((args, kwargs))
-        stub._last_turn_result = failed if len(calls) == fail_on_turn else initial
+        value = failed if len(calls) == fail_on_turn else initial
+        if value == "no_fresh_settlement":
+            return "apparent successful display despite stale previous turn"
+        if isinstance(value, BaseException):
+            raise value
+        stub._last_turn_result = value
         return stub._last_turn_result["final_response"] if isinstance(stub._last_turn_result, dict) else "unsettled display"
 
     stub = SimpleNamespace(
@@ -73,12 +101,22 @@ def test_followup_failed_provider_turn_reaches_process_exit(monkeypatch, quiet, 
     assert len(calls) == fail_on_turn
     assert actions == ["judge"] * (fail_on_turn - 1)
     assert exc.value.code == expected_code
-    assert f"[kanban-worker-exit] rc={expected_code}" in capsys.readouterr().err
+    output = capsys.readouterr()
+    assert output.err.count(f"[kanban-worker-exit] rc={expected_code}") == 1
+    assert finalizations == ["s1"]
+    assert hooks == ([{"reason": "keyboard_interrupt"}] if isinstance(failure, KeyboardInterrupt) else [])
+    if quiet:
+        assert output.err.count("session_id: s1") == 1
+        if isinstance(failed, dict):
+            assert output.out.count("provider error") == 1
+    else:
+        assert "session_id: s1" not in output.err
 
 
 @pytest.mark.parametrize("quiet", [False, True])
 @pytest.mark.parametrize("error", [AuxiliaryClientUnavailable("reauthentication required"),
-                                    TypeError("bad auxiliary config"), TimeoutError("aux timeout")])
+                                    TypeError("bad auxiliary config"), Exception("auth-like prose"),
+                                    TimeoutError("aux timeout")])
 def test_real_judge_flag_reaches_both_actual_caller_exits(monkeypatch, quiet, error, capsys):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_testowned")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
@@ -124,11 +162,12 @@ def test_real_judge_flag_reaches_both_actual_caller_exits(monkeypatch, quiet, er
             cli._run_single_query_mode(stub, "task", None, quiet, True)
     assert exc.value.code == 1
     assert len(calls) == 1
-    assert seen[0][0] == "continue" and seen[0][-1] is True
-    output = capsys.readouterr().err
-    assert "[kanban-worker-exit] rc=1" in output
+    assert len(seen) == 1 and seen[0][0] == "continue" and seen[0][-1] is True
+    captured = capsys.readouterr()
+    assert captured.err.count("[kanban-worker-exit] rc=1") == 1
     if quiet:
-        assert "judge transport failure" in output and output.count("session_id: s1") == 1
+        assert "judge transport failure" in captured.err and captured.err.count("session_id: s1") == 1
+        assert "first nonempty receipt" in captured.out
 
 
 def test_quiet_emitter_followup_failure_is_one_terminal_json_result(monkeypatch, capsys):
@@ -251,6 +290,7 @@ def _model_answer(text):
 
 
 def test_real_agent_goal_followup_retains_two_nudges_and_three_successful_turns(monkeypatch, tmp_path):
+    from agent import turn_context, conversation_loop
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -272,6 +312,21 @@ def test_real_agent_goal_followup_retains_two_nudges_and_three_successful_turns(
     monkeypatch.setattr(kb, "block_task", lambda *a, **k: pytest.fail("no block"))
     monkeypatch.setattr(goals, "judge_goal", lambda goal, response: checks.append((goal, response)) or ("continue", "another slice", False, None, False))
     agent = _real_agent(tmp_path)
+    reset = turn_context._reset_per_turn_agent_state
+    finalizer = conversation_loop.finalize_turn
+    reset_calls = []
+    finalized_calls = []
+    @wraps(reset)
+    def observed_reset(owner):
+        reset_calls.append(owner)
+        return reset(owner)
+    @wraps(finalizer)
+    def observed_finalizer(owner, **kwargs):
+        result = finalizer(owner, **kwargs)
+        finalized_calls.append((owner, result))
+        return result
+    monkeypatch.setattr(turn_context, "_reset_per_turn_agent_state", observed_reset)
+    monkeypatch.setattr(conversation_loop, "finalize_turn", observed_finalizer)
     receipts = []
     for i in range(3):
         artifact = tmp_path / f"slice{i}.txt"
@@ -303,6 +358,9 @@ def test_real_agent_goal_followup_retains_two_nudges_and_three_successful_turns(
             cli._run_single_query_mode(stub, "task", None, True, True)
     assert exc.value.code == 0
     assert len(settled) == 3
+    assert reset_calls == [agent] * 3
+    assert len(finalized_calls) == 3
+    assert [r for _, r in finalized_calls] == settled
     assert all(r["completed"] is True and not r["failed"] and not r["partial"] and not r["interrupted"] for r in settled)
     assert [r["final_response"] for r in settled] == receipts
     assert agent._kanban_stop_nudges == 2
@@ -313,9 +371,19 @@ def test_real_agent_goal_followup_retains_two_nudges_and_three_successful_turns(
     assert "Another bounded check may follow" in str(observed_prompts[1])
     assert "repeated bounded check, not a rejection" in str(observed_prompts[2])
     assert stub.conversation_history == settled[-1]["messages"]
+    for result in settled:
+        messages = result["messages"]
+        assert messages[0]["role"] == "user"  # system prompt is API-only, not persisted history
+        assert all(row["role"] in {"system", "user", "assistant", "tool"} for row in messages)
+        assert all(left["role"] != right["role"] for left, right in pairwise(messages))
+        assert messages[-1]["role"] == "assistant" and messages[-1]["content"] == result["final_response"]
+        assert sum(row["role"] == "assistant" and row["content"] == result["final_response"]
+                   for row in messages[max(i for i, row in enumerate(messages) if row["role"] == "user") + 1:]) == 1
+        assert not any("kanban-stop" in str(row) for row in messages)
 
 
-def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeypatch, tmp_path):
+@pytest.mark.parametrize("fail_followup", [False, True])
+def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeypatch, tmp_path, fail_followup):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_testowned")
@@ -335,7 +403,11 @@ def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeyp
     instance = _real_agent(tmp_path)
     answers = iter([_model_answer("fixture first receipt") for _ in range(3)] +
                    [_model_answer("fixture second receipt")])
-    instance._interruptible_api_call = lambda kwargs: next(answers)
+    def model_call(kwargs):
+        if fail_followup and len(checks) == 1:
+            raise ValueError("fixture provider failure")
+        return next(answers)
+    instance._interruptible_api_call = model_call
     rendered = []
     stub = SimpleNamespace(
         session_id=instance.session_id, conversation_history=[], agent=instance, _single_query_mode=False,
@@ -352,6 +424,10 @@ def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeyp
     )
     def chat(prompt, **kwargs):
         raw = instance.run_conversation(user_message=prompt, conversation_history=stub.conversation_history)
+        if fail_followup and len(checks) == 1 and raw.get("failed"):
+            # Exercise the renderer's empty-answer error-copy branch using the real
+            # agent's failed settlement, with only its display field blanked.
+            raw = {**raw, "final_response": ""}
         turn = SimpleNamespace(result=raw, use_streaming_tts=False, text_queue=None,
                                mute_notification_reply=False)
         cli.HermesCLI._chat_settle_turn(stub, turn)
@@ -361,10 +437,18 @@ def test_real_agent_rendered_goal_followup_uses_settled_turn_not_display(monkeyp
           patch("hermes_cli.plugins.invoke_hook", return_value=[])):
         with pytest.raises(SystemExit) as exc:
             cli._run_single_query_mode(stub, "task", None, False, True)
-    assert exc.value.code == 0
-    assert rendered == ["fixture first receipt", "fixture second receipt"]
+    assert exc.value.code == (1 if fail_followup else 0)
+    assert rendered[0] == "fixture first receipt"
+    if fail_followup:
+        assert len(rendered) == 2 and rendered[1] and rendered[1] != "fixture second receipt"
+        assert "fixture provider failure" in rendered[1]
+        assert stub._last_turn_result["failed"] is True
+        assert not stub._last_turn_result.get("final_response")
+    else:
+        assert rendered == ["fixture first receipt", "fixture second receipt"]
     assert checks == ["fixture first receipt"]
-    assert stub._last_turn_result["final_response"] == "fixture second receipt"
+    if not fail_followup:
+        assert stub._last_turn_result["final_response"] == "fixture second receipt"
 
 
 def test_real_agent_low_budget_finalizer_books_native_timeout_not_goal_block(monkeypatch, tmp_path):
@@ -568,12 +652,16 @@ def test_real_board_reclaim_before_block_refusal_preserves_successor(monkeypatch
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
+    host = kb._claimer_id().split(":", 1)[0]
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="race target", assignee="builder")
-        old = kb.claim_task(conn, tid, claimer="builder:old")
+        old = kb.claim_task(conn, tid, claimer=f"{host}:old")
         assert old is not None
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: f"fingerprint-{pid}")
+        kbd._set_worker_pid(conn, tid, 87001)
     first = GoalTurnResult("first", {"completed": True}, 0)
     progress = GoalLoopProgress(first)
     observed = []
@@ -588,8 +676,9 @@ def test_real_board_reclaim_before_block_refusal_preserves_successor(monkeypatch
         with kbc.connect() as conn:
             kbd._record_task_failure(conn, tid, error="old worker reclaimed", outcome="rate_limited",
                                      release_claim=True, end_run=True)
-            new = kb.claim_task(conn, tid, claimer="builder:new")
+            new = kb.claim_task(conn, tid, claimer=f"{host}:new")
             assert new is not None
+            kbd._set_worker_pid(conn, tid, 87002)
             successor.append(new.current_run_id)
             failure_baseline.append(new.consecutive_failures)
             return kb.block_task(conn, tid, reason=reason, expected_run_id=old.current_run_id)
@@ -603,15 +692,34 @@ def test_real_board_reclaim_before_block_refusal_preserves_successor(monkeypatch
     with kbc.connect() as conn:
         new_task = kb.get_task(conn, tid)
         new_run = kb.latest_run(conn, tid)
+        successor_row = conn.execute("SELECT worker_pid, worker_started_at, claim_lock, claim_expires "
+                                     "FROM tasks WHERE id=?", (tid,)).fetchone()
     assert new_task is not None and new_task.status == "running"
     assert new_task.current_run_id == successor[0]
+    assert new_task.claim_lock == f"{host}:new" and new_task.worker_pid == 87002
+    assert successor_row["worker_started_at"] == "fingerprint-87002"
     assert new_run is not None and new_run.id == successor[0] and new_run.outcome is None
+    old_log = kb.worker_log_path(tid)
+    old_log.parent.mkdir(parents=True, exist_ok=True)
+    with old_log.open("a", encoding="utf-8") as stream:
+        stream.write("old worker log\n[kanban-worker-exit] rc=1\n")
+    kbd._recent_worker_exits.clear()
+    checked = []
+    def alive(pid, fingerprint):
+        checked.append((pid, fingerprint))
+        return pid == 87002 and fingerprint == "fingerprint-87002"
+    monkeypatch.setattr(kbd, "_worker_alive", alive)
     with kbc.connect() as conn:
         kbd.detect_crashed_workers(conn)
         survivor = kb.get_task(conn, tid)
         survivor_run = kb.latest_run(conn, tid)
+        survivor_row = conn.execute("SELECT worker_pid, worker_started_at, claim_lock, claim_expires "
+                                    "FROM tasks WHERE id=?", (tid,)).fetchone()
     assert survivor is not None and survivor.current_run_id == successor[0]
     assert survivor.status == "running" and survivor.consecutive_failures == failure_baseline[0]
+    assert survivor.claim_lock == new_task.claim_lock and survivor.worker_pid == new_task.worker_pid
+    assert dict(survivor_row) == dict(successor_row)
+    assert checked == [(87002, "fingerprint-87002")]
     assert survivor_run is not None and survivor_run.outcome is None
 
 
@@ -654,3 +762,30 @@ class _Connection:
 
     def __exit__(self, *_):
         return False
+
+
+def test_rendered_followup_systemexit_bypasses_classification(monkeypatch):
+    """Termination after a settled result must not run the rendered exception handler."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_testowned")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *a: SimpleNamespace(
+        title="task", body="work", goal_max_turns=3))
+    monkeypatch.setattr("hermes_cli.kanban_db_connect.connect_closing", lambda: _Connection())
+    monkeypatch.setattr(kb, "goal_run_status", lambda *a: "running")
+    monkeypatch.setattr(goals, "judge_goal", lambda *a: ("continue", "next", False, None, False))
+    first = GoalTurnResult("first", {"final_response": "first", "completed": True}, 0)
+    progress = GoalLoopProgress(first)
+    stub = SimpleNamespace(_last_turn_result=None)
+
+    def chat(prompt):
+        stub._last_turn_result = {"final_response": "settled", "completed": True}
+        raise SystemExit(42)
+
+    stub.chat = chat
+    from hermes_cli import cli_single_query as single
+    with patch.object(single, "_classify_kanban_goal_turn", side_effect=AssertionError("classified termination")):
+        with pytest.raises(SystemExit) as exc:
+            cli._run_kanban_goal_loop_chat(stub, first, progress=progress)
+    assert exc.value.code == 42
+    assert progress.turns_used == 2
+    assert progress.last_turn is first
