@@ -65,10 +65,11 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
+def _dead_worker_with_log(conn, tid: str, pid: int, rc: int, *, review: bool = False) -> None:
     """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here."""
     host = kb._claimer_id().split(":", 1)[0]
-    kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
+    claimed = (kb.claim_review_task if review else kb.claim_task)(conn, tid, claimer=f"{host}:w{pid}")
+    assert claimed is not None
     conn.execute(
         "UPDATE tasks SET worker_pid=?, worker_started_at=NULL, started_at=? WHERE id=?",
         (pid, int(time.time()) - 120, tid),
@@ -194,7 +195,7 @@ def test_goal_loop_local_exits_preserve_dispatcher_booking_distinction(kanban_ho
 
 
 def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_home, monkeypatch):
-    code = _selected_goal_code(monkeypatch, ValueError("deterministic schema failure"))
+    code = _selected_goal_code(monkeypatch, ValueError("bad auxiliary config"), real_judge=True)
     assert code == 1
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=f"schema-{i}", assignee="a") for i in range(3)]
@@ -206,6 +207,10 @@ def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_
             run = kb.latest_run(conn, tid)
             assert task is not None and task.status == "blocked" and task.consecutive_failures >= 1
             assert run is not None and run.outcome == "crashed"
+            gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+            assert len(gave_up) == 1 and gave_up[0].payload["effective_limit"] == 1
+            assert gave_up[0].payload["retry_status"] == "ready"
+            assert task.claim_lock is None and task.current_run_id is None
         assert kb.recompute_ready(conn, failure_limit=10) == 0
         assert all(kb.get_task(conn, tid).status == "blocked" for tid in tids)
 
@@ -223,6 +228,48 @@ def test_real_judge_catch_all_selected_one_books_native_crash(kanban_home, monke
         task, run = kb.get_task(conn, tid), kb.latest_run(conn, tid)
     assert task is not None and task.consecutive_failures == 1 and task.status == "ready"
     assert run is not None and run.outcome == "crashed"
+
+
+def test_transient_goal_exit_restores_review_and_preserves_protocol_streak(kanban_home, monkeypatch):
+    """The actual typed bypass selects 75; neutral booking is not a streak reset."""
+    code = _selected_goal_code(monkeypatch, TimeoutError("judge call unavailable"))
+    assert code == 75
+    with kbc.connect() as conn:
+        ready = kb.create_task(conn, title="ready worker", assignee="a")
+        _dead_worker_with_log(conn, ready, 84003, 0)
+        kbd.detect_crashed_workers(conn)
+        assert kbd._protocol_violation_streak(conn, ready) == 1
+        # The cooldown query orders by ended_at; keep distinct seconds for the
+        # predecessor and successor instead of relying on same-second tie order.
+        conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                     (int(time.time()) - 60, ready))
+        conn.commit()
+        _dead_worker_with_log(conn, ready, 84004, code)
+        assert kbd._worker_log_exit_code(ready) == 75
+        kbd.detect_crashed_workers(conn)
+        assert kb.get_task(conn, ready).status == "ready"
+        assert kbd._protocol_violation_streak(conn, ready) == 1
+        newest = conn.execute("SELECT outcome, ended_at FROM task_runs WHERE task_id=? "
+                              "ORDER BY ended_at DESC LIMIT 1", (ready,)).fetchone()
+        assert newest["outcome"] == "rate_limited"
+        assert kb._to_epoch(newest["ended_at"]) is not None
+        monkeypatch.setattr(kb, "_resolve_rate_limit_cooldown_seconds", lambda: 3600)
+        assert kbd.check_respawn_guard(conn, ready) == "rate_limit_cooldown"
+        monkeypatch.setattr(kb, "_resolve_rate_limit_cooldown_seconds", lambda: 0)
+        assert kbd.check_respawn_guard(conn, ready) is None
+        tid = kb.create_task(conn, title="reviewer", assignee="a")
+        _dead_worker_with_log(conn, tid, 84001, 0)
+        kbd.detect_crashed_workers(conn)
+        assert kbd._protocol_violation_streak(conn, tid) == 1
+        kb.request_review(conn, tid, summary="Ready for test-owned review")
+        _dead_worker_with_log(conn, tid, 84002, code, review=True)
+        kbd.detect_crashed_workers(conn)
+        task, run = kb.get_task(conn, tid), kb.latest_run(conn, tid)
+        assert task is not None and task.status == "review" and task.consecutive_failures == 0
+        assert task.claim_lock is None and task.current_run_id is None
+        assert run is not None and run.outcome == "rate_limited"
+        # The genuine review request is a terminal handoff and resets its own streak.
+        assert kbd._protocol_violation_streak(conn, tid) == 0
 
 
 def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, capsys):

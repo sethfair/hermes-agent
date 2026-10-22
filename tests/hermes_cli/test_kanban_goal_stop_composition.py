@@ -114,6 +114,82 @@ def test_followup_failed_provider_turn_reaches_process_exit(monkeypatch, quiet, 
 
 
 @pytest.mark.parametrize("quiet", [False, True])
+@pytest.mark.parametrize("fail_on_turn", [2, 3])
+@pytest.mark.parametrize("phase,error,code", [
+    ("status", TimeoutError("status unavailable"), 75),
+    ("status", ValueError("invalid status"), 1),
+    ("status", KeyboardInterrupt(), 130),
+    ("judge", ConnectionError("judge unavailable"), 75),
+    ("judge", ValueError("bad judge"), 1),
+    ("judge", KeyboardInterrupt(), 130),
+])
+def test_followup_infrastructure_after_latest_success_reaches_actual_caller(
+        monkeypatch, capsys, quiet, fail_on_turn, phase, error, code):
+    """A successful later worker turn is evidence, never authority to lose a later error."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_testowned")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr("tools.kanban_tools.register_current_worker_from_env", lambda: True)
+    monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "_collect_query_images", lambda q, i: (q, []))
+    monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda imgs: [])
+    monkeypatch.setattr(cli, "_route_single_query_images", lambda c, q, e, i, u: e)
+    finalized, hooks, judged = [], [], []
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda c: finalized.append(c.session_id))
+    monkeypatch.setattr(cli, "_emit_interrupted_session_end", lambda c, **kw: hooks.append((c.session_id, kw)))
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda *a: SimpleNamespace(
+        title="task", body="acceptance", goal_max_turns=5))
+    monkeypatch.setattr("hermes_cli.kanban_db_connect.connect_closing", lambda: _Connection())
+    statuses = []
+    def status(*args):
+        statuses.append(args)
+        if phase == "status" and len(statuses) == fail_on_turn:
+            raise error
+        return "running"
+    monkeypatch.setattr(kb, "goal_run_status", status)
+    monkeypatch.setattr(kb, "block_task", lambda *a, **k: pytest.fail("no block after infrastructure error"))
+    def judge(*args):
+        judged.append(args)
+        if phase == "judge" and len(judged) == fail_on_turn:
+            raise error
+        return "continue", "next fixture slice", False, None, False
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    calls = []
+    def raw():
+        calls.append(len(calls) + 1)
+        return {"final_response": f"receipt {len(calls)}", "completed": True,
+                "input_tokens": len(calls) * 11, "messages": []}
+    agent = SimpleNamespace(session_id="rotated-session", run_conversation=lambda **kw: raw())
+    stub = SimpleNamespace(
+        session_id="rotated-session", agent=agent, conversation_history=[], _last_turn_result=None,
+        _claim_active_session=lambda *a, **k: True, _ensure_runtime_credentials=lambda: True,
+        _resolve_turn_agent_config=lambda q: {"signature": "same", "model": "m", "runtime": None},
+        _active_agent_route_signature="same", _init_agent=lambda **k: True,
+        console=SimpleNamespace(print=lambda *a, **k: None), _show_security_advisories=lambda: None,
+        _print_exit_summary=lambda **k: None,
+    )
+    def chat(*args, **kwargs):
+        stub._last_turn_result = raw()
+        return stub._last_turn_result["final_response"]
+    stub.chat = chat
+    with pytest.raises(SystemExit) as exc:
+        cli._run_single_query_mode(stub, "task", None, quiet, True)
+    assert exc.value.code == code and len(calls) == fail_on_turn
+    assert len(statuses) == fail_on_turn
+    assert len(judged) == (fail_on_turn if phase == "judge" else fail_on_turn - 1)
+    assert finalized == ["rotated-session"]
+    assert hooks == ([("rotated-session", {"reason": "keyboard_interrupt"})]
+                     if isinstance(error, KeyboardInterrupt) else [])
+    output = capsys.readouterr()
+    assert output.err.count(f"[kanban-worker-exit] rc={code}") == 1
+    if quiet:
+        assert output.err.count("session_id: rotated-session") == 1
+        assert f"receipt {fail_on_turn}" in output.out
+    else:
+        assert "session_id: rotated-session" not in output.err
+
+
+@pytest.mark.parametrize("quiet", [False, True])
 @pytest.mark.parametrize("error", [AuxiliaryClientUnavailable("reauthentication required"),
                                     TypeError("bad auxiliary config"), Exception("auth-like prose"),
                                     TimeoutError("aux timeout")])
