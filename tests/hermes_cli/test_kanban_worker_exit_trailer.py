@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import cli
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -20,13 +22,35 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER, exit_single_query
 
 
-def _selected_goal_code(monkeypatch, error, *, real_judge=False):
+def _selected_goal_code(monkeypatch, error, *, real_judge=False, phase="judge"):
     """Select a disposition through the real goal loop before native booking."""
     from unittest.mock import patch
     from hermes_cli import goals
     from hermes_cli.cli_single_query import _goal_infrastructure_exit_code
     from hermes_cli.kanban_goal_result import GoalLoopProgress, GoalTurnResult
     first = GoalTurnResult("test receipt", {"completed": True, "final_response": "test receipt"}, 0)
+    if phase == "lookup":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_testowned")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "19")
+        class Conn:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        with monkeypatch.context() as scoped:
+            scoped.setattr(kb, "get_task", lambda *a: (_ for _ in ()).throw(error))
+            scoped.setattr("hermes_cli.kanban_db_connect.connect_closing", lambda: Conn())
+            return cli._run_kanban_goal_loop_q(
+                SimpleNamespace(agent=SimpleNamespace(session_id="s1"), session_id="s1"),
+                first, progress=GoalLoopProgress(first)).exit_code
+    if phase == "status":
+        outcome = goals.run_kanban_goal_loop(
+            task_id="t_testowned", goal_text="test-owned task", first_turn=first,
+            progress=GoalLoopProgress(first), run_turn=lambda p: pytest.fail("no model"),
+            task_status_fn=lambda: (_ for _ in ()).throw(error),
+            block_fn=lambda p: pytest.fail("no block"),
+            infrastructure_exit_code=_goal_infrastructure_exit_code)
+        return outcome.exit_code
     if real_judge:
         actual = goals.judge_goal
         seen = []
@@ -167,8 +191,10 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
 
 def test_goal_loop_local_exits_preserve_dispatcher_booking_distinction(kanban_home, monkeypatch):
     transient = _selected_goal_code(monkeypatch, TimeoutError("judge unavailable"))
+    status_transient = _selected_goal_code(monkeypatch, ConnectionError("status unavailable"), phase="status")
+    lookup_transient = _selected_goal_code(monkeypatch, TimeoutError("lookup unavailable"), phase="lookup")
     deterministic = _selected_goal_code(monkeypatch, ValueError("schema mismatch"))
-    assert transient == 75 and deterministic == 1
+    assert (transient, status_transient, lookup_transient, deterministic) == (75, 75, 75, 1)
     seen_crashes = []
     original_account = kbd._account_crashes
     def account(conn, crash_details, *args, **kwargs):
@@ -177,16 +203,20 @@ def test_goal_loop_local_exits_preserve_dispatcher_booking_distinction(kanban_ho
     monkeypatch.setattr(kbd, "_account_crashes", account)
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=f"transient-{i}", assignee="a") for i in range(3)]
-        for i, tid in enumerate(tids):
-            _dead_worker_with_log(conn, tid, 80001 + i, transient)
+        for i, (tid, selected) in enumerate(zip(tids, (transient, status_transient, lookup_transient))):
+            _dead_worker_with_log(conn, tid, 80001 + i, selected)
         broken = kb.create_task(conn, title="deterministic", assignee="a")
         _dead_worker_with_log(conn, broken, 80009, deterministic)
         kbd.detect_crashed_workers(conn)
         assert len(seen_crashes) == 1 and seen_crashes[0][0] == broken
+        assert seen_crashes[0][1] == 80009
+        assert seen_crashes[0][3].code == deterministic
+        assert seen_crashes[0][3].run_outcome == "crashed"
         for tid in tids:
             task = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
-            assert task.status == "ready" and task.consecutive_failures == 0
+            assert task is not None and task.status == "ready" and task.consecutive_failures == 0
+            assert task.claim_lock is None and task.current_run_id is None and task.worker_pid is None
             assert run is not None and run.outcome == "rate_limited"
         task = kb.get_task(conn, broken)
         run = kb.latest_run(conn, broken)
@@ -194,8 +224,15 @@ def test_goal_loop_local_exits_preserve_dispatcher_booking_distinction(kanban_ho
         assert run is not None and run.outcome == "crashed"
 
 
-def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_home, monkeypatch):
-    code = _selected_goal_code(monkeypatch, ValueError("bad auxiliary config"), real_judge=True)
+@pytest.mark.parametrize("error", [
+    ValueError("bad auxiliary config"), TimeoutError("swallowed transient"),
+    TypeError("bad auxiliary type"), RuntimeError("auth-like diagnostic"),
+    pytest.param(None, id="auxiliary-unavailable"),
+])
+def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_home, monkeypatch, error):
+    from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
+    error = error if error is not None else AuxiliaryClientUnavailable("reauthentication required")
+    code = _selected_goal_code(monkeypatch, error, real_judge=True)
     assert code == 1
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=f"schema-{i}", assignee="a") for i in range(3)]
@@ -217,8 +254,12 @@ def test_three_deterministic_goal_exits_trip_systemic_sticky_containment(kanban_
 
 @pytest.mark.parametrize("error", [
     ValueError("bad auxiliary config"), TimeoutError("swallowed transient"),
+    TypeError("bad auxiliary type"), RuntimeError("auth-like diagnostic"),
+    pytest.param(None, id="auxiliary-unavailable"),
 ])
 def test_real_judge_catch_all_selected_one_books_native_crash(kanban_home, monkeypatch, error):
+    from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
+    error = error if error is not None else AuxiliaryClientUnavailable("reauthentication required")
     code = _selected_goal_code(monkeypatch, error, real_judge=True)
     assert code == 1 and kbd._exit_code_kind(code)[0] == "nonzero_exit"
     with kbc.connect() as conn:
@@ -247,7 +288,9 @@ def test_transient_goal_exit_restores_review_and_preserves_protocol_streak(kanba
         _dead_worker_with_log(conn, ready, 84004, code)
         assert kbd._worker_log_exit_code(ready) == 75
         kbd.detect_crashed_workers(conn)
-        assert kb.get_task(conn, ready).status == "ready"
+        ready_task = kb.get_task(conn, ready)
+        assert ready_task is not None and ready_task.status == "ready"
+        assert ready_task.claim_lock is None and ready_task.current_run_id is None and ready_task.worker_pid is None
         assert kbd._protocol_violation_streak(conn, ready) == 1
         newest = conn.execute("SELECT outcome, ended_at FROM task_runs WHERE task_id=? "
                               "ORDER BY ended_at DESC LIMIT 1", (ready,)).fetchone()
@@ -266,6 +309,7 @@ def test_transient_goal_exit_restores_review_and_preserves_protocol_streak(kanba
         kbd.detect_crashed_workers(conn)
         task, run = kb.get_task(conn, tid), kb.latest_run(conn, tid)
         assert task is not None and task.status == "review" and task.consecutive_failures == 0
+        assert task.worker_pid is None
         assert task.claim_lock is None and task.current_run_id is None
         assert run is not None and run.outcome == "rate_limited"
         # The genuine review request is a terminal handoff and resets its own streak.
@@ -284,3 +328,24 @@ def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, c
         exit_single_query(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
     assert exc.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
     assert f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE}" in capsys.readouterr().err
+
+
+def test_native_130_books_nonzero_crash_and_protocol_override(kanban_home):
+    with kbc.connect() as conn:
+        interrupted = kb.create_task(conn, title="interrupted", assignee="a")
+        _dead_worker_with_log(conn, interrupted, 85001, 130)
+        kbd.detect_crashed_workers(conn)
+        task, run = kb.get_task(conn, interrupted), kb.latest_run(conn, interrupted)
+        assert kbd._exit_code_kind(130)[0] == "nonzero_exit"
+        assert task is not None and task.status == "ready" and task.consecutive_failures == 1
+        assert run is not None and run.outcome == "crashed"
+        overridden = kb.create_task(conn, title="protocol override", assignee="a", max_retries=1)
+        _dead_worker_with_log(conn, overridden, 85002, 0)
+        kbd.detect_crashed_workers(conn)
+        held, run = kb.get_task(conn, overridden), kb.latest_run(conn, overridden)
+        assert held is not None and held.status == "blocked" and held.consecutive_failures == 1
+        assert held.claim_lock is None and held.current_run_id is None
+        assert run is not None and run.outcome == "crashed"
+        assert kbd._protocol_violation_streak(conn, overridden) == 1
+        gave_up = [e for e in kb.list_events(conn, overridden) if e.kind == "gave_up"]
+        assert len(gave_up) == 1 and gave_up[0].payload["protocol_violation_limit"] == 1
