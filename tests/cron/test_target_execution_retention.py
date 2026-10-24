@@ -41,12 +41,15 @@ def test_unresolved_quota_denies_new_binding_without_eviction(tmp_path, monkeypa
             assert held
             if index == 0:
                 executions.reserve_prerun_binding(attempt["id"], job["id"], claimed["fire_claim"]["by"])
+                assert executions.finish_execution(attempt["id"], success=True)["status"] == "completed"
+                executions.begin_local_finalization(attempt["id"])
+                assert executions.mirror_local_finalization(attempt["id"], "succeeded", "a" * 64)
             else:
                 with pytest.raises(RuntimeError, match="quota"):
                     executions.reserve_prerun_binding(attempt["id"], job["id"], claimed["fire_claim"]["by"])
     with executions._transaction() as db:
-        rows = db.execute("SELECT execution_id FROM cron_prerun_bindings").fetchall()
-    assert [row[0] for row in rows] == ids[:1]
+        rows = db.execute("SELECT execution_id,unresolved_pin FROM cron_prerun_bindings").fetchall()
+    assert [tuple(row) for row in rows] == [(ids[0], 1)], "local mirror alone cannot release a v2 receipt pin"
 
 
 def test_ownerless_canonical_recovery_keeps_target_disposition_unpromoted(tmp_path, monkeypatch):
@@ -115,3 +118,37 @@ def test_canonical_nonce_refuses_changed_original_execution_owner(tmp_path, monk
         state = db.execute("SELECT bind_state,nonce_digest FROM cron_prerun_bindings WHERE execution_id=?",
                            (execution["id"],)).fetchone()
     assert tuple(state) == ("awaiting_canonical", None)
+
+def test_canonical_preparation_rejects_wrong_job_profile_and_claim(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    job = jobs.create_job(prompt="synthetic", schedule="every 1h")
+    other = jobs.create_job(prompt="other", schedule="every 1h")
+    claimed = jobs.claim_job_for_fire(job["id"], manual=True, return_job=True)
+    assert isinstance(claimed, dict)
+    execution = executions.create_execution(job["id"], source="test")
+    assert executions.mark_execution_running(execution["id"])
+    owner = claimed["fire_claim"]["by"]
+    with jobs.fire_claim_fence(job["id"], expected_owner=owner) as held:
+        assert held
+        executions.reserve_prerun_binding(execution["id"], job["id"], owner)
+        for wrong_job, wrong_owner in ((other["id"], owner), (job["id"], "forged")):
+            with pytest.raises(RuntimeError):
+                executions.prepare_prerun_binding(execution["id"], wrong_job, "admission", "a" * 64, wrong_owner)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+        with pytest.raises(RuntimeError):
+            executions.prepare_prerun_binding(execution["id"], job["id"], "admission", "a" * 64, owner)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert executions.prepare_prerun_binding(execution["id"], job["id"], "admission", "a" * 64, owner)["bind_state"] == "preparing"
+        with pytest.raises(RuntimeError, match="admission"):
+            executions.bind_prerun_output(execution["id"], job["id"], "wrong", owner,
+                                          generation=1, epoch_id="b" * 64,
+                                          issuance_digest="c" * 64, output_sha256="d" * 64)
+        with pytest.raises(RuntimeError, match="claim"):
+            executions.bind_prerun_output(execution["id"], job["id"], "admission", "forged",
+                                          generation=1, epoch_id="b" * 64,
+                                          issuance_digest="c" * 64, output_sha256="d" * 64)
+    with executions._transaction() as db:
+        state = db.execute("SELECT bind_state,epoch_id,unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",
+                           (execution["id"],)).fetchone()
+    assert tuple(state) == ("preparing", None, 1)

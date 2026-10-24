@@ -74,6 +74,53 @@ def _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info
     assert terminal == ("completed",) and disposition == ("pending",)
     assert (outcomes, checked) == ((0, 0) if hold_finalizer == "before-v2" else (1, 2))
 
+    # A new process may fire after the dead owner, but cannot settle the prior pin.
+    contender = subprocess.run(
+        [sys.executable, "-c",
+         "import json,os,pathlib,sqlite3\n"
+         "from cron import jobs\n"
+         f"new=jobs.claim_job_for_fire({info['job_id']!r},manual=True,return_job=True)\n"
+         "assert isinstance(new,dict)\n"
+         "with sqlite3.connect(pathlib.Path(os.environ['HERMES_HOME'])/'cron'/'executions.db') as db:\n"
+         f" state=db.execute('SELECT state FROM cron_local_finalizations WHERE execution_id=?',({info['execution_id']!r},)).fetchone()\n"
+         "print(json.dumps({'owner':new['fire_claim']['by'],'old_state':state[0]}))\n"],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**{k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ},
+             "HERMES_HOME": str(home), "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert contender.returncode == 0, contender.stderr
+    observed = json.loads(contender.stdout)
+    assert observed["owner"] != info["claim"] and observed["old_state"] == "pending"
+
+
+def _assert_absent_v2_fails_closed(firer, home, job, info):
+    wait_until(lambda: firer.poll() is not None, timeout=35,
+               what="absent v2 fails the real original firer")
+    observer_path = home / "cron" / f"recovery-{job['id']}" / "local-observation-v2.sqlite"
+    assert not observer_path.exists()
+    with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
+        state = db.execute(
+            "SELECT e.status,b.bind_state,b.unresolved_pin FROM executions e "
+            "JOIN cron_prerun_bindings b ON b.execution_id=e.id WHERE e.id=?",
+            (info["execution_id"],),
+        ).fetchone()
+        assert state is not None and state[0] != "completed" and state[1:] == ("preparing", 1)
+        assert db.execute("SELECT count(*) FROM cron_local_finalizations").fetchone()[0] == 0
+
+
+def _assert_original_reservation(home, job, info):
+    with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
+        db.row_factory = sqlite3.Row
+        execution = db.execute("SELECT * FROM executions WHERE id=?", (info["execution_id"],)).fetchone()
+        assert execution is not None and execution["status"] == "running"
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "cron_prerun_bindings" in tables, "real canonical admission lacked original firer reservation"
+        rows = db.execute("SELECT * FROM cron_prerun_bindings WHERE execution_id=?",
+                          (info["execution_id"],)).fetchall()
+        assert len(rows) == 1 and rows[0]["bind_state"] in ("awaiting_canonical", "preparing")
+        assert rows[0]["job_id"] == job["id"]
+
 
 def _assert_terminal_and_receipts(home, execution_id, epoch_db, stage_roots,
                                   omit_receipt, firer_log):
@@ -103,11 +150,13 @@ def _assert_terminal_and_receipts(home, execution_id, epoch_db, stage_roots,
      (False, False, False, True, False, False), (True, False, False, False, True, False),
      (True, False, False, False, False, True),
      (True, False, False, False, "before-v2", False),
-     (True, False, False, False, "after-v2", False)],
+     (True, False, False, False, "after-v2", False),
+     (False, "absent-v2", False, False, False, False)],
     ids=["no-stage", "two-serial-stages", "tampered-prerun-script",
          "sigkill-script-before-commit", "sigkill-script-after-provisional",
          "second-fire-waits-through-finalizer", "missing-root-receipt-refuses-mirror",
-         "sigkill-firer-terminal-before-v2", "sigkill-firer-v2-before-mirror"],
+         "sigkill-firer-terminal-before-v2", "sigkill-firer-v2-before-mirror",
+         "absent-v2-production-fails-closed"],
 )
 def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_terminal(
     tmp_path, monkeypatch, model_peer, stage_roots, tamper, kill_script, kill_after_commit,
@@ -141,6 +190,10 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
         "job_id = os.environ.get('HERMES_LOCAL_OBSERVATION_JOB_ID')\n"
         "assert nonce and execution_id and job_id, 'scoped producer identity absent'\n"
         "digest = hashlib.sha256(bytes.fromhex(nonce)).hexdigest()\n"
+        f"if {tamper == 'absent-v2'!r}:\n"
+        " epoch_id = hashlib.sha256((execution_id + digest).encode()).hexdigest()\n"
+        " print(json.dumps({'version':2,'execution_id':execution_id,'nonce_digest':digest,'generation':1,'epoch_id':epoch_id,'issuance_digest':hashlib.sha256(b'synthetic-empty-issuance').hexdigest(),'wakeAgent':True}))\n"
+        " raise SystemExit(0)\n"
         "db_path = pathlib.Path(os.environ['HERMES_HOME']) / 'cron' / ('recovery-' + job_id) / 'local-observation-v2.sqlite'\n"
         "db_path.parent.mkdir(mode=0o700, exist_ok=True)\n"
         "with sqlite3.connect(db_path) as db:\n"
@@ -190,7 +243,7 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
                       "local_observation_finalizer_script": str(finalizer),
                       "local_observation_finalizer_sha256": hashlib.sha256(finalizer.read_bytes()).hexdigest()}
     (home / "config.yaml").write_text(json.dumps(config))
-    if tamper:
+    if tamper is True:
         script.write_text(script.read_text() + "\n# altered after opt-in\n")
     with sqlite3.connect(home / "cron" / "synthetic-board.sqlite") as board:
         board.execute("CREATE TABLE roots (root TEXT PRIMARY KEY, evidence TEXT NOT NULL)")
@@ -238,8 +291,9 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
             gateway_log.flush(); gateway_log.seek(0)
             raise AssertionError(f"PRETEST firer={firer.poll()} {firer_log.read()} gateway={gateway_log.read()}") from exc
         info = json.loads(firer_info.read_text())
+        info["job_id"] = job["id"]
         assert info["pid"] == firer.pid != gateway.pid
-        if tamper:
+        if tamper is True:
             assert not started.exists(), "changed target script ran despite configured exact digest"
             with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
                 status = db.execute("SELECT status FROM executions WHERE id=?", (info["execution_id"],)).fetchone()
@@ -280,24 +334,16 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
             assert row is not None and row[0] != "completed" and row[1] == "preparing"
             return
         # This is an admitted real RPC: the canonical process reached the script barrier.
-        with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
-            db.row_factory = sqlite3.Row
-            execution = db.execute("SELECT * FROM executions WHERE id=?", (info["execution_id"],)).fetchone()
-            assert execution is not None and execution["status"] == "running"
-            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            assert "cron_prerun_bindings" in tables, (
-                "real distinct-process canonical admission reached script, but original firer "
-                "did not reserve its durable awaiting_canonical binding")
-            rows = db.execute("SELECT * FROM cron_prerun_bindings WHERE execution_id=?",
-                              (info["execution_id"],)).fetchall()
-            assert len(rows) == 1 and rows[0]["bind_state"] in ("awaiting_canonical", "preparing")
-            assert rows[0]["job_id"] == job["id"]
+        _assert_original_reservation(home, job, info)
         release.touch()
         identity_path = tmp_path / "script-identity"
         wait_until(identity_path.exists, timeout=5)
         identity = json.loads(identity_path.read_text())
         assert identity == {"nonce_present": True, "execution_present": True}, (
             "admitted canonical script lacked scoped producer identity")
+        if tamper == "absent-v2":
+            _assert_absent_v2_fails_closed(firer, home, job, info)
+            return
         epoch_db = home / "cron" / f"recovery-{job['id']}" / "local-observation-v2.sqlite"
         def committed_epoch():
             if not epoch_db.exists():
@@ -321,7 +367,8 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
         assert binding is not None and binding[0] == "bound"
         assert binding[1:3] == epoch[1:3] and binding[3]
         if stage_roots:
-            assert model_peer.blocked.wait(15), "real canonical model did not reach its stage barrier"
+            assert model_peer.blocked.wait(15), ("real canonical model did not reach its stage barrier; "
+                                                 f"firer={firer.poll()} log={firer_log.read()} gateway={gateway_log.read()}")
             adapter = root / "tests" / "cron" / "fixtures" / "wri2276_observer_contract.py"
             stage_env = dict(env, WRI2276_SYNTHETIC_JOB_ID=job["id"])
             for revision, root_id in enumerate(("root-a", "root-b"), start=1):
@@ -382,7 +429,8 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
                     contender.terminate()
                 contender.wait(timeout=8)
         wait_until(lambda: firer.poll() is not None, timeout=40, what="original firer terminal")
-        assert model_peer.requests, "loopback agent was not reached through canonical process"
+        assert model_peer.requests, ("loopback agent was not reached through canonical process; "
+                                     f"job={jobs.get_job(job['id'])} firer={firer_log.read()} gateway={gateway_log.read()}")
         firer_log.flush(); firer_log.seek(0)
         gateway_log.flush(); gateway_log.seek(0)
         _assert_terminal_and_receipts(home, info["execution_id"], epoch_db, stage_roots,
