@@ -441,7 +441,7 @@ def prepare_prerun_binding(execution_id: str, job_id: str, admission_id: str,
 
 
 def bind_prerun_output(execution_id: str, job_id: str, admission_id: str,
-                       fire_claim_by: str, *, generation: int, epoch_id: str,
+                       fire_claim_by: str, *, nonce_digest: str, generation: int, epoch_id: str,
                        issuance_digest: str, output_sha256: str) -> dict[str, Any]:
     """Canonical binding of already-validated post-redaction output, never terminal ownership."""
     from cron import jobs
@@ -458,12 +458,15 @@ def bind_prerun_output(execution_id: str, job_id: str, admission_id: str,
                WHERE b.execution_id=? AND b.job_id=? AND e.job_id=?""",
             (execution_id, job_id, job_id),
         ).fetchone()
+        if row is not None and row["nonce_digest"] != nonce_digest:
+            raise RuntimeError("Target cron nonce digest differs from canonical preparation")
         if (row is None or row["execution_status"] != "running"
                 or row["bind_state"] != "preparing"
                 or row["process_id"] != row["execution_process_id"]
                 or row["pid"] != row["execution_pid"]
                 or row["process_started_at"] != row["execution_birth"]
                 or row["admission_id"] != admission_id
+                or row["nonce_digest"] != nonce_digest
                 or row["fire_claim_by"] != fire_claim_by
                 or row["profile_home"] != str(get_hermes_home().resolve())
                 or not _owner_is_live(row["pid"], row["process_started_at"])):

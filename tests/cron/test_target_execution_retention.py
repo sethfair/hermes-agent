@@ -142,11 +142,11 @@ def test_canonical_preparation_rejects_wrong_job_profile_and_claim(tmp_path, mon
         assert executions.prepare_prerun_binding(execution["id"], job["id"], "admission", "a" * 64, owner)["bind_state"] == "preparing"
         with pytest.raises(RuntimeError, match="admission"):
             executions.bind_prerun_output(execution["id"], job["id"], "wrong", owner,
-                                          generation=1, epoch_id="b" * 64,
+                                          nonce_digest="a" * 64, generation=1, epoch_id="b" * 64,
                                           issuance_digest="c" * 64, output_sha256="d" * 64)
         with pytest.raises(RuntimeError, match="claim"):
             executions.bind_prerun_output(execution["id"], job["id"], "admission", "forged",
-                                          generation=1, epoch_id="b" * 64,
+                                          nonce_digest="a" * 64, generation=1, epoch_id="b" * 64,
                                           issuance_digest="c" * 64, output_sha256="d" * 64)
     with executions._transaction() as db:
         state = db.execute("SELECT bind_state,epoch_id,unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",

@@ -148,6 +148,7 @@ def bind_canonical_output(job: dict, output: str) -> dict:
             raise RuntimeError("Target cron binding fire fence lost")
         return executions.bind_prerun_output(
             execution_id, job["id"], admission[2], owner,
+            nonce_digest=envelope["nonce_digest"],
             generation=envelope["generation"], epoch_id=envelope["epoch_id"],
             issuance_digest=envelope["issuance_digest"],
             output_sha256=hashlib.sha256(data).hexdigest(),
