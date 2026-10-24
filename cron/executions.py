@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
+# Unresolved target receipts cannot be pruned; deny new fires before an unbounded pin pile-up.
+MAX_TARGET_UNRESOLVED_BINDINGS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
@@ -88,6 +90,39 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS cron_prerun_bindings (
+             execution_id TEXT PRIMARY KEY,
+             job_id TEXT NOT NULL,
+             profile_home TEXT NOT NULL,
+             process_id TEXT NOT NULL,
+             pid INTEGER NOT NULL,
+             process_started_at INTEGER,
+             fire_claim_by TEXT NOT NULL,
+             unresolved_pin INTEGER NOT NULL DEFAULT 1,
+             bind_state TEXT NOT NULL CHECK(bind_state IN
+               ('awaiting_canonical','preparing','bound','unknown')),
+             nonce_digest TEXT,
+             generation INTEGER,
+             epoch_id TEXT,
+             issuance_digest TEXT,
+             output_sha256 TEXT,
+             admission_id TEXT,
+             created_at TEXT NOT NULL,
+             FOREIGN KEY(execution_id) REFERENCES executions(id)
+           )"""
+    )
+    add_column_if_missing(conn, "cron_prerun_bindings", "unresolved_pin",
+                          "unresolved_pin INTEGER NOT NULL DEFAULT 1")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS cron_local_finalizations (
+             execution_id TEXT PRIMARY KEY,
+             state TEXT NOT NULL CHECK(state IN ('pending','succeeded','unknown','not_applicable')),
+             outcome_digest TEXT,
+             created_at TEXT NOT NULL,
+             FOREIGN KEY(execution_id) REFERENCES executions(id)
+           )"""
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
@@ -203,6 +238,9 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
+               AND NOT EXISTS (
+                 SELECT 1 FROM cron_prerun_bindings b
+                 WHERE b.execution_id=executions.id AND b.unresolved_pin=1)
              ORDER BY julianday(finished_at) DESC, finished_at DESC,
                       julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
@@ -307,6 +345,178 @@ def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
+
+
+def reserve_prerun_binding(execution_id: str, job_id: str, fire_claim_by: str) -> dict[str, Any]:
+    """Original firer only: pin the running owner before canonical submission.
+
+    The caller holds the real job's fire fence. This never delegates execution ownership;
+    a separate canonical admission must validate the pin before script effects.
+    """
+    from cron import jobs
+
+    job = jobs.get_job(job_id)
+    if (not job or not isinstance(job.get("fire_claim"), dict)
+            or job["fire_claim"].get("by") != fire_claim_by):
+        raise RuntimeError("Target cron fire claim is absent or changed")
+    with _transaction() as conn:
+        row = _fetch(conn, execution_id)
+        if (not row or row["job_id"] != job_id or row["status"] != "running"
+                or row["process_id"] != _PROCESS_ID or row["pid"] != os.getpid()
+                or not _owner_is_live(row["pid"], row["process_started_at"])):
+            raise RuntimeError("Target cron original running owner is absent or changed")
+        profile_home = str(get_hermes_home().resolve())
+        previous = conn.execute(
+            "SELECT * FROM cron_prerun_bindings WHERE execution_id=?", (execution_id,)
+        ).fetchone()
+        if previous is not None:
+            if (previous["job_id"] != job_id or previous["profile_home"] != profile_home
+                    or previous["process_id"] != row["process_id"]
+                    or previous["pid"] != row["pid"]
+                    or previous["process_started_at"] != row["process_started_at"]
+                    or previous["fire_claim_by"] != fire_claim_by
+                    or previous["bind_state"] != "awaiting_canonical"):
+                raise RuntimeError("Target cron reservation is already decided or mismatched")
+            return dict(previous)
+        unresolved = conn.execute(
+            "SELECT count(*) FROM cron_prerun_bindings WHERE unresolved_pin=1"
+        ).fetchone()[0]
+        if unresolved >= MAX_TARGET_UNRESOLVED_BINDINGS:
+            raise RuntimeError("Target cron unresolved binding quota reached; reconcile before a new fire")
+        conn.execute(
+            """INSERT INTO cron_prerun_bindings
+               (execution_id, job_id, profile_home, process_id, pid,
+                process_started_at, fire_claim_by, bind_state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_canonical', ?)""",
+            (execution_id, job_id, profile_home, row["process_id"], row["pid"],
+             row["process_started_at"], fire_claim_by, _hermes_now().isoformat()),
+        )
+        saved = conn.execute(
+            "SELECT * FROM cron_prerun_bindings WHERE execution_id=?", (execution_id,)
+        ).fetchone()
+    if saved is None:
+        raise RuntimeError("Target cron reservation readback failed")
+    return dict(saved)
+
+
+def prepare_prerun_binding(execution_id: str, job_id: str, admission_id: str,
+                           nonce_digest: str, fire_claim_by: str) -> dict[str, Any]:
+    """Canonical owner may prepare only the live original firer's reserved fire."""
+    from cron import jobs
+
+    job = jobs.get_job(job_id)
+    if (not job or not isinstance(job.get("fire_claim"), dict)
+            or job["fire_claim"].get("by") != fire_claim_by):
+        raise RuntimeError("Target cron claim changed before canonical preparation")
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT e.status, e.process_id, e.pid, e.process_started_at, b.*
+               FROM cron_prerun_bindings b JOIN executions e ON e.id=b.execution_id
+               WHERE b.execution_id=? AND b.job_id=? AND e.job_id=?""",
+            (execution_id, job_id, job_id),
+        ).fetchone()
+        if (row is None or row["status"] != "running" or row["bind_state"] != "awaiting_canonical"
+                or row["profile_home"] != str(get_hermes_home().resolve())
+                or row["fire_claim_by"] != fire_claim_by
+                or not _owner_is_live(row["pid"], row["process_started_at"])):
+            raise RuntimeError("Target cron original firer is not live and reserved")
+        cur = conn.execute(
+            """UPDATE cron_prerun_bindings SET bind_state='preparing',
+               nonce_digest=?, admission_id=?
+               WHERE execution_id=? AND bind_state='awaiting_canonical'""",
+            (nonce_digest, admission_id, execution_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Target cron canonical preparation lost the reservation")
+        saved = conn.execute("SELECT * FROM cron_prerun_bindings WHERE execution_id=?",
+                             (execution_id,)).fetchone()
+    if saved is None:
+        raise RuntimeError("Target cron canonical preparation readback failed")
+    return dict(saved)
+
+
+def bind_prerun_output(execution_id: str, job_id: str, admission_id: str,
+                       fire_claim_by: str, *, generation: int, epoch_id: str,
+                       issuance_digest: str, output_sha256: str) -> dict[str, Any]:
+    """Canonical binding of already-validated post-redaction output, never terminal ownership."""
+    from cron import jobs
+
+    current_job = jobs.get_job(job_id)
+    if (not current_job or not isinstance(current_job.get("fire_claim"), dict)
+            or current_job["fire_claim"].get("by") != fire_claim_by):
+        raise RuntimeError("Target cron claim changed before output binding")
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT e.status AS execution_status, e.process_id AS execution_process_id,
+                      e.pid AS execution_pid, e.process_started_at AS execution_birth, b.*
+               FROM cron_prerun_bindings b JOIN executions e ON e.id=b.execution_id
+               WHERE b.execution_id=? AND b.job_id=? AND e.job_id=?""",
+            (execution_id, job_id, job_id),
+        ).fetchone()
+        if (row is None or row["execution_status"] != "running"
+                or row["bind_state"] != "preparing"
+                or row["process_id"] != row["execution_process_id"]
+                or row["pid"] != row["execution_pid"]
+                or row["process_started_at"] != row["execution_birth"]
+                or row["admission_id"] != admission_id
+                or row["fire_claim_by"] != fire_claim_by
+                or row["profile_home"] != str(get_hermes_home().resolve())
+                or not _owner_is_live(row["pid"], row["process_started_at"])):
+            raise RuntimeError("Target cron live original owner or admission changed before binding")
+        cursor = conn.execute(
+            """UPDATE cron_prerun_bindings SET bind_state='bound', generation=?, epoch_id=?,
+               issuance_digest=?, output_sha256=?
+               WHERE execution_id=? AND bind_state='preparing' AND admission_id=?""",
+            (generation, epoch_id, issuance_digest, output_sha256, execution_id, admission_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Target cron binding lost its compare-and-swap")
+        saved = conn.execute("SELECT * FROM cron_prerun_bindings WHERE execution_id=?",
+                             (execution_id,)).fetchone()
+    if saved is None or saved["bind_state"] != "bound":
+        raise RuntimeError("Target cron binding readback failed")
+    return dict(saved)
+
+
+def target_preterminal(execution_id: str, job_id: str, fire_claim_by: str) -> Optional[dict[str, Any]]:
+    """Read and strictly verify the original live owner and bound identity under fire fence."""
+    with _transaction() as conn:
+        execution = _fetch(conn, execution_id)
+        binding = conn.execute("SELECT * FROM cron_prerun_bindings WHERE execution_id=?",
+                               (execution_id,)).fetchone()
+    if (not execution or binding is None or execution["job_id"] != job_id
+            or execution["status"] != "running" or execution["process_id"] != _PROCESS_ID
+            or execution["pid"] != os.getpid()
+            or binding["bind_state"] != "bound" or binding["job_id"] != job_id
+            or binding["fire_claim_by"] != fire_claim_by
+            or binding["profile_home"] != str(get_hermes_home().resolve())
+            or binding["process_id"] != execution["process_id"]
+            or binding["pid"] != execution["pid"]
+            or binding["process_started_at"] != execution["process_started_at"]
+            or not _owner_is_live(execution["pid"], execution["process_started_at"])):
+        return None
+    return dict(binding)
+
+
+def begin_local_finalization(execution_id: str) -> None:
+    with _transaction() as conn:
+        conn.execute(
+            """INSERT INTO cron_local_finalizations (execution_id,state,created_at)
+               VALUES (?, 'pending', ?)""", (execution_id, _hermes_now().isoformat()))
+
+
+def mirror_local_finalization(execution_id: str, state: str, digest: str) -> bool:
+    if state not in {"succeeded", "not_applicable", "unknown"} or len(digest) != 64:
+        return False
+    with _transaction() as conn:
+        result = conn.execute(
+            """UPDATE cron_local_finalizations SET state=?, outcome_digest=?
+               WHERE execution_id=? AND state='pending'
+                 AND EXISTS (SELECT 1 FROM executions
+                             WHERE id=? AND status='completed')""",
+            (state, digest, execution_id, execution_id),
+        )
+        return result.rowcount == 1
 
 
 def finish_execution(

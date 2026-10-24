@@ -2290,13 +2290,27 @@ def _prepare_job_prompt(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
+        from cron.scheduler_local_observation import is_target_job, prepare_canonical
+        scoped_env, script_pin = prepare_canonical(job) if is_target_job(job) else (None, None)
         prerun_script = _run_job_script_with_claim_heartbeat(
             job,
             script_path,
             workdir=_resolve_job_workdir(job, job_id),
             cancel_event=cancel_event,
+            scoped_env=scoped_env,
         )
         _ran_ok, _script_output = prerun_script
+        if is_target_job(job):
+            if not _ran_ok:
+                return (False, "", "", "Target observation script failed before binding"), None
+            from cron.scheduler_local_observation import bind_canonical_output, verify_target_script
+            try:
+                if verify_target_script(job) != script_pin:
+                    raise RuntimeError("Target cron script identity changed while running")
+                bind_canonical_output(job, _script_output)
+            except (RuntimeError, ValueError, KeyError, OSError, UnicodeError) as exc:
+                logger.warning("Target observation output refused for job %s: %s", job_id, exc)
+                return (False, "", "", "Target observation output was not durably bound"), None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
@@ -3266,6 +3280,11 @@ def _start_owned_run(job: dict, execution_id: str) -> Optional[contextvars.Token
         record = get_execution(execution_id)
     elif (record := mark_execution_running(execution_id)) is None:
         return None
+    from cron.scheduler_local_observation import is_target_job, reserve_original_firer
+    if is_target_job(job):
+        claim = job.get("fire_claim")
+        reserve_original_firer(job, execution_id,
+                               claim.get("by") if isinstance(claim, dict) else None)
     return enter_cron_execution(job, execution_id, record or {})
 
 

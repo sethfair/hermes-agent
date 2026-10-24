@@ -1812,16 +1812,15 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Disabled unless a single exact profile-local recovery job is configured.
+        "local_observation_target_job_id": "", "local_observation_prerun_sha256": "",
+        "local_observation_finalizer_script": "", "local_observation_finalizer_sha256": "",
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
-        # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
-        # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
-        # created this way are user-owned in the same flat jobs table. Interactive toolsets
-        # (messaging/clarify) stay denied in cron regardless.
+        # Cron agents may schedule user-owned jobs only when opted in; interactive toolsets
+        # remain denied, preventing unattended scheduling loops.
         "allow_agent_scheduling": False,
-        # Pre-dispatch validation: before building any agent machinery, verify the provider API key
-        # resolves (unless a fallback chain exists), attached skills are ready, and delivery
-        # platforms are configured. Failure -> last_status=blocked_config, ONE alert, no LLM call.
-        # False = fail during the run instead.
+        # Pre-dispatch validates provider, skills and delivery; refusal records blocked_config
+        # and alerts once without an LLM call. False defers failure to the run.
         "preflight": True,
         # Default model for cron jobs (WHAT model runs). Fire-time resolution: per-job pin >
         # cron.model > model.default (the main agent model). An unpinned job follows the main

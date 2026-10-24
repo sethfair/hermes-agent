@@ -16,6 +16,7 @@ from hermes_state_keys import CRON_PRINCIPAL_ID, cron_request_id
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, get_session_admission
 
 _execution: ContextVar[tuple | None] = ContextVar('cron_owner_execution', default=None)
+_admission: ContextVar[tuple | None] = ContextVar('cron_admitted_execution', default=None)
 _owners = {}
 
 
@@ -40,6 +41,11 @@ def owner_for_home(home):
 
 def current_execution():
     return _execution.get()
+
+
+def current_admission():
+    """Private owner-context proof; absent outside an admitted canonical cron turn."""
+    return _admission.get()
 
 
 def bind_execution(authority, session_id, job_id, execution_id):
@@ -253,6 +259,8 @@ async def execute(authority, ref, row, policy):
     # The frozen snapshot predates the fire's ledger row; the run's progress stamps need its id.
     job = dict(data['cron_job'], execution_id=execution_id)
     token = bind_execution(authority, ref.session_id, job['id'], execution_id)
+    admission_token = _admission.set((authority, ref.session_id, row['admission_id'],
+                                      job['id'], execution_id, row['request_id']))
     try:
         db_path = await asyncio.to_thread(Path(authority.db.db_path).resolve)
         with _profile_runtime_scope(db_path.parent):
@@ -270,5 +278,6 @@ async def execute(authority, ref, row, policy):
     finally:
         from cron.scheduler_liveness import owner_progress
         owner_progress.pop(execution_id, None)
+        _admission.reset(admission_token)
         _execution.reset(token)
         cancellations.pop(row['admission_id'], None)

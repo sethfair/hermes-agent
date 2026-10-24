@@ -49,13 +49,18 @@ def _classify_delivery_outcome(
     return "suppressed"
 
 
-def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, recovered=False) -> bool:
+def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, recovered=False,
+                         _target_inner=False) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery.
 
     ``d`` is the scheduler's ``_RunDelivery``. Store and ledger writers are read off the
     ``cron.scheduler`` facade, which is where tests and the receipt-recovery path patch them."""
     from cron import scheduler
     job = d.job
+    if not recovered and not _target_inner:
+        from cron.scheduler_local_observation import is_target_job, finish_target_completed_run
+        if is_target_job(job):
+            return finish_target_completed_run(d, fire_owner, execution_id)
     if not d.should_deliver and job.get("last_delivery_queued"):
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
