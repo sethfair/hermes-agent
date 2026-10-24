@@ -122,6 +122,14 @@ def _assert_original_reservation(home, job, info):
         assert rows[0]["job_id"] == job["id"]
 
 
+def _assert_queued_delivery_is_separate(home, job, info):
+    from cron import jobs
+    with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
+        assert db.execute("SELECT delivery_outcome FROM executions WHERE id=?",
+                          (info["execution_id"],)).fetchone() == ("queued",)
+    assert jobs.get_job(job["id"])["last_status"] == "delivery_queued"
+
+
 def _assert_terminal_and_receipts(home, execution_id, epoch_db, stage_roots,
                                   omit_receipt, firer_log):
     with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
@@ -151,12 +159,13 @@ def _assert_terminal_and_receipts(home, execution_id, epoch_db, stage_roots,
      (True, False, False, False, False, True),
      (True, False, False, False, "before-v2", False),
      (True, False, False, False, "after-v2", False),
-     (False, "absent-v2", False, False, False, False)],
+     (False, "absent-v2", False, False, False, False),
+     (True, "queued", False, False, False, False)],
     ids=["no-stage", "two-serial-stages", "tampered-prerun-script",
          "sigkill-script-before-commit", "sigkill-script-after-provisional",
          "second-fire-waits-through-finalizer", "missing-root-receipt-refuses-mirror",
          "sigkill-firer-terminal-before-v2", "sigkill-firer-v2-before-mirror",
-         "absent-v2-production-fails-closed"],
+         "absent-v2-production-fails-closed", "queued-bot-chat-delivery-is-not-checked-proof"],
 )
 def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_terminal(
     tmp_path, monkeypatch, model_peer, stage_roots, tamper, kill_script, kill_after_commit,
@@ -236,7 +245,8 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
     monkeypatch.setenv("HERMES_HOME", str(home))
     # The synthetic recurring job is never due during the gateway boot/ticker.
     job = jobs.create_job(prompt="BLOCK_FIFO synthetic board" if stage_roots else "Check synthetic board",
-                          schedule="every 1h", deliver="local", script=str(script))
+                          schedule="every 1h", deliver="bot-chat" if tamper == "queued" else "local",
+                          script=str(script))
     config = json.loads((home / "config.yaml").read_text())
     config["cron"] = {"local_observation_target_job_id": job["id"],
                       "local_observation_prerun_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
@@ -435,6 +445,8 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
         gateway_log.flush(); gateway_log.seek(0)
         _assert_terminal_and_receipts(home, info["execution_id"], epoch_db, stage_roots,
                                       omit_receipt, firer_log)
+        if tamper == "queued":
+            _assert_queued_delivery_is_separate(home, job, info)
     finally:
         model_peer.release.set()
         release.touch()
