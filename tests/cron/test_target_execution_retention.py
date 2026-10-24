@@ -152,3 +152,25 @@ def test_canonical_preparation_rejects_wrong_job_profile_and_claim(tmp_path, mon
         state = db.execute("SELECT bind_state,epoch_id,unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",
                            (execution["id"],)).fetchone()
     assert tuple(state) == ("preparing", None, 1)
+
+
+def test_canonical_preparation_rejects_mismatched_reserved_firer_fingerprint(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    job = jobs.create_job(prompt="synthetic", schedule="every 1h")
+    claimed = jobs.claim_job_for_fire(job["id"], manual=True, return_job=True)
+    assert isinstance(claimed, dict)
+    execution = executions.create_execution(job["id"], source="test")
+    assert executions.mark_execution_running(execution["id"])
+    owner = claimed["fire_claim"]["by"]
+    with jobs.fire_claim_fence(job["id"], expected_owner=owner) as held:
+        assert held
+        executions.reserve_prerun_binding(execution["id"], job["id"], owner)
+        with executions._transaction() as db:
+            db.execute("UPDATE cron_prerun_bindings SET process_id=? WHERE execution_id=?",
+                       ("different-reserved-firer", execution["id"]))
+        with pytest.raises(RuntimeError, match="original firer"):
+            executions.prepare_prerun_binding(execution["id"], job["id"], "admission", "a" * 64, owner)
+    with executions._transaction() as db:
+        state = db.execute("SELECT bind_state,admission_id FROM cron_prerun_bindings WHERE execution_id=?",
+                           (execution["id"],)).fetchone()
+    assert tuple(state) == ("awaiting_canonical", None)

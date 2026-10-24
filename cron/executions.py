@@ -410,12 +410,17 @@ def prepare_prerun_binding(execution_id: str, job_id: str, admission_id: str,
         raise RuntimeError("Target cron claim changed before canonical preparation")
     with _transaction() as conn:
         row = conn.execute(
-            """SELECT e.status, e.process_id, e.pid, e.process_started_at, b.*
+            """SELECT e.status AS execution_status, e.process_id AS execution_process_id,
+                      e.pid AS execution_pid, e.process_started_at AS execution_birth, b.*
                FROM cron_prerun_bindings b JOIN executions e ON e.id=b.execution_id
                WHERE b.execution_id=? AND b.job_id=? AND e.job_id=?""",
             (execution_id, job_id, job_id),
         ).fetchone()
-        if (row is None or row["status"] != "running" or row["bind_state"] != "awaiting_canonical"
+        if (row is None or row["execution_status"] != "running"
+                or row["bind_state"] != "awaiting_canonical"
+                or row["process_id"] != row["execution_process_id"]
+                or row["pid"] != row["execution_pid"]
+                or row["process_started_at"] != row["execution_birth"]
                 or row["profile_home"] != str(get_hermes_home().resolve())
                 or row["fire_claim_by"] != fire_claim_by
                 or not _owner_is_live(row["pid"], row["process_started_at"])):
