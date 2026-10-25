@@ -7,8 +7,10 @@ import pytest
 
 from cron.scheduler_local_observation import _finalize_with_observer
 
+pytest_plugins = ("tests.cron.fixtures.wri2276_store_fixture",)
 
-def test_world_writable_finalizer_refused_before_execution(tmp_path, monkeypatch):
+
+def test_world_writable_finalizer_refused_before_execution(tmp_path, monkeypatch, real_v2):
     home = tmp_path / "profile"
     scripts = home / "scripts"
     scripts.mkdir(parents=True, mode=0o700)
@@ -28,11 +30,11 @@ def test_world_writable_finalizer_refused_before_execution(tmp_path, monkeypatch
     with pytest.raises(RuntimeError):
         _finalize_with_observer({"id": "synthetic"}, {
             "execution_id": "synthetic-execution", "epoch_id": "a" * 64,
-        })
+        }, object())
     assert not marker.exists(), "untrusted mutable finalizer ran before the store readback failed"
 
 
-def test_symlinked_script_ancestor_refused_before_execution(tmp_path, monkeypatch):
+def test_symlinked_script_ancestor_refused_before_execution(tmp_path, monkeypatch, real_v2):
     home = tmp_path / "profile"
     real = home / "scripts" / "real"
     real.mkdir(parents=True, mode=0o700)
@@ -49,5 +51,6 @@ def test_symlinked_script_ancestor_refused_before_execution(tmp_path, monkeypatc
     }}))
     monkeypatch.setenv("HERMES_HOME", str(home))
     with pytest.raises((RuntimeError, ValueError)):
-        _finalize_with_observer({"id": "synthetic"}, {"execution_id": "id", "epoch_id": "a" * 64})
+        _finalize_with_observer({"id": "synthetic"}, {"execution_id": "id", "epoch_id": "a" * 64},
+                                object())
     assert not marker.exists(), "symlinked ancestor redirected the script before refusal"

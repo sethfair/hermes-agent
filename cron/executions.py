@@ -526,6 +526,72 @@ def mirror_local_finalization(execution_id: str, state: str, digest: str) -> boo
         )
         return result.rowcount == 1
 
+def reconcile_target_pin(execution_id: str, job_id: str) -> bool:
+    """Release a completed target's quota pin only after exact retained v2 proof.
+
+    Explicit reconciliation, never a scheduler or mirror callback. Unknown/failed and
+    post-COMMIT/pre-mirror windows retain their pins for operator disposition.
+    """
+    from cron.scheduler_local_observation import _read_complete_parent_outcome
+    from local_observation_v2 import Store
+
+    directory = get_hermes_home().resolve() / "cron" / f"recovery-{job_id}"
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT e.*, b.job_id AS bound_job, b.profile_home, b.bind_state,
+                      b.unresolved_pin, b.nonce_digest, b.generation, b.epoch_id,
+                      b.issuance_digest, b.output_sha256, b.fire_claim_by,
+                      f.state AS mirror_state, f.outcome_digest AS mirror_digest
+               FROM executions e JOIN cron_prerun_bindings b ON b.execution_id=e.id
+               JOIN cron_local_finalizations f ON f.execution_id=e.id
+               WHERE e.id=? AND e.job_id=?""", (execution_id, job_id),
+        ).fetchone()
+        if (row is None or row["status"] != "completed" or row["bound_job"] != job_id
+                or row["profile_home"] != str(get_hermes_home().resolve())
+                or row["bind_state"] != "bound" or row["unresolved_pin"] != 1
+                or row["mirror_state"] not in {"succeeded", "not_applicable"}
+                or not row["fire_claim_by"]
+                or any(not isinstance(row[k], str) or len(row[k]) != 64
+                       for k in ("nonce_digest", "epoch_id", "issuance_digest",
+                                 "output_sha256", "mirror_digest"))
+                or type(row["generation"]) is not int or row["generation"] < 1):
+            return False
+        store = Store(directory)
+        header = store.header()
+        if (header["profile"] != row["profile_home"] or header["job"] != job_id
+                or header["execution_id"] != execution_id
+                or header["state"] != "finalized"
+                or any(header[k] != row[k] for k in
+                       ("generation", "epoch_id", "issuance_digest"))):
+            return False
+        try:
+            state, digest = _read_complete_parent_outcome(
+                store, {**dict(row), "execution_id": execution_id},
+                {"state": row["mirror_state"], "digest": row["mirror_digest"]},
+                _outcome_roots(store, execution_id),
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            return False
+        if state != row["mirror_state"] or digest != row["mirror_digest"]:
+            return False
+        updated = conn.execute(
+            """UPDATE cron_prerun_bindings SET unresolved_pin=0
+               WHERE execution_id=? AND job_id=? AND unresolved_pin=1
+                 AND bind_state='bound'""", (execution_id, job_id),
+        )
+        return updated.rowcount == 1
+
+
+def _outcome_roots(store, execution_id: str) -> list[str]:
+    """Independent storage root inventory, never a caller or mirrored root count."""
+    import json
+    with store._connection() as (db, _):
+        row = db.execute("SELECT payload FROM outcomes WHERE execution_id=?", (execution_id,)).fetchone()
+        if row is None:
+            return []
+        records = json.loads(row[0])['records']
+        return [item['root'] for item in records]
+
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,

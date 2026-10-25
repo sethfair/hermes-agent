@@ -210,6 +210,66 @@ def _assert_terminal_and_receipts(home, execution_id, epoch_db, stage_roots,
             assert stages == [("t_00000001",), ("t_00000002",)]
 
 
+def _assert_reconciled_quota(tmp_path, monkeypatch, home, job, info, env, root,
+                             tamper, omit_receipt):
+    """Mirror and quota remain distinct until a restarted exact-v2 proof reader succeeds."""
+    if omit_receipt or tamper:
+        return
+    from cron import executions, jobs
+    from tests.cron.fixtures.wri2276_store_fixture import materialize_archived_v2
+    import importlib
+
+    source = materialize_archived_v2(tmp_path / "reconcile-source", parent=True)
+    monkeypatch.syspath_prepend(str(source))
+    for module in ("engineering_recovery_observer", "local_observation_v2", "observer_parent_seam"):
+        monkeypatch.delitem(sys.modules, module, raising=False)
+    legacy = importlib.import_module("engineering_recovery_observer")
+    monkeypatch.setattr(legacy, "PROFILE_HOME", home.resolve())
+    monkeypatch.setattr(legacy, "JOB_ID", job["id"])
+    monkeypatch.setattr(executions, "MAX_TARGET_UNRESOLVED_BINDINGS", 1)
+    next_job = jobs.create_job(prompt="quota contender", schedule="every 1h")
+    next_claim = jobs.claim_job_for_fire(next_job["id"], manual=True, return_job=True)
+    assert isinstance(next_claim, dict)
+    next_execution = executions.create_execution(next_job["id"], source="quota-test")
+    assert executions.mark_execution_running(next_execution["id"])
+    with jobs.fire_claim_fence(next_job["id"], expected_owner=next_claim["fire_claim"]["by"]) as held:
+        assert held
+        with pytest.raises(RuntimeError, match="quota"):
+            executions.reserve_prerun_binding(next_execution["id"], next_job["id"],
+                                              next_claim["fire_claim"]["by"])
+    with executions._transaction() as db:
+        original = db.execute("SELECT outcome_digest FROM cron_local_finalizations WHERE execution_id=?",
+                              (info["execution_id"],)).fetchone()[0]
+        db.execute("UPDATE cron_local_finalizations SET outcome_digest=? WHERE execution_id=?",
+                   ("f" * 64, info["execution_id"]))
+    assert not executions.reconcile_target_pin(info["execution_id"], job["id"])
+    with executions._transaction() as db:
+        assert db.execute("SELECT unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",
+                          (info["execution_id"],)).fetchone()[0] == 1
+        db.execute("UPDATE cron_local_finalizations SET outcome_digest=? WHERE execution_id=?",
+                   (original, info["execution_id"]))
+    assert not executions.reconcile_target_pin(info["execution_id"], next_job["id"])
+    # Restarted process independently opens both durable stores, not the test's modules.
+    reconciler = subprocess.run(
+        [sys.executable, "-c",
+         "import pathlib,os\n"
+         "import engineering_recovery_observer as legacy\n"
+         "legacy.PROFILE_HOME=pathlib.Path(os.environ['HERMES_HOME']).resolve()\n"
+         f"legacy.JOB_ID={job['id']!r}\n"
+         "from cron import executions\n"
+         f"print(executions.reconcile_target_pin({info['execution_id']!r},{job['id']!r}))\n"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert reconciler.returncode == 0 and reconciler.stdout.strip() == "True", reconciler.stderr
+    with executions._transaction() as db:
+        assert db.execute("SELECT unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",
+                          (info["execution_id"],)).fetchone()[0] == 0
+    with jobs.fire_claim_fence(next_job["id"], expected_owner=next_claim["fire_claim"]["by"]) as held:
+        assert held
+        assert executions.reserve_prerun_binding(next_execution["id"], next_job["id"],
+                                                 next_claim["fire_claim"]["by"])["unresolved_pin"] == 1
+
+
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize(
     "stage_roots,tamper,kill_script,kill_after_commit,hold_finalizer,omit_receipt",
@@ -502,6 +562,8 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
         gateway_log.flush(); gateway_log.seek(0)
         _assert_terminal_and_receipts(home, info["execution_id"], epoch_db, stage_roots,
                                       omit_receipt, firer_log)
+        _assert_reconciled_quota(tmp_path, monkeypatch, home, job, info, env, root,
+                                 tamper, omit_receipt)
         if tamper == "queued":
             _assert_queued_delivery_is_separate(home, job, info)
     finally:
