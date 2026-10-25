@@ -1,0 +1,544 @@
+"""Isolated lossless observer-v2 storage; no scheduler or live-profile installer.
+
+The caller must supply independent producer/terminal verification to stage/finalize.
+A provisional commit alone carries no checked cursor authority.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import stat
+import tempfile
+import time
+from contextlib import contextmanager
+
+import engineering_recovery_observer as legacy
+
+MAX_CANONICAL_BYTES = 67108864
+MAX_DB_BYTES = 134217728
+MAX_CURRENT = 10000
+MAX_PAYLOAD = 65536
+RESERVED_BYTES = 1048576
+ROW_OVERHEAD = 256
+HEX = re.compile(r"[0-9a-f]{64}\Z")
+ROOT = re.compile(r"t_[0-9a-f]{8}\Z")
+
+
+class Stale(RuntimeError):
+    pass
+
+
+class Overflow(RuntimeError):
+    pass
+
+
+def encode(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def digest(value):
+    return hashlib.sha256(encode(value)).hexdigest()
+
+
+def strict_json(raw):
+    def unique(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+    return json.loads(raw, object_pairs_hook=unique,
+                      parse_constant=lambda value: (_ for _ in ()).throw(ValueError("invalid JSON constant")))
+
+
+def _regular_bytes(path, limit):
+    path = legacy._reject_symlink_ancestors(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError("invalid or oversized source")
+        raw = handle.read(limit + 1)
+        after = os.fstat(handle.fileno())
+        if len(raw) > limit or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise Stale("source changed during read")
+        return raw
+
+
+SCHEMA = """
+PRAGMA foreign_keys=ON;
+PRAGMA journal_mode=DELETE;
+PRAGMA synchronous=FULL;
+CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
+CREATE TABLE records (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind IN ('pending','checked')),
+ root TEXT NOT NULL, payload BLOB NOT NULL, predecessor_seq INTEGER REFERENCES records(seq));
+CREATE INDEX records_root_seq ON records(root,seq);
+CREATE TABLE latest (
+ root TEXT PRIMARY KEY, pending_seq INTEGER REFERENCES records(seq),
+ checked_seq INTEGER REFERENCES records(seq));
+CREATE TABLE issued (
+ root TEXT PRIMARY KEY, observation_id TEXT NOT NULL,
+ pending_seq INTEGER NOT NULL REFERENCES records(seq), execution_id TEXT NOT NULL);
+CREATE TABLE epochs (
+ execution_id TEXT PRIMARY KEY, payload BLOB NOT NULL);
+CREATE TABLE epoch_issued (
+ execution_id TEXT NOT NULL REFERENCES epochs(execution_id), root TEXT NOT NULL,
+ payload BLOB NOT NULL, PRIMARY KEY(execution_id,root));
+CREATE TABLE stages (
+ execution_id TEXT NOT NULL REFERENCES epochs(execution_id), root TEXT NOT NULL,
+ payload BLOB NOT NULL, PRIMARY KEY(execution_id,root));
+CREATE TABLE outcomes (
+ execution_id TEXT PRIMARY KEY REFERENCES epochs(execution_id), payload BLOB NOT NULL);
+CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL);
+CREATE TRIGGER records_no_update BEFORE UPDATE ON records BEGIN SELECT RAISE(ABORT,'immutable record'); END;
+CREATE TRIGGER records_no_delete BEFORE DELETE ON records BEGIN SELECT RAISE(ABORT,'immutable record'); END;
+CREATE TRIGGER epochs_no_update BEFORE UPDATE ON epochs BEGIN SELECT RAISE(ABORT,'immutable epoch'); END;
+CREATE TRIGGER epochs_no_delete BEFORE DELETE ON epochs BEGIN SELECT RAISE(ABORT,'immutable epoch'); END;
+CREATE TRIGGER epoch_issued_no_update BEFORE UPDATE ON epoch_issued BEGIN SELECT RAISE(ABORT,'immutable issuance'); END;
+CREATE TRIGGER epoch_issued_no_delete BEFORE DELETE ON epoch_issued BEGIN SELECT RAISE(ABORT,'immutable issuance'); END;
+CREATE TRIGGER outcomes_no_update BEFORE UPDATE ON outcomes BEGIN SELECT RAISE(ABORT,'immutable outcome'); END;
+CREATE TRIGGER outcomes_no_delete BEFORE DELETE ON outcomes BEGIN SELECT RAISE(ABORT,'immutable outcome'); END;
+CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT,'immutable event'); END;
+CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'immutable event'); END;
+"""
+
+
+def _count_bytes(db):
+    total = 0
+    for table, column in (("metadata", "payload"), ("records", "payload"),
+                          ("epochs", "payload"), ("epoch_issued", "payload"),
+                          ("stages", "payload"), ("outcomes", "payload"),
+                          ("events", "payload")):
+        count, size = db.execute(f"SELECT COUNT(*), COALESCE(SUM(LENGTH({column})),0) FROM {table}").fetchone()
+        total += size + count * ROW_OVERHEAD
+    # The index rows carry these fields instead of a payload blob.
+    for table in ("latest", "issued"):
+        count, size = db.execute(f"SELECT COUNT(*), COALESCE(SUM(LENGTH(root)),0) FROM {table}").fetchone()
+        total += size + count * ROW_OVERHEAD
+    return total
+
+
+def _check_capacity(db, path):
+    logical = _count_bytes(db)
+    if logical + RESERVED_BYTES > MAX_CANONICAL_BYTES:
+        raise Overflow("historical canonical quota exceeded; no new cursor")
+    page_size = db.execute("PRAGMA page_size").fetchone()[0]
+    pages = db.execute("PRAGMA page_count").fetchone()[0]
+    if pages * page_size > MAX_DB_BYTES:
+        raise Overflow("database page quota exceeded")
+    if shutil.disk_usage(path.parent).free < 2 * MAX_DB_BYTES + RESERVED_BYTES:
+        raise Overflow("insufficient disk for database and rollback journal")
+    return logical
+
+
+def _metadata(db):
+    row = db.execute("SELECT payload FROM metadata WHERE id=1").fetchone()
+    if not row:
+        raise Stale("observer metadata absent")
+    return strict_json(row[0])
+
+
+def _write_metadata(db, metadata):
+    db.execute("UPDATE metadata SET payload=? WHERE id=1", (encode(metadata),))
+
+
+def _validate_record(kind, root, value):
+    if not ROOT.fullmatch(root) or not isinstance(value, dict):
+        raise ValueError("invalid observation root/payload")
+    if kind == "pending":
+        if not HEX.fullmatch(str(value.get("observation_id"))) or not isinstance(value.get("fingerprint"), str) or not isinstance(value.get("event_ids"), list) or not all(isinstance(item, (str, int)) for item in value["event_ids"]):
+            raise ValueError("invalid pending identity")
+    else:
+        if not HEX.fullmatch(str(value.get("local_observation_id"))) or not isinstance(value.get("local_cursor_sha"), str):
+            raise ValueError("invalid checked identity")
+    blob = encode(value)
+    if len(blob) > MAX_PAYLOAD:
+        raise Overflow("single observation payload exceeds limit")
+    return blob
+
+
+def _insert_record(db, kind, root, value, predecessor):
+    blob = _validate_record(kind, root, value)
+    if predecessor is not None:
+        old = db.execute("SELECT kind,root FROM records WHERE seq=?", (predecessor,)).fetchone()
+        if old != (kind, root):
+            raise Stale("historical predecessor mismatch")
+    return db.execute("INSERT INTO records(kind,root,payload,predecessor_seq) VALUES(?,?,?,?)",
+                      (kind, root, blob, predecessor)).lastrowid
+
+
+def _validate_v1(value):
+    if not isinstance(value, dict) or (value.get("version"), value.get("job_id"), value.get("board_id")) != (1, legacy.JOB_ID, legacy.BOARD):
+        raise ValueError("invalid v1 identity")
+    if not isinstance(value.get("pending"), dict) or not isinstance(value.get("roots"), dict) or not isinstance(value.get("current_issued", {}), dict):
+        raise ValueError("invalid v1 maps")
+    if len(value["pending"]) > MAX_CURRENT or len(value["roots"]) > MAX_CURRENT or len(value["current_issued"]) > MAX_CURRENT:
+        raise Overflow("v1 current roots exceed quota")
+    if type(value.get("admission_generation", 0)) is not int or value.get("admission_generation", 0) < 0 or value.get("admission_state", "invalidating") not in ("committed", "invalidating"):
+        raise ValueError("invalid v1 admission")
+    for root, item in value["pending"].items():
+        _validate_record("pending", root, item)
+    for root, item in value["roots"].items():
+        _validate_record("checked", root, item)
+    if any(root not in value["pending"] or value["pending"][root]["observation_id"] != ident
+           for root, ident in value["current_issued"].items()):
+        raise ValueError("v1 issuance mismatch")
+    if value["current_issued"] and value.get("admission_state") != "committed":
+        raise ValueError("v1 issuance not committed")
+
+
+def migrate(directory):
+    """Stage restricted DB and byte-identical backup; no installed-profile operation."""
+    directory = legacy._reject_symlink_ancestors(directory)
+    db_path = directory / "local-observation-v2.sqlite"
+    backup = directory / "local-observation-v1.backup"
+    if db_path.exists() or backup.exists() or db_path.is_symlink() or backup.is_symlink():
+        raise Stale("migration target exists; inspect before retry")
+    if stat.S_IMODE(directory.stat().st_mode) & 0o077:
+        raise ValueError("migration directory is not restricted")
+    source = directory / "local-observation-v1.json"
+    raw = _regular_bytes(source, MAX_CANONICAL_BYTES)
+    value = strict_json(raw)
+    _validate_v1(value)
+    if _regular_bytes(source, MAX_CANONICAL_BYTES) != raw:
+        raise Stale("v1 changed before staging")
+    fd, temp = tempfile.mkstemp(prefix=".v2-staging-", dir=directory)
+    os.close(fd)
+    try:
+        os.chmod(temp, 0o600)
+        db = sqlite3.connect(temp)
+        try:
+            db.executescript(SCHEMA)
+            page_size = db.execute("PRAGMA page_size").fetchone()[0]
+            db.execute(f"PRAGMA max_page_count={MAX_DB_BYTES // page_size}")
+            db.execute("BEGIN IMMEDIATE")
+            meta = {"schema": 2, "job": legacy.JOB_ID, "board": legacy.BOARD,
+                    "profile": str(legacy.PROFILE_HOME), "source_v1_sha": hashlib.sha256(raw).hexdigest(),
+                    "ledger_sha": value.get("ledger_sha"), "generation": value.get("admission_generation", 0),
+                    "state": "invalidating", "execution_id": None, "epoch_id": None,
+                    "issuance_digest": None, "revision": 0,
+                    "v1_unknown": {k: v for k, v in value.items() if k not in
+                       {"version", "board_id", "job_id", "ledger_sha", "admission_generation",
+                        "admission_state", "current_issued", "pending", "roots"}}}
+            db.execute("INSERT INTO metadata(id,payload) VALUES(1,?)", (encode(meta),))
+            for root in sorted(set(value["pending"]) | set(value["roots"])):
+                p = _insert_record(db, "pending", root, value["pending"][root], None) if root in value["pending"] else None
+                c = _insert_record(db, "checked", root, value["roots"][root], None) if root in value["roots"] else None
+                db.execute("INSERT INTO latest(root,pending_seq,checked_seq) VALUES(?,?,?)", (root, p, c))
+            db.execute("INSERT INTO events(payload) VALUES(?)", (encode({"event": "migration", "source_v1_sha": meta["source_v1_sha"],
+                       "revoked_issued": value["current_issued"], "generation": meta["generation"]}),))
+            _check_capacity(db, pathlib.Path(temp))
+            db.commit()
+            if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or db.execute("PRAGMA foreign_key_check").fetchone():
+                raise Stale("migration integrity check failed")
+        finally:
+            db.close()
+        if _regular_bytes(source, MAX_CANONICAL_BYTES) != raw:
+            raise Stale("v1 changed before publication")
+        backup_fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(backup_fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if _regular_bytes(backup, MAX_CANONICAL_BYTES) != raw:
+            raise Stale("v1 backup readback mismatch")
+        if db_path.exists() or db_path.is_symlink():
+            raise Stale("v2 appeared during migration")
+        # Hard-link publication fails if another writer created the target;
+        # os.replace would overwrite a concurrent candidate.
+        os.link(temp, db_path, follow_symlinks=False)
+        os.unlink(temp)
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        result = Store(directory)
+        if result.header()["source_v1_sha"] != hashlib.sha256(raw).hexdigest() or result.history_count() != len(value["pending"]) + len(value["roots"]):
+            raise Stale("v2 migration readback mismatch")
+        return result
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+class Store:
+    def __init__(self, directory):
+        self.directory = legacy._reject_symlink_ancestors(directory)
+        self.path = legacy._reject_symlink_ancestors(self.directory / "local-observation-v2.sqlite")
+        self.backup = self.directory / "local-observation-v1.backup"
+
+    @contextmanager
+    def _connection(self, write=False):
+        if not self.path.is_file() or self.path.stat().st_size > MAX_DB_BYTES or stat.S_IMODE(self.path.stat().st_mode) & 0o077:
+            raise Stale("v2 missing, oversized or unrestricted")
+        mode = "rw" if write else "ro"
+        db = sqlite3.connect(f"file:{self.path.as_posix()}?mode={mode}", uri=True, timeout=15)
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+            if write:
+                db.execute("PRAGMA journal_mode=DELETE")
+                db.execute("PRAGMA synchronous=FULL")
+                page_size = db.execute("PRAGMA page_size").fetchone()[0]
+                db.execute(f"PRAGMA max_page_count={MAX_DB_BYTES // page_size}")
+                db.execute("BEGIN IMMEDIATE")
+            else:
+                db.execute("BEGIN")
+            meta = _metadata(db)
+            if meta["schema"] != 2 or meta["job"] != legacy.JOB_ID or meta["board"] != legacy.BOARD or meta["profile"] != str(legacy.PROFILE_HOME) or meta["source_v1_sha"] != hashlib.sha256(_regular_bytes(self.backup, MAX_CANONICAL_BYTES)).hexdigest():
+                raise Stale("v2 identity or backup mismatch")
+            if _count_bytes(db) + RESERVED_BYTES > MAX_CANONICAL_BYTES:
+                raise Stale("v2 logical quota invalid")
+            yield db, meta
+            if write:
+                _check_capacity(db, self.path)
+                db.commit()
+            else:
+                db.rollback()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def backup_bytes(self):
+        return _regular_bytes(self.backup, MAX_CANONICAL_BYTES)
+
+    def header(self):
+        with self._connection() as (db, meta):
+            result = dict(meta)
+            result["logical_bytes"] = _count_bytes(db)
+            result["pending_count"] = db.execute("SELECT COUNT(*) FROM latest WHERE pending_seq IS NOT NULL").fetchone()[0]
+            result["checked_count"] = db.execute("SELECT COUNT(*) FROM latest WHERE checked_seq IS NOT NULL").fetchone()[0]
+            result["issued_count"] = db.execute("SELECT COUNT(*) FROM issued").fetchone()[0]
+            return result
+
+    def history_count(self):
+        with self._connection() as (db, _):
+            return db.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+
+    def history(self, root, after_seq=0, max_items=128, max_bytes=32768):
+        if not ROOT.fullmatch(root) or not (1 <= max_items <= 128) or not (512 <= max_bytes <= 32768):
+            raise ValueError("invalid history page")
+        with self._connection() as (db, _):
+            rows = db.execute("SELECT seq,kind,payload,predecessor_seq FROM records WHERE root=? AND seq>? ORDER BY seq LIMIT ?",
+                              (root, after_seq, max_items)).fetchall()
+            result = []
+            for seq, kind, payload, pred in rows:
+                item = {"seq": seq, "kind": kind, "payload": strict_json(payload), "predecessor_seq": pred}
+                if len(encode([*result, item])) > max_bytes:
+                    if not result:
+                        raise Overflow("single forensic item exceeds page")
+                    break
+                result.append(item)
+            return result
+
+    def current(self, root):
+        if not ROOT.fullmatch(root):
+            raise ValueError("invalid root")
+        with self._connection() as (db, _):
+            row = db.execute("SELECT pending_seq,checked_seq FROM latest WHERE root=?", (root,)).fetchone()
+            if not row:
+                return None
+            p, c = row
+            def payload(seq):
+                return strict_json(db.execute("SELECT payload FROM records WHERE seq=?", (seq,)).fetchone()[0]) if seq else None
+            return {"pending": payload(p), "checked": payload(c), "pending_seq": p, "checked_seq": c}
+
+    def current_issued(self):
+        # Small-fixture diagnostic only. Callers at scale must use page_current.
+        with self._connection() as (db, _):
+            count = db.execute("SELECT COUNT(*) FROM issued").fetchone()[0]
+            if count > 128:
+                raise Overflow("use page_current for bulk issuance")
+            return {root: {"observation_id": ident, "pending_seq": seq} for root, ident, seq in
+                    db.execute("SELECT root,observation_id,pending_seq FROM issued ORDER BY root")}
+
+    def begin(self, execution_id, ledger_sha):
+        if not execution_id or not HEX.fullmatch(ledger_sha):
+            raise ValueError("invalid execution or ledger")
+        with self._connection(write=True) as (db, meta):
+            if db.execute("SELECT 1 FROM epochs WHERE execution_id=?", (execution_id,)).fetchone():
+                raise Stale("execution already used")
+            meta["generation"] += 1
+            meta["revision"] += 1
+            meta.update(state="invalidating", execution_id=execution_id, epoch_id=None,
+                        issuance_digest=None, ledger_sha=ledger_sha)
+            db.execute("DELETE FROM stages")
+            db.execute("DELETE FROM issued")
+            db.execute("INSERT INTO events(payload) VALUES(?)", (encode({"event": "invalidate", "generation": meta["generation"], "execution_id": execution_id}),))
+            _write_metadata(db, meta)
+            return dict(meta)
+
+    def native_commit(self, execution_id, ledger_sha, board, roots):
+        """Isolated native board/ledger seam, not a trusted scheduler admission."""
+        if not isinstance(roots, (tuple, list, set)) or len(roots) > MAX_CURRENT or len(set(roots)) != len(roots):
+            raise ValueError("invalid native roots")
+        with legacy._observation_lock(self.directory):
+            ledger, actual = legacy.read_ledger(self.directory)
+            if not ledger or actual != ledger_sha or ledger["version"] != 2:
+                raise Stale("native ledger mismatch")
+            marker_path = legacy._cutover_path(self.directory, ledger)
+            legacy._verify_cutover(self.directory, ledger, marker_path, strict_json(_regular_bytes(marker_path, 1048576)))
+            fingerprints, events, attachments = legacy.board_observation(board, roots)
+            observations = {}
+            for root in sorted(roots):
+                now = time.time()
+                item = {"fingerprint": fingerprints[root], "event_ids": events[root],
+                        "observed_at": now, "attachment_bearing": root in attachments}
+                item["observation_id"] = legacy._digest((legacy.JOB_ID, legacy.BOARD,
+                    self.header()["generation"], root, item["fingerprint"], item["event_ids"], now))
+                observations[root] = item
+
+            def still_current():
+                active, sha = legacy.read_ledger(self.directory)
+                if active != ledger or sha != ledger_sha or \
+                   legacy.board_observation(board, roots) != (fingerprints, events, attachments):
+                    raise Stale("native board/ledger changed before commit")
+
+            return self.commit(execution_id, ledger_sha, observations, precommit=still_current)
+
+    def commit(self, execution_id, ledger_sha, observations, *, precommit=None):
+        if not isinstance(observations, dict) or len(observations) > MAX_CURRENT:
+            raise Overflow("current issuance cardinality exceeded")
+        with self._connection(write=True) as (db, meta):
+            if meta["state"] != "invalidating" or meta["execution_id"] != execution_id or meta["ledger_sha"] != ledger_sha:
+                raise Stale("invalidated execution/ledger required")
+            mapping = []
+            for root in sorted(observations):
+                item = observations[root]
+                previous = db.execute("SELECT pending_seq,checked_seq FROM latest WHERE root=?", (root,)).fetchone()
+                p, c = previous if previous else (None, None)
+                seq = _insert_record(db, "pending", root, item, p)
+                db.execute("INSERT INTO latest(root,pending_seq,checked_seq) VALUES(?,?,?) "
+                           "ON CONFLICT(root) DO UPDATE SET pending_seq=excluded.pending_seq", (root, seq, c))
+                mapping.append({"root": root, "observation_id": item["observation_id"],
+                                "pending_seq": seq, "attachment_bearing": item.get("attachment_bearing", False)})
+            if db.execute("SELECT COUNT(*) FROM latest WHERE pending_seq IS NOT NULL").fetchone()[0] > MAX_CURRENT:
+                raise Overflow("current pending cardinality exceeded")
+            issuance_digest = digest({"execution_id": execution_id, "generation": meta["generation"],
+                                      "ledger_sha": ledger_sha, "mapping": mapping})
+            epoch_id = digest([execution_id, meta["generation"], issuance_digest])
+            epoch = {"execution_id": execution_id, "generation": meta["generation"],
+                     "epoch_id": epoch_id, "issuance_digest": issuance_digest, "ledger_sha": ledger_sha,
+                     "issued_count": len(mapping)}
+            db.execute("INSERT INTO epochs(execution_id,payload) VALUES(?,?)", (execution_id, encode(epoch)))
+            for item in mapping:
+                db.execute("INSERT INTO issued(root,observation_id,pending_seq,execution_id) VALUES(?,?,?,?)",
+                           (item["root"], item["observation_id"], item["pending_seq"], execution_id))
+                db.execute("INSERT INTO epoch_issued(execution_id,root,payload) VALUES(?,?,?)",
+                           (execution_id, item["root"], encode(item)))
+            db.execute("INSERT INTO events(payload) VALUES(?)", (encode({"event": "issue", **epoch}),))
+            meta.update(state="provisional", epoch_id=epoch_id, issuance_digest=issuance_digest,
+                        revision=meta["revision"] + 1)
+            _write_metadata(db, meta)
+            _check_capacity(db, self.path)
+            if precommit is not None:
+                precommit()
+            return epoch
+
+    def select(self, root, observation_id, execution_id):
+        with self._connection() as (db, meta):
+            return self._select(db, meta, root, observation_id, execution_id)
+
+    @staticmethod
+    def _select(db, meta, root, observation_id, execution_id):
+        if meta["state"] != "provisional" or meta["execution_id"] != execution_id:
+            raise Stale("epoch not current")
+        row = db.execute("SELECT i.pending_seq,r.payload,l.pending_seq FROM issued i JOIN latest l ON i.root=l.root "
+                         "JOIN records r ON r.seq=i.pending_seq WHERE i.root=? AND i.observation_id=? AND i.execution_id=?",
+                         (root, observation_id, execution_id)).fetchone()
+        if not row or row[0] != row[2] or strict_json(row[1])["observation_id"] != observation_id:
+            raise Stale("observation not current issued")
+        return {"pending_seq": row[0], "payload": strict_json(row[1])}
+
+    def stage(self, execution_id, root, observation_id, revision, ledger_sha, *, verified_binding=None):
+        if verified_binding is None:
+            raise Stale("independent producer binding required")
+        with self._connection(write=True) as (db, meta):
+            if meta["revision"] != revision or meta["ledger_sha"] != ledger_sha:
+                raise Stale("revision or ledger changed")
+            epoch_row = db.execute("SELECT payload FROM epochs WHERE execution_id=?", (execution_id,)).fetchone()
+            if not epoch_row:
+                raise Stale("epoch absent")
+            epoch = strict_json(epoch_row[0])
+            if not verified_binding(epoch):
+                raise Stale("producer binding rejected")
+            selected = self._select(db, meta, root, observation_id, execution_id)
+            if selected["payload"].get("attachment_bearing") or db.execute("SELECT 1 FROM stages WHERE execution_id=? AND root=?", (execution_id, root)).fetchone():
+                raise Stale("attachment or repeat stage")
+            preimage = db.execute("SELECT checked_seq FROM latest WHERE root=?", (root,)).fetchone()[0]
+            stage = {"execution_id": execution_id, "root": root, "pending_seq": selected["pending_seq"],
+                     "checked_preimage_seq": preimage, "observation_id": observation_id,
+                     "epoch_id": epoch["epoch_id"], "stage_revision": revision}
+            db.execute("INSERT INTO stages(execution_id,root,payload) VALUES(?,?,?)", (execution_id, root, encode(stage)))
+            db.execute("INSERT INTO events(payload) VALUES(?)", (encode({"event": "stage", **stage}),))
+            meta["revision"] += 1
+            _write_metadata(db, meta)
+            return {"revision": meta["revision"], "stage": stage}
+
+    def finalize(self, execution_id, receipts, ledger_sha, *, verified_terminal=None):
+        # Historical storage-only callback entry cannot be a scheduler positive writer.
+        raise Stale("caller callback finalization retired; use parent_finalize")
+
+    def parent_finalize(self, authority, proposal, board):
+        from observer_parent_seam import finalize_parent
+        return finalize_parent(self, authority, proposal, board)
+
+    def stage_observation(self, execution_id, root, observation_id, revision, board):
+        from observer_parent_seam import stage_observation
+        return stage_observation(self, execution_id, root, observation_id, revision, board)
+
+    def parent_unknown(self, authority, board, reason):
+        from observer_parent_seam import record_parent_unknown
+        return record_parent_unknown(self, authority, board, reason)
+
+    def read_parent_outcome(self, execution_id, after_root=None, *, max_items=64, max_bytes=32768):
+        from observer_parent_seam import read_parent_outcome
+        return read_parent_outcome(self, execution_id, after_root, max_items, max_bytes)
+
+    def page_current(self, execution_id, epoch_id, generation, issuance_digest, after_root=None,
+                     *, max_items=128, max_bytes=32768):
+        if not 1 <= max_items <= 128 or not 512 <= max_bytes <= 32768 or (after_root is not None and not ROOT.fullmatch(after_root)):
+            raise ValueError("invalid page bounds/cursor")
+        with self._connection() as (db, meta):
+            if (meta["state"], meta["execution_id"], meta["epoch_id"], meta["generation"], meta["issuance_digest"]) != ("provisional", execution_id, epoch_id, generation, issuance_digest):
+                raise Stale("stale page epoch")
+            fixed = {"execution_id": execution_id, "epoch_id": epoch_id, "generation": generation,
+                     "issuance_digest": issuance_digest}
+            items = []
+            last = after_root
+            cursor = after_root or ""
+            while True:
+                row = db.execute("SELECT i.root,i.observation_id,i.pending_seq,r.payload,l.pending_seq "
+                                 "FROM issued i JOIN latest l ON i.root=l.root JOIN records r ON r.seq=i.pending_seq "
+                                 "WHERE i.execution_id=? AND i.root>? ORDER BY i.root COLLATE BINARY LIMIT 1",
+                                 (execution_id, cursor)).fetchone()
+                if not row:
+                    more = False
+                    break
+                root, ident, seq, payload, current_seq = row
+                if seq != current_seq:
+                    raise Stale("issued pointer changed")
+                candidate = {"root": root, "observation_id": ident, "pending_seq": seq,
+                             "attachment_bearing": strict_json(payload).get("attachment_bearing", False)}
+                envelope = {**fixed, "items": [*items, candidate], "last_root": root, "has_more": False}
+                if len(items) >= max_items or len(encode(envelope)) > max_bytes:
+                    if not items:
+                        raise Overflow("single page item exceeds envelope")
+                    more = True
+                    break
+                items.append(candidate)
+                last = cursor = root
+            page = {**fixed, "items": items, "last_root": last, "has_more": more}
+            if len(encode(page)) > max_bytes:
+                raise Overflow("page envelope exceeds byte limit")
+            return page

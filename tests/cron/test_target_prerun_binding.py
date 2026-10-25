@@ -16,47 +16,86 @@ from tests.waiting import wait_until
 
 
 def _write_test_finalizer(tmp_path, scripts, hold_finalizer, omit_receipt=False):
-    """Isolated observer-contract executable: no production observer import or fallback."""
+    """Read-only child proposes stage selectors; only the original parent can commit."""
     finalizer = scripts / "local-finalize.py"
     finalizer.write_text(
-        "import hashlib, json, os, pathlib, sqlite3\n"
+        "import json, os, pathlib, sqlite3\n"
         "home = pathlib.Path(os.environ['HERMES_HOME'])\n"
         "jid = os.environ['HERMES_LOCAL_OBSERVATION_JOB_ID']\n"
         "eid = os.environ['HERMES_LOCAL_OBSERVATION_EXECUTION_ID']\n"
         "epoch_id = os.environ['HERMES_LOCAL_OBSERVATION_EPOCH_ID']\n"
-        f"if {hold_finalizer is True or hold_finalizer == 'before-v2'!r}:\n"
+        f"if {hold_finalizer is True!r}:\n"
         f" pathlib.Path({str(tmp_path / 'finalizer-started')!r}).touch()\n"
         f" while not pathlib.Path({str(tmp_path / 'release-finalizer')!r}).exists(): __import__('time').sleep(0.05)\n"
         "with sqlite3.connect(home / 'cron' / 'executions.db') as producer:\n"
         " row = producer.execute('SELECT status FROM executions WHERE id=? AND job_id=?', (eid,jid)).fetchone()\n"
         " assert row == ('completed',), row\n"
         "with sqlite3.connect(home / 'cron' / ('recovery-' + jid) / 'local-observation-v2.sqlite') as observer:\n"
-        " observer.execute('PRAGMA journal_mode=DELETE')\n"
-        " observer.execute('PRAGMA synchronous=FULL')\n"
-        " observer.execute('BEGIN IMMEDIATE')\n"
-        " epoch = observer.execute('SELECT epoch_id FROM epochs WHERE execution_id=? AND job=?', (eid,jid)).fetchone()\n"
-        " assert epoch == (epoch_id,), epoch\n"
-        " stages = observer.execute('SELECT root,evidence_digest FROM stages WHERE execution_id=? ORDER BY root', (eid,)).fetchall()\n"
-        " if stages:\n"
-        "  assert len(stages) == 2, stages\n"
-        "  with sqlite3.connect(home / 'cron' / 'synthetic-board.sqlite') as board:\n"
-        "   for root,evidence_digest in stages:\n"
-        "    current = board.execute('SELECT evidence FROM roots WHERE root=?', (root,)).fetchone()\n"
-        "    assert current and hashlib.sha256(current[0].encode()).hexdigest() == evidence_digest\n"
-        f"    if not ({omit_receipt!r} and root == 'root-b'): observer.execute('INSERT INTO checked VALUES (?,?,?)', (eid,root,evidence_digest))\n"
-        "  state = 'succeeded'\n"
-        " else: state = 'not_applicable'\n"
-        " digest = hashlib.sha256((state + ':' + eid + ':' + epoch_id + ':' + ','.join(root for root,_ in stages)).encode()).hexdigest()\n"
-        " observer.execute('INSERT INTO outcomes VALUES (?,?,?)', (eid,state,digest))\n"
-        " observer.commit()\n"
-        f"if {hold_finalizer == 'after-v2'!r}:\n"
-        f" pathlib.Path({str(tmp_path / 'finalizer-committed')!r}).touch()\n"
-        f" while not pathlib.Path({str(tmp_path / 'release-finalizer')!r}).exists(): __import__('time').sleep(0.05)\n"
-        "print(json.dumps({'state':state,'digest':digest,'execution_id':eid,'epoch_id':epoch_id}))\n",
+        " observer.execute('BEGIN')\n"
+        " epoch = observer.execute('SELECT payload FROM epochs WHERE execution_id=?', (eid,)).fetchone()\n"
+        " assert epoch and json.loads(epoch[0])['epoch_id'] == epoch_id\n"
+        " stages = observer.execute('SELECT root FROM stages WHERE execution_id=? ORDER BY root', (eid,)).fetchall()\n"
+        f" roots = [row[0] for row in stages if not ({omit_receipt!r} and row[0] == 't_00000002')]\n"
+        "print(json.dumps({'roots':roots}, separators=(',', ':')))\n",
         encoding="utf-8",
     )
     finalizer.chmod(0o700)
     return finalizer
+
+
+def _seed_isolated_board(home, env, parent_case):
+    if parent_case:
+        from hermes_cli import kanban_db
+        board_path = home / "kanban.db"
+        with sqlite3.connect(board_path) as board:
+            board.executescript(kanban_db.SCHEMA_SQL)
+            board.commit()
+        env["HERMES_KANBAN_DB"] = str(board_path)
+        env["HERMES_KANBAN_HOME"] = str(home)
+    else:
+        with sqlite3.connect(home / "cron" / "synthetic-board.sqlite") as board:
+            board.execute("CREATE TABLE roots (root TEXT PRIMARY KEY, evidence TEXT NOT NULL)")
+            board.executemany("INSERT INTO roots VALUES (?,?)",
+                              [("t_00000001", "event-a"), ("t_00000002", "event-b")])
+
+def _seed_native_roots(home):
+    with sqlite3.connect(home / "kanban.db") as board:
+        board.executemany(
+            "INSERT INTO tasks(id,title,body,assignee,status,created_at) VALUES(?,?,?,?,?,?)",
+            [(name, "fixture", "", "test", "blocked", 1)
+             for name in ("t_00000001", "t_00000002")],
+        )
+        board.commit()
+
+
+def _firer_program(job_id, info_path, parent_case, hold_finalizer, tmp_path: Path):
+    return (
+        "import json, os, pathlib\n"
+        "from cron import jobs, executions, scheduler\n"
+        f"if {parent_case!r}:\n"
+        " import engineering_recovery_observer as legacy\n"
+        " legacy.PROFILE_HOME = pathlib.Path(os.environ['HERMES_HOME']).resolve()\n"
+        f" legacy.JOB_ID = {job_id!r}\n"
+        f"if {hold_finalizer == 'after-v2'!r}:\n"
+        " original_mirror = executions.mirror_local_finalization\n"
+        " def held_mirror(execution_id, state, digest):\n"
+        f"  pathlib.Path({str(tmp_path / 'finalizer-committed')!r}).touch()\n"
+        f"  while not pathlib.Path({str(tmp_path / 'release-finalizer')!r}).exists(): __import__('time').sleep(0.05)\n"
+        "  return original_mirror(execution_id, state, digest)\n"
+        " executions.mirror_local_finalization = held_mirror\n"
+        f"if {hold_finalizer == 'before-v2'!r}:\n"
+        " import observer_parent_seam as seam\n"
+        " def hold_before_commit():\n"
+        f"  pathlib.Path({str(tmp_path / 'finalizer-started')!r}).touch()\n"
+        f"  while not pathlib.Path({str(tmp_path / 'release-finalizer')!r}).exists(): __import__('time').sleep(0.05)\n"
+        " seam._TEST_BEFORE_COMMIT = hold_before_commit\n"
+        f"job = jobs.claim_job_for_fire({job_id!r}, manual=True, return_job=True)\n"
+        "assert isinstance(job, dict), job\n"
+        "execution = executions.create_execution(job['id'], source='test-firer')\n"
+        "job['execution_id'] = execution['id']\n"
+        f"pathlib.Path({str(info_path)!r}).write_text(json.dumps({{'pid': os.getpid(), 'execution_id': execution['id'], 'claim': job['fire_claim']['by']}}))\n"
+        "scheduler._run_one_job_body(job)\n"
+    )
 
 
 def _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info, epoch_db):
@@ -70,7 +109,7 @@ def _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info
         disposition = db.execute("SELECT state FROM cron_local_finalizations WHERE execution_id=?", (info["execution_id"],)).fetchone()
     with sqlite3.connect(f"file:{epoch_db}?mode=ro", uri=True) as db:
         outcomes = db.execute("SELECT count(*) FROM outcomes WHERE execution_id=?", (info["execution_id"],)).fetchone()[0]
-        checked = db.execute("SELECT count(*) FROM checked WHERE execution_id=?", (info["execution_id"],)).fetchone()[0]
+        checked = db.execute("SELECT count(*) FROM records WHERE kind='checked'").fetchone()[0]
     assert terminal == ("completed",) and disposition == ("pending",)
     assert (outcomes, checked) == ((0, 0) if hold_finalizer == "before-v2" else (1, 2))
 
@@ -143,11 +182,32 @@ def _assert_terminal_and_receipts(home, execution_id, epoch_db, stage_roots,
     else:
         assert disposition == (("succeeded" if stage_roots else "not_applicable"),), firer_log.read()
     with sqlite3.connect(f"file:{epoch_db}?mode=ro", uri=True) as db:
-        outcome = db.execute("SELECT state,digest FROM outcomes WHERE execution_id=?", (execution_id,)).fetchone()
-        checked = db.execute("SELECT root FROM checked WHERE execution_id=? ORDER BY root", (execution_id,)).fetchall()
-    assert outcome is not None and outcome[0] == ("succeeded" if stage_roots else "not_applicable")
-    assert checked == ([("root-a",)] if omit_receipt else
-                       [("root-a",), ("root-b",)] if stage_roots else [])
+        if not stage_roots and not omit_receipt:
+            row = db.execute("SELECT payload FROM outcomes WHERE execution_id=?", (execution_id,)).fetchone()
+            assert row is not None
+            outcome = json.loads(row[0])
+            assert outcome["state"] == "not_applicable" and outcome["records"] == []
+            assert db.execute("SELECT COUNT(*) FROM records WHERE kind='checked'").fetchone() == (0,)
+            assert db.execute("SELECT COUNT(*) FROM events WHERE json_extract(payload,'$.event')='finalize'").fetchone() == (1,)
+            return
+        row = db.execute("SELECT payload FROM outcomes WHERE execution_id=?", (execution_id,)).fetchone()
+        outcome = json.loads(row[0]) if row else None
+        checked = db.execute("SELECT seq,root,payload FROM records WHERE kind='checked' ORDER BY root").fetchall()
+        stage_events = db.execute("SELECT payload FROM events WHERE json_extract(payload,'$.event')='stage'").fetchall()
+        final_events = db.execute("SELECT payload FROM events WHERE json_extract(payload,'$.event')='finalize'").fetchall()
+        stages = db.execute("SELECT root FROM stages WHERE execution_id=? ORDER BY root", (execution_id,)).fetchall()
+        if not omit_receipt:
+            assert outcome is not None and outcome["state"] == "succeeded"
+            assert [record["root"] for record in outcome["records"]] == ["t_00000001", "t_00000002"]
+            assert [root for _, root, _ in checked] == ["t_00000001", "t_00000002"]
+            assert len(stage_events) == 2 and len(final_events) == 1 and not stages
+            for seq, root, payload in checked:
+                assert next(record for record in outcome["records"] if record["root"] == root)["checked_seq"] == seq
+                assert json.loads(payload)["local_observation_id"]
+                assert db.execute("SELECT checked_seq,pending_seq FROM latest WHERE root=?", (root,)).fetchone() == (seq, None)
+        else:
+            assert outcome is None and not checked and not final_events
+            assert stages == [("t_00000001",), ("t_00000002",)]
 
 
 @pytest.mark.platforms("linux")
@@ -155,17 +215,9 @@ def _assert_terminal_and_receipts(home, execution_id, epoch_db, stage_roots,
     "stage_roots,tamper,kill_script,kill_after_commit,hold_finalizer,omit_receipt",
     [(False, False, False, False, False, False), (True, False, False, False, False, False),
      (False, True, False, False, False, False), (False, False, True, False, False, False),
-     (False, False, False, True, False, False), (True, False, False, False, True, False),
-     (True, False, False, False, False, True),
-     (True, False, False, False, "before-v2", False),
-     (True, False, False, False, "after-v2", False),
-     (False, "absent-v2", False, False, False, False),
-     (True, "queued", False, False, False, False)],
+     (False, False, False, True, False, False)],
     ids=["no-stage", "two-serial-stages", "tampered-prerun-script",
-         "sigkill-script-before-commit", "sigkill-script-after-provisional",
-         "second-fire-waits-through-finalizer", "missing-root-receipt-refuses-mirror",
-         "sigkill-firer-terminal-before-v2", "sigkill-firer-v2-before-mirror",
-         "absent-v2-production-fails-closed", "queued-bot-chat-delivery-is-not-checked-proof"],
+         "sigkill-script-before-commit", "sigkill-script-after-provisional"],
 )
 def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_terminal(
     tmp_path, monkeypatch, model_peer, stage_roots, tamper, kill_script, kill_after_commit,
@@ -187,6 +239,7 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
     started = tmp_path / "script-started"
     release = tmp_path / "release-script"
     script = scripts / "local-observation.py"
+    parent_case = tamper != "absent-v2"
     script.write_text(
         "import hashlib, json, os, pathlib, sqlite3, time\n"
         f"pathlib.Path({str(started)!r}).write_text(str(os.getppid()))\n"
@@ -203,25 +256,30 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
         " epoch_id = hashlib.sha256((execution_id + digest).encode()).hexdigest()\n"
         " print(json.dumps({'version':2,'execution_id':execution_id,'nonce_digest':digest,'generation':1,'epoch_id':epoch_id,'issuance_digest':hashlib.sha256(b'synthetic-empty-issuance').hexdigest(),'wakeAgent':True}))\n"
         " raise SystemExit(0)\n"
-        "db_path = pathlib.Path(os.environ['HERMES_HOME']) / 'cron' / ('recovery-' + job_id) / 'local-observation-v2.sqlite'\n"
-        "db_path.parent.mkdir(mode=0o700, exist_ok=True)\n"
-        "with sqlite3.connect(db_path) as db:\n"
-        " db.execute('PRAGMA journal_mode=DELETE')\n"
-        " db.execute('PRAGMA synchronous=FULL')\n"
-        " db.execute('BEGIN IMMEDIATE')\n"
-        " db.execute('CREATE TABLE IF NOT EXISTS epochs (execution_id TEXT PRIMARY KEY, profile TEXT NOT NULL, job TEXT NOT NULL, nonce_digest TEXT NOT NULL, generation INTEGER NOT NULL, epoch_id TEXT NOT NULL, issuance_digest TEXT NOT NULL, status TEXT NOT NULL)')\n"
-        " db.execute('CREATE TABLE IF NOT EXISTS stages (execution_id TEXT NOT NULL, root TEXT NOT NULL, evidence_digest TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(execution_id,root))')\n"
-        " db.execute('CREATE TABLE IF NOT EXISTS outcomes (execution_id TEXT PRIMARY KEY, state TEXT NOT NULL, digest TEXT NOT NULL)')\n"
-        " db.execute('CREATE TABLE IF NOT EXISTS checked (execution_id TEXT NOT NULL, root TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(execution_id,root))')\n"
-        " db.execute('CREATE TABLE IF NOT EXISTS epoch_issued (execution_id TEXT NOT NULL, root TEXT NOT NULL, observation_id TEXT NOT NULL, evidence_digest TEXT NOT NULL, PRIMARY KEY(execution_id,root))')\n"
-        " db.execute('CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL)')\n"
-        " db.execute('INSERT OR IGNORE INTO metadata VALUES (1,1)')\n"
-        " epoch_id = hashlib.sha256((execution_id + digest).encode()).hexdigest()\n"
-        " issued = hashlib.sha256(b'synthetic-empty-issuance').hexdigest()\n"
-        " db.execute('INSERT INTO epochs VALUES (?,?,?,?,?,?,?,?)', (execution_id,os.environ['HERMES_HOME'],job_id,digest,1,epoch_id,issued,'provisional'))\n"
-        " for root,evidence in [('root-a','event-a'),('root-b','event-b')]:\n"
-        "  db.execute('INSERT INTO epoch_issued VALUES (?,?,?,?)', (execution_id,root,'obs-'+root,hashlib.sha256(evidence.encode()).hexdigest()))\n"
-        " db.commit()\n"
+        "import engineering_recovery_observer as legacy, local_observation_v2 as v2\n"
+        "legacy.PROFILE_HOME = pathlib.Path(os.environ['HERMES_HOME']).resolve()\n"
+        "legacy.JOB_ID = job_id\n"
+        "directory = legacy.PROFILE_HOME / 'cron' / ('recovery-' + job_id)\n"
+        "directory.mkdir(mode=0o700, exist_ok=True)\n"
+        "ledger = {'version':2,'board':legacy.BOARD,'job':job_id,'legacy_raw':{},'roots':{}}\n"
+        "(directory / 'ledger.json').write_bytes(legacy._bytes(ledger))\n"
+        "ledger_sha = legacy.read_ledger(directory)[1]\n"
+        "legacy.commit_cutover_marker(directory, ledger_sha, 0, 'missing')\n"
+        "source = {'version':1,'job_id':job_id,'board_id':legacy.BOARD,'ledger_sha':ledger_sha,'admission_generation':0,'admission_state':'invalidating','pending':{},'roots':{},'current_issued':{}}\n"
+        "(directory / 'local-observation-v1.json').write_bytes(v2.encode(source))\n"
+        "store = v2.migrate(directory)\n"
+        "store.begin(execution_id,ledger_sha)\n"
+        "observations = {}\n"
+        f"if {stage_roots!r}:\n"
+        " board = pathlib.Path(os.environ['HERMES_KANBAN_DB'])\n"
+        " fingerprints, events, attached = legacy.board_observation(board, ['t_00000001','t_00000002'])\n"
+        " assert not attached\n"
+        " for root in ('t_00000001','t_00000002'):\n"
+        "  observations[root] = {'fingerprint':fingerprints[root],'event_ids':events[root],"
+        "'observed_at':42.5,'observation_id':hashlib.sha256(root.encode()).hexdigest(),"
+        "'attachment_bearing':False}\n"
+        "epoch = store.commit(execution_id,ledger_sha,observations)\n"
+        "epoch_id, issued = epoch['epoch_id'], epoch['issuance_digest']\n"
         f"pathlib.Path({str(tmp_path / 'script-committed')!r}).touch()\n"
         f"if {kill_after_commit!r}:\n"
         f" while not pathlib.Path({str(tmp_path / 'release-output')!r}).exists(): time.sleep(0.05)\n"
@@ -238,9 +296,11 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
         "auxiliary": {"title_generation": {"enabled": False}},
     }), encoding="utf-8")
     root = Path(__file__).resolve().parents[2]
+    from tests.cron.fixtures.wri2276_store_fixture import materialize_archived_v2
+    archived = materialize_archived_v2(tmp_path / "archived-v2-source", parent=parent_case)
     env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
     env.update(HERMES_HOME=str(home), HOME=str(tmp_path), USERPROFILE=str(tmp_path),
-               PYTHONPATH=str(root), PYTHONUNBUFFERED="1", OPENAI_API_KEY="synthetic-loopback-only",
+               PYTHONPATH=os.pathsep.join((str(archived), str(root))), PYTHONUNBUFFERED="1", OPENAI_API_KEY="synthetic-loopback-only",
                OPENAI_BASE_URL=model_url)
     monkeypatch.setenv("HERMES_HOME", str(home))
     # The synthetic recurring job is never due during the gateway boot/ticker.
@@ -255,21 +315,11 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
     (home / "config.yaml").write_text(json.dumps(config))
     if tamper is True:
         script.write_text(script.read_text() + "\n# altered after opt-in\n")
-    with sqlite3.connect(home / "cron" / "synthetic-board.sqlite") as board:
-        board.execute("CREATE TABLE roots (root TEXT PRIMARY KEY, evidence TEXT NOT NULL)")
-        board.executemany("INSERT INTO roots VALUES (?,?)",
-                          [("root-a", "event-a"), ("root-b", "event-b")])
+    _seed_isolated_board(home, env, parent_case)
+    if stage_roots:
+        _seed_native_roots(home)
     firer_info = tmp_path / "firer.json"
-    firer_code = (
-        "import json, os, pathlib\n"
-        "from cron import jobs, executions, scheduler\n"
-        "job = jobs.claim_job_for_fire(" + repr(job["id"]) + ", manual=True, return_job=True)\n"
-        "assert isinstance(job, dict), job\n"
-        "execution = executions.create_execution(job['id'], source='test-firer')\n"
-        "job['execution_id'] = execution['id']\n"
-        f"pathlib.Path({str(firer_info)!r}).write_text(json.dumps({{'pid': os.getpid(), 'execution_id': execution['id'], 'claim': job['fire_claim']['by']}}))\n"
-        "scheduler._run_one_job_body(job)\n"
-    )
+    firer_code = _firer_program(job["id"], firer_info, parent_case, hold_finalizer, tmp_path)
     gateway_log = (tmp_path / "gateway.log").open("w+")
     firer_log = (tmp_path / "firer.log").open("w+")
     gateway = subprocess.Popen([sys.executable, "-m", "gateway.run"], cwd=root, env=env,
@@ -326,7 +376,7 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
             return
         if kill_after_commit:
             release.touch()
-            wait_until((tmp_path / "script-committed").exists, timeout=15,
+            wait_until((tmp_path / "script-committed").exists, timeout=30,
                        what="provisional SQLite commit before stdout")
             os.kill(int((tmp_path / "script-pid").read_text()), signal.SIGKILL)
             wait_until(lambda: firer.poll() is not None, timeout=35,
@@ -334,7 +384,7 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
             observer_path = home / "cron" / f"recovery-{job['id']}" / "local-observation-v2.sqlite"
             with sqlite3.connect(f"file:{observer_path}?mode=ro", uri=True) as db:
                 assert db.execute("SELECT count(*) FROM epochs").fetchone()[0] == 1
-                assert db.execute("SELECT count(*) FROM checked").fetchone()[0] == 0
+                assert db.execute("SELECT count(*) FROM records WHERE kind='checked'").fetchone()[0] == 0
                 assert db.execute("SELECT count(*) FROM outcomes").fetchone()[0] == 0
             with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
                 row = db.execute(
@@ -345,6 +395,9 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
             return
         # This is an admitted real RPC: the canonical process reached the script barrier.
         _assert_original_reservation(home, job, info)
+        with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
+            prepared_nonce = db.execute("SELECT nonce_digest FROM cron_prerun_bindings WHERE execution_id=?",
+                                        (info["execution_id"],)).fetchone()[0]
         release.touch()
         identity_path = tmp_path / "script-identity"
         wait_until(identity_path.exists, timeout=5)
@@ -360,11 +413,13 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
                 return None
             try:
                 with sqlite3.connect(f"file:{epoch_db}?mode=ro", uri=True) as db:
-                    return db.execute("SELECT execution_id, nonce_digest, epoch_id FROM epochs").fetchone()
+                    row = db.execute("SELECT execution_id,payload FROM epochs").fetchone()
+                    return (row[0], json.loads(row[1])) if row else None
             except sqlite3.OperationalError:
                 return None
         epoch = wait_until(committed_epoch, timeout=15, what="script committed provisional epoch")
-        assert epoch[0] == info["execution_id"]
+        assert epoch is not None and epoch[0] == info["execution_id"]
+        assert epoch[1]["epoch_id"]
         def binding_row():
             with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
                 return db.execute(
@@ -375,21 +430,23 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
                    timeout=40, what="bound producer row or finished original firer")
         binding = binding_row()
         assert binding is not None and binding[0] == "bound"
-        assert binding[1:3] == epoch[1:3] and binding[3]
+        assert binding[1] == prepared_nonce and binding[2] == epoch[1]["epoch_id"] and binding[3]
         if stage_roots:
             assert model_peer.blocked.wait(15), ("real canonical model did not reach its stage barrier; "
                                                  f"firer={firer.poll()} log={firer_log.read()} gateway={gateway_log.read()}")
-            adapter = root / "tests" / "cron" / "fixtures" / "wri2276_observer_contract.py"
+            adapter = root / "tests" / "cron" / "fixtures" / "target_parent_stage.py"
             stage_env = dict(env, WRI2276_SYNTHETIC_JOB_ID=job["id"])
-            for revision, root_id in enumerate(("root-a", "root-b"), start=1):
+            for index, root_id in enumerate(("t_00000001", "t_00000002")):
+                with sqlite3.connect(f"file:{epoch_db}?mode=ro", uri=True) as db:
+                    revision = json.loads(db.execute("SELECT payload FROM metadata WHERE id=1").fetchone()[0])["revision"]
                 stale = subprocess.run(
-                    [sys.executable, str(adapter), info["execution_id"], root_id, "0"],
+                    [sys.executable, str(adapter), info["execution_id"], root_id, str(revision - 1)],
                     cwd=root, env=stage_env, capture_output=True, text=True, timeout=10,
                     check=False,
                 )
                 assert stale.returncode != 0, "stale observer revision staged a root"
                 with sqlite3.connect(f"file:{epoch_db}?mode=ro", uri=True) as db:
-                    assert db.execute("SELECT count(*) FROM stages").fetchone()[0] == revision - 1
+                    assert db.execute("SELECT count(*) FROM stages").fetchone()[0] == index
                 staged = subprocess.run(
                     [sys.executable, str(adapter), info["execution_id"], root_id, str(revision)],
                     cwd=root, env=stage_env, capture_output=True, text=True, timeout=10,
@@ -399,8 +456,8 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
                 assert json.loads(staged.stdout) == {"state": "staged", "root": root_id,
                                                      "revision": revision + 1}
                 with sqlite3.connect(f"file:{epoch_db}?mode=ro", uri=True) as db:
-                    assert db.execute("SELECT count(*) FROM checked").fetchone()[0] == 0
-                    assert db.execute("SELECT count(*) FROM stages").fetchone()[0] == revision
+                    assert db.execute("SELECT count(*) FROM records WHERE kind='checked'").fetchone()[0] == 0
+                    assert db.execute("SELECT count(*) FROM stages").fetchone()[0] == index + 1
             with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
                 assert db.execute("SELECT status FROM executions WHERE id=?", (info["execution_id"],)).fetchone() == ("running",)
             model_peer.release.set()

@@ -88,11 +88,103 @@ def prepare_canonical(job: dict) -> tuple[dict[str, str], tuple[int, int, str]]:
              "HERMES_LOCAL_OBSERVATION_JOB_ID": job["id"]}, pin)
 
 
+def _verify_provisional_store(db_path, job_id: str, execution_id: str, output: dict) -> None:
+    """Reconstruct archived-v2 issuance in one read snapshot; never trust output as authority."""
+    import hashlib
+    import json
+    import sqlite3
+
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, ensure_ascii=True,
+                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+    def digest(value):
+        return hashlib.sha256(encoded(value)).hexdigest()
+
+    def decoded(raw):
+        if not isinstance(raw, bytes):
+            raise RuntimeError("Target cron observer payload is not a BLOB")
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise RuntimeError("Target cron observer duplicate JSON member")
+                result[key] = value
+            return result
+        value = json.loads(raw, object_pairs_hook=unique,
+                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+        if encoded(value) != raw or not isinstance(value, dict):
+            raise RuntimeError("Target cron observer payload is not canonical")
+        return value
+
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+        db.execute("BEGIN")
+        meta_row = db.execute("SELECT payload FROM metadata WHERE id=1").fetchone()
+        epoch_row = db.execute("SELECT payload FROM epochs WHERE execution_id=?",
+                               (execution_id,)).fetchone()
+        if not meta_row or not epoch_row:
+            raise RuntimeError("Target cron observer provisional identity absent")
+        meta, epoch = decoded(meta_row[0]), decoded(epoch_row[0])
+        expected_meta = {"schema": 2, "profile": str(get_hermes_home().resolve()),
+                         "job": job_id, "state": "provisional", "execution_id": execution_id}
+        if (any(meta.get(k) != v for k, v in expected_meta.items())
+                or type(meta.get("generation")) is not int or meta["generation"] < 1
+                or type(meta.get("revision")) is not int or meta["revision"] < 1
+                or not isinstance(meta.get("board"), str) or not meta["board"]
+                or any(not isinstance(meta.get(k), str) or len(meta[k]) != 64
+                       for k in ("source_v1_sha", "ledger_sha", "epoch_id", "issuance_digest"))
+                or any(meta.get(k) != output[k] for k in ("generation", "epoch_id", "issuance_digest"))):
+            raise RuntimeError("Target cron observer metadata identity changed")
+        backup = db_path.with_name("local-observation-v1.backup")
+        if (backup.is_symlink() or not backup.is_file() or
+                hashlib.sha256(backup.read_bytes()).hexdigest() != meta["source_v1_sha"]):
+            raise RuntimeError("Target cron observer source backup changed")
+        if (set(epoch) != {"execution_id", "generation", "epoch_id", "issuance_digest",
+                            "ledger_sha", "issued_count"}
+                or epoch["execution_id"] != execution_id
+                or any(epoch[k] != meta[k] for k in
+                       ("generation", "epoch_id", "issuance_digest", "ledger_sha"))
+                or type(epoch["issued_count"]) is not int
+                or not 0 <= epoch["issued_count"] <= 10000):
+            raise RuntimeError("Target cron observer epoch identity changed")
+        mapping = []
+        for root, payload in db.execute(
+                "SELECT root,payload FROM epoch_issued WHERE execution_id=? ORDER BY root",
+                (execution_id,)):
+            item = decoded(payload)
+            if (set(item) != {"root", "observation_id", "pending_seq", "attachment_bearing"}
+                    or item["root"] != root or type(item["pending_seq"]) is not int
+                    or item["pending_seq"] < 1 or type(item["attachment_bearing"]) is not bool
+                    or not isinstance(item["observation_id"], str)
+                    or len(item["observation_id"]) != 64 or len(mapping) >= 10000):
+                raise RuntimeError("Target cron observer issuance mapping changed")
+            issued = db.execute("SELECT observation_id,pending_seq,execution_id FROM issued "
+                                "WHERE root=?", (root,)).fetchone()
+            latest = db.execute("SELECT pending_seq FROM latest WHERE root=?", (root,)).fetchone()
+            pending = db.execute("SELECT kind,root,payload FROM records WHERE seq=?",
+                                 (item["pending_seq"],)).fetchone()
+            if (issued != (item["observation_id"], item["pending_seq"], execution_id)
+                    or latest is None or latest[0] != item["pending_seq"] or pending is None
+                    or pending[:2] != ("pending", root)):
+                raise RuntimeError("Target cron observer issued pointer changed")
+            observation = decoded(pending[2])
+            if (observation.get("observation_id") != item["observation_id"]
+                    or observation.get("attachment_bearing", False) != item["attachment_bearing"]):
+                raise RuntimeError("Target cron observer pending identity changed")
+            mapping.append(item)
+        count = db.execute("SELECT COUNT(*) FROM issued WHERE execution_id=?",
+                           (execution_id,)).fetchone()[0]
+        if (len(mapping) != epoch["issued_count"] or count != len(mapping)
+                or digest({"execution_id": execution_id, "generation": epoch["generation"],
+                           "ledger_sha": epoch["ledger_sha"], "mapping": mapping}) != epoch["issuance_digest"]
+                or digest([execution_id, epoch["generation"], epoch["issuance_digest"]]) != epoch["epoch_id"]):
+            raise RuntimeError("Target cron observer issuance digest changed")
+
+
 def bind_canonical_output(job: dict, output: str) -> dict:
     """Bind only strict post-redaction output to independently committed v2 identity."""
     import hashlib
     import json
-    import sqlite3
     import stat
     from cron import executions, jobs
     from gateway.session_cron import current_admission
@@ -130,14 +222,7 @@ def bind_canonical_output(job: dict, output: str) -> dict:
     if (db_path.is_symlink() or db_path.parent.is_symlink()
             or not stat.S_ISREG(db_path.stat().st_mode)):
         raise RuntimeError("Target cron observer store is not a regular restricted file")
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
-        db.row_factory = sqlite3.Row
-        epoch = db.execute("SELECT * FROM epochs WHERE execution_id=?", (execution_id,)).fetchone()
-    if (epoch is None or epoch["profile"] != str(get_hermes_home().resolve())
-            or epoch["job"] != job["id"] or epoch["status"] != "provisional"
-            or any(epoch[k] != envelope[k] for k in
-                   ("nonce_digest", "generation", "epoch_id", "issuance_digest"))):
-        raise RuntimeError("Target cron observer provisional identity changed")
+    _verify_provisional_store(db_path, job["id"], execution_id, envelope)
     live = jobs.get_job(job["id"])
     claim = live.get("fire_claim") if isinstance(live, dict) else None
     owner = claim.get("by") if isinstance(claim, dict) else None
@@ -174,6 +259,8 @@ def finish_target_completed_run(d, fire_owner: str | None, execution_id: str) ->
         if binding is None:
             return scheduler_bookkeeping.finish_completed_run(d, fire_owner, execution_id,
                                                               _target_inner=True)
+        from observer_parent_seam import ParentAuthority
+        authority = ParentAuthority.capture(execution_id, job["id"], fire_owner)
         executions.begin_local_finalization(execution_id)
         completed = scheduler_bookkeeping.finish_completed_run(d, fire_owner, execution_id,
                                                                _target_inner=True)
@@ -185,7 +272,7 @@ def finish_target_completed_run(d, fire_owner: str | None, execution_id: str) ->
                 or saved_job.get("last_status") not in {"ok", "delivery_queued"}):
             return completed  # pending/UNKNOWN is durable; no checked promotion
         try:
-            state, digest = _finalize_with_observer(job, binding)
+            state, digest = _finalize_with_observer(job, binding, authority)
             if not executions.mirror_local_finalization(execution_id, state, digest):
                 raise RuntimeError("Target cron finalization mirror refused")
         except (OSError, ValueError, RuntimeError) as exc:
@@ -194,14 +281,16 @@ def finish_target_completed_run(d, fire_owner: str | None, execution_id: str) ->
         return completed
 
 
-def _finalize_with_observer(job: dict, binding: dict) -> tuple[str, str]:
+def _finalize_with_observer(job: dict, binding: dict, authority) -> tuple[str, str]:
     import hashlib
     import json
     import os
-    import sqlite3
     import stat
     from cron.scheduler_script import _run_job_script, _resolve_script_path
     from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli import kanban_db
+    import engineering_recovery_observer as legacy
+    from local_observation_v2 import Store
 
     configured = load_user_config_effective(get_hermes_home() / "config.yaml")
     cron = configured.get("cron", {}) if isinstance(configured, dict) else {}
@@ -235,29 +324,68 @@ def _finalize_with_observer(job: dict, binding: dict) -> tuple[str, str]:
     })
     if hashlib.sha256(path.read_bytes()).hexdigest() != expected or not ok or len(output) > 4096:
         raise RuntimeError("Target cron finalizer failed or changed while running")
-    result = json.loads(output)
-    if (not isinstance(result, dict) or set(result) != {"state", "digest", "execution_id", "epoch_id"}
-            or result["state"] not in {"succeeded", "not_applicable", "unknown"}
-            or result["execution_id"] != binding["execution_id"]
-            or result["epoch_id"] != binding["epoch_id"]
-            or not isinstance(result["digest"], str) or len(result["digest"]) != 64):
-        raise RuntimeError("Target cron finalizer returned mismatched outcome")
-    db_path = get_hermes_home() / "cron" / f"recovery-{job['id']}" / "local-observation-v2.sqlite"
-    if db_path.is_symlink() or db_path.parent.is_symlink():
+    result = json.loads(output, object_pairs_hook=lambda pairs: _unique_proposal_members(pairs))
+    if (not isinstance(result, dict) or set(result) != {"roots"}
+            or not isinstance(result["roots"], list) or len(result["roots"]) > 10000
+            or any(not isinstance(root, str) or not root.startswith("t_") for root in result["roots"])
+            or result["roots"] != sorted(set(result["roots"]))):
+        raise RuntimeError("Target cron finalizer proposal is not a bounded root set")
+    directory = get_hermes_home() / "cron" / f"recovery-{job['id']}"
+    db_path = directory / "local-observation-v2.sqlite"
+    if db_path.is_symlink() or directory.is_symlink():
         raise RuntimeError("Target cron observer outcome path changed")
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
-        saved = db.execute("SELECT state,digest FROM outcomes WHERE execution_id=?",
-                           (binding["execution_id"],)).fetchone()
-        staged = db.execute("SELECT root,evidence_digest FROM stages WHERE execution_id=? ORDER BY root",
-                            (binding["execution_id"],)).fetchall()
-        checked = db.execute("SELECT root,digest FROM checked WHERE execution_id=? ORDER BY root",
-                             (binding["execution_id"],)).fetchall()
-    if saved != (result["state"], result["digest"]):
-        raise RuntimeError("Target cron observer outcome readback mismatch")
-    if ((saved[0] == "succeeded" and (not staged or checked != staged))
-            or (saved[0] != "succeeded" and (staged or checked))):
-        raise RuntimeError("Target cron checked receipts do not match every staged root")
-    return saved
+    store = Store(directory)
+    board = kanban_db.kanban_db_path(board=legacy.BOARD)
+    committed = store.parent_finalize(authority, result, board)
+    return _read_complete_parent_outcome(store, binding, committed, result["roots"])
+
+def _read_complete_parent_outcome(store, binding, committed, roots):
+    """Read every bounded immutable proof page before reflecting success into the producer."""
+    execution_id = binding["execution_id"]
+    cursor = None
+    seen = []
+    baseline = None
+    for _ in range(10001):
+        proof = store.read_parent_outcome(execution_id, after_root=cursor)
+        outcome = proof["outcome"]
+        current = (proof["epoch"], outcome, proof["final_event"])
+        if (baseline is not None and current != baseline
+                or outcome["execution_id"] != execution_id
+                or outcome["epoch_id"] != binding["epoch_id"]
+                or outcome["state"] not in {"succeeded", "not_applicable"}
+                or outcome["state"] != committed["state"]
+                or outcome["digest"] != committed["digest"]
+                or outcome["record_count"] != len(roots)
+                or proof["epoch"]["issuance_digest"] != binding["issuance_digest"]
+                or proof["epoch"]["generation"] != binding["generation"]
+                or proof["final_event"]["event"] != "finalize"
+                or proof["final_event"]["outcome_digest"] != outcome["digest"]):
+            raise RuntimeError("Target cron parent receipt readback mismatch")
+        baseline = current
+        page_roots = [item["outcome_item"]["root"] for item in proof["items"]]
+        if (any(not isinstance(root, str) for root in page_roots)
+                or page_roots != sorted(set(page_roots))
+                or (page_roots and cursor is not None and page_roots[0] <= cursor)
+                or len(seen) + len(page_roots) > len(roots)
+                or proof["last_root"] != (page_roots[-1] if page_roots else cursor)
+                or (proof["has_more"] and not page_roots)):
+            raise RuntimeError("Target cron parent proof page did not advance")
+        seen.extend(page_roots)
+        if not proof["has_more"]:
+            if seen != roots:
+                raise RuntimeError("Target cron parent proof root set incomplete")
+            return outcome["state"], outcome["digest"]
+        cursor = proof["last_root"]
+    raise RuntimeError("Target cron parent proof exceeded page bound")
+
+
+def _unique_proposal_members(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError("Target cron duplicate proposal member")
+        result[key] = value
+    return result
 
 
 def reserve_original_firer(job: dict, execution_id: str, fire_owner: str | None) -> None:

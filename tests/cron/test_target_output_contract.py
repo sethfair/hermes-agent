@@ -1,19 +1,17 @@
 """WRI-2276 target output grammar fails before any observer or worker promotion."""
 
 import json
-import sqlite3
-
 import pytest
 
 from cron.scheduler_local_observation import bind_canonical_output
 
+pytest_plugins = ("tests.cron.fixtures.wri2276_store_fixture",)
 
-def test_output_cannot_substitute_a_different_nonce_even_with_matching_provisional(tmp_path, monkeypatch):
+def test_output_cannot_substitute_a_different_nonce_even_with_matching_provisional(real_v2, monkeypatch):
     from cron import executions, jobs
     from gateway import session_cron
 
-    home = tmp_path / "profile"
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    home, legacy, v2 = real_v2
     job = jobs.create_job(prompt="synthetic", schedule="every 1h")
     claimed = jobs.claim_job_for_fire(job["id"], manual=True, return_job=True)
     assert isinstance(claimed, dict)
@@ -27,16 +25,22 @@ def test_output_cannot_substitute_a_different_nonce_even_with_matching_provision
         assert held
         executions.reserve_prerun_binding(execution_id, job["id"], owner)
         executions.prepare_prerun_binding(execution_id, job["id"], "admission", "a" * 64, owner)
-    db_path = home / "cron" / f"recovery-{job['id']}" / "local-observation-v2.sqlite"
-    db_path.parent.mkdir(mode=0o700)
-    with sqlite3.connect(db_path) as db:
-        db.execute("CREATE TABLE epochs (execution_id TEXT,profile TEXT,job TEXT,status TEXT,"
-                   "nonce_digest TEXT,generation INTEGER,epoch_id TEXT,issuance_digest TEXT)")
-        db.execute("INSERT INTO epochs VALUES (?,?,?,?,?,?,?,?)",
-                   (execution_id, str(home.resolve()), job["id"], "provisional", "b" * 64,
-                    1, "c" * 64, "d" * 64))
+    monkeypatch.setattr(legacy, "JOB_ID", job["id"])
+    directory = home / "cron" / f"recovery-{job['id']}"
+    directory.mkdir(mode=0o700)
+    source = {"version": 1, "job_id": job["id"], "board_id": legacy.BOARD,
+              "ledger_sha": "d" * 64, "admission_generation": 0,
+              "admission_state": "invalidating", "pending": {}, "roots": {},
+              "current_issued": {}}
+    (directory / "local-observation-v1.json").write_bytes(json.dumps(source).encode())
+    store = v2.migrate(directory)
+    store.begin(execution_id, "d" * 64)
+    pending = {"fingerprint": "f" * 64, "event_ids": [7], "observed_at": 42.5,
+               "observation_id": "b" * 64, "attachment_bearing": False}
+    epoch = store.commit(execution_id, "d" * 64, {"t_00000001": pending})
     envelope = {"version": 2, "execution_id": execution_id, "nonce_digest": "b" * 64,
-                "generation": 1, "epoch_id": "c" * 64, "issuance_digest": "d" * 64,
+                "generation": epoch["generation"], "epoch_id": epoch["epoch_id"],
+                "issuance_digest": epoch["issuance_digest"],
                 "wakeAgent": True}
     with pytest.raises(RuntimeError, match="nonce"):
         bind_canonical_output({**claimed, "execution_id": execution_id}, json.dumps(envelope))
