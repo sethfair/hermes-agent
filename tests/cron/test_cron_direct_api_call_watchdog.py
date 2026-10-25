@@ -110,6 +110,8 @@ def test_inline_local_responses_endpoint_keeps_its_configured_stale_budget(monke
 
     monkeypatch.delenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", raising=False)
     monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "3000")
+    # The local server's advertised window is independent of its stale timeout.
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *a, **k: 128_000)
     agent = run_agent.AIAgent(
         model="local-model", provider="custom", api_mode="codex_responses",
         base_url="http://127.0.0.1:8080/v1", api_key="x", quiet_mode=True,
