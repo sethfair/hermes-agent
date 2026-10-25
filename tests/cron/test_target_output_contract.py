@@ -66,6 +66,9 @@ def test_absent_v2_store_cannot_bind_valid_looking_output(tmp_path, monkeypatch)
 @pytest.mark.parametrize("payload", [
     '{}',
     '{"version":2,"version":2}',
+    '{"version":2,"execution_id":"execution","nonce_digest":"[REDACTED]",'
+    '"generation":1,"epoch_id":"' + 'b' * 64 +
+    '","issuance_digest":"' + 'c' * 64 + '","wakeAgent":true}',
     '{"version":2,"execution_id":"execution","nonce_digest":"' + 'a' * 64 +
     '","generation":1,"epoch_id":"' + 'b' * 64 +
     '","issuance_digest":"' + 'c' * 64 + '","wakeAgent":false}',

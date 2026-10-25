@@ -77,6 +77,13 @@ def test_actual_archived_store_binds_only_prepared_nonce_and_issued_identity(rea
         bind_canonical_output(target, json.dumps(envelope))
     with sqlite3.connect(store.path) as db:
         db.execute("UPDATE metadata SET payload=? WHERE id=1", (original,))
+    live = jobs.get_job(job["id"])
+    assert isinstance(live, dict) and isinstance(live.get("fire_claim"), dict)
+    changed_claim = {**live, "fire_claim": {**live["fire_claim"], "by": "foreign-firer"}}
+    jobs.save_jobs([changed_claim])
+    with pytest.raises(RuntimeError, match="claim"):
+        bind_canonical_output(target, json.dumps(envelope))
+    jobs.save_jobs([live])
     bound = bind_canonical_output(target, json.dumps(envelope))
     assert bound["bind_state"] == "bound"
     assert bound["nonce_digest"] == "a" * 64
