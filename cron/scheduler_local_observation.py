@@ -93,6 +93,7 @@ def _verify_provisional_store(db_path, job_id: str, execution_id: str, output: d
     import hashlib
     import json
     import sqlite3
+    from engineering_recovery_observer import BOARD
 
     def encoded(value):
         return json.dumps(value, sort_keys=True, ensure_ascii=True,
@@ -126,8 +127,12 @@ def _verify_provisional_store(db_path, job_id: str, execution_id: str, output: d
             raise RuntimeError("Target cron observer provisional identity absent")
         meta, epoch = decoded(meta_row[0]), decoded(epoch_row[0])
         expected_meta = {"schema": 2, "profile": str(get_hermes_home().resolve()),
-                         "job": job_id, "state": "provisional", "execution_id": execution_id}
-        if (any(meta.get(k) != v for k, v in expected_meta.items())
+                         "job": job_id, "board": BOARD, "state": "provisional",
+                         "execution_id": execution_id}
+        if (set(meta) != {"schema", "profile", "job", "board", "source_v1_sha",
+                          "ledger_sha", "generation", "state", "execution_id",
+                          "epoch_id", "issuance_digest", "revision", "v1_unknown"}
+                or any(meta.get(k) != v for k, v in expected_meta.items())
                 or type(meta.get("generation")) is not int or meta["generation"] < 1
                 or type(meta.get("revision")) is not int or meta["revision"] < 1
                 or not isinstance(meta.get("board"), str) or not meta["board"]

@@ -1,6 +1,7 @@
 """WRI-2276 output binding against the archived, uninstalled v2 Store implementation."""
 
 import json
+import sqlite3
 
 import pytest
 
@@ -51,6 +52,31 @@ def test_actual_archived_store_binds_only_prepared_nonce_and_issued_identity(rea
         row = db.execute("SELECT bind_state,unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",
                          (execution_id,)).fetchone()
     assert tuple(row) == ("preparing", 1)
+    with sqlite3.connect(store.path) as db:
+        original = db.execute("SELECT payload FROM metadata WHERE id=1").fetchone()[0]
+        mutated = json.loads(original)
+        mutated["caller_approved"] = True
+        db.execute("UPDATE metadata SET payload=? WHERE id=1", (v2.encode(mutated),))
+    with pytest.raises(RuntimeError, match="metadata"):
+        bind_canonical_output(target, json.dumps(envelope))
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE metadata SET payload=? WHERE id=1", (original,))
+    with sqlite3.connect(store.path) as db:
+        wrong_board = json.loads(original)
+        wrong_board["board"] = "foreign-board"
+        db.execute("UPDATE metadata SET payload=? WHERE id=1", (v2.encode(wrong_board),))
+    with pytest.raises(RuntimeError, match="metadata"):
+        bind_canonical_output(target, json.dumps(envelope))
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE metadata SET payload=? WHERE id=1", (original,))
+    with sqlite3.connect(store.path) as db:
+        wrong_profile = json.loads(original)
+        wrong_profile["profile"] = str(home / "other-profile")
+        db.execute("UPDATE metadata SET payload=? WHERE id=1", (v2.encode(wrong_profile),))
+    with pytest.raises(RuntimeError, match="metadata"):
+        bind_canonical_output(target, json.dumps(envelope))
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE metadata SET payload=? WHERE id=1", (original,))
     bound = bind_canonical_output(target, json.dumps(envelope))
     assert bound["bind_state"] == "bound"
     assert bound["nonce_digest"] == "a" * 64
