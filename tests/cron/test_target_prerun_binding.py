@@ -98,7 +98,7 @@ def _firer_program(job_id, info_path, parent_case, hold_finalizer, tmp_path: Pat
     )
 
 
-def _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info, epoch_db):
+def _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info, epoch_db, env):
     marker = "finalizer-started" if hold_finalizer == "before-v2" else "finalizer-committed"
     wait_until((tmp_path / marker).exists, timeout=15, what="held local finalization kill window")
     os.kill(firer.pid, signal.SIGKILL)
@@ -112,6 +112,23 @@ def _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info
         checked = db.execute("SELECT count(*) FROM records WHERE kind='checked'").fetchone()[0]
     assert terminal == ("completed",) and disposition == ("pending",)
     assert (outcomes, checked) == ((0, 0) if hold_finalizer == "before-v2" else (1, 2))
+
+    # Even a durable v2 success cannot free quota after parent death before mirror.
+    denial = subprocess.run(
+        [sys.executable, "-c",
+         "import pathlib,os\n"
+         "import engineering_recovery_observer as legacy\n"
+         "legacy.PROFILE_HOME=pathlib.Path(os.environ['HERMES_HOME']).resolve()\n"
+         f"legacy.JOB_ID={info['job_id']!r}\n"
+         "from cron import executions\n"
+         f"print(executions.reconcile_target_pin({info['execution_id']!r},{info['job_id']!r}))\n"],
+        cwd=Path(__file__).resolve().parents[2], env=env,
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert denial.returncode == 0 and denial.stdout.strip() == "False", denial.stderr
+    with sqlite3.connect(f"file:{home / 'cron' / 'executions.db'}?mode=ro", uri=True) as db:
+        assert db.execute("SELECT unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",
+                          (info["execution_id"],)).fetchone() == (1,)
 
     # A new process may fire after the dead owner, but cannot settle the prior pin.
     contender = subprocess.run(
@@ -522,7 +539,7 @@ def test_target_distinct_process_binds_before_stage_and_finalizes_only_after_ter
                 assert db.execute("SELECT status FROM executions WHERE id=?", (info["execution_id"],)).fetchone() == ("running",)
             model_peer.release.set()
         if hold_finalizer in ("before-v2", "after-v2"):
-            _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info, epoch_db)
+            _assert_killed_finalizer_pending(tmp_path, hold_finalizer, firer, home, info, epoch_db, env)
             return
         if hold_finalizer:
             wait_until((tmp_path / "finalizer-started").exists, timeout=15,
