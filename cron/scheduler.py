@@ -2292,12 +2292,13 @@ def _prepare_job_prompt(
     if script_path:
         from cron.scheduler_local_observation import is_target_job, prepare_canonical
         scoped_env, script_pin = prepare_canonical(job) if is_target_job(job) else (None, None)
+        script_kwargs = {"scoped_env": scoped_env} if scoped_env is not None else {}
         prerun_script = _run_job_script_with_claim_heartbeat(
             job,
             script_path,
             workdir=_resolve_job_workdir(job, job_id),
             cancel_event=cancel_event,
-            scoped_env=scoped_env,
+            **script_kwargs,
         )
         _ran_ok, _script_output = prerun_script
         if is_target_job(job):
