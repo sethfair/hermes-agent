@@ -227,7 +227,7 @@ class TestSyncMode:
         elapsed = time.monotonic() - start
 
         assert n == 1  # optimistic count
-        assert elapsed < 1.0  # returned immediately, didn't wait for slow_run
+        assert elapsed < 4.0  # below the barrier's 5s wait; startup can exceed 1s
 
         # Let the job finish so cleanup works.
         barrier.wait()
