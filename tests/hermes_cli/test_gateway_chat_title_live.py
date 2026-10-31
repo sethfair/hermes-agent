@@ -106,6 +106,32 @@ finally:
             history = json.dumps(model_peer.requests[-1]["messages"])
             assert "WS_SHARED create" in history and "WS_SHARED again" in history
             assert len(model_peer.requests) == 3
+
+            # A workflow-style first send must freeze explicit route and budget at the
+            # title's atomic creation, not first create at defaults then reject on resume.
+            policy_title = "workflow-style fresh titled thread"
+            policy_args = ("-c", policy_title, "--create-if-missing", "--model", "policy-wire-stub",
+                           "--provider", "custom", "--max-turns", "3")
+            first, policy_sid = chat(*policy_args, "-q", "WS_SHARED policy")
+            assert first.returncode == 0 and policy_sid and "LOCAL_ACK_WS_SHARED" in first.stdout, first
+            assert model_peer.requests[-1]["model"] == "policy-wire-stub"
+            repeated, repeated_sid = chat(*policy_args, "-q", "WS_SHARED same route")
+            assert repeated.returncode == 0 and repeated_sid == policy_sid, repeated
+            assert len(model_peer.requests) == 5
+            mismatch, _ = chat("-c", policy_title, "--create-if-missing", "--model", "other-wire-stub",
+                               "--provider", "custom", "--max-turns", "3", "-q", "WS_SHARED deny")
+            assert mismatch.returncode != 0 and "creation overrides are unsupported on resume" in mismatch.stderr
+            budget_mismatch, _ = chat("-c", policy_title, "--create-if-missing", "--model", "policy-wire-stub",
+                                      "--provider", "custom", "--max-turns", "4", "-q", "WS_SHARED deny")
+            assert budget_mismatch.returncode != 0 and "--max-turns differs" in budget_mismatch.stderr
+            # Provider-only repeats must not silently retain the frozen provider.
+            provider_title = "provider-only titled thread"
+            provider_first, provider_sid = chat("-c", provider_title, "--create-if-missing",
+                                                "--provider", "custom", "-q", "WS_SHARED provider first")
+            assert provider_first.returncode == 0 and provider_sid, provider_first
+            provider_same, provider_same_sid = chat("-c", provider_title, "--create-if-missing",
+                                                   "--provider", "custom", "-q", "WS_SHARED provider same")
+            assert provider_same.returncode == 0 and provider_same_sid == provider_sid, provider_same
             print("CLI_TITLE_RECEIPT=" + json.dumps({"session_id": sid, "daemon_pid": daemon.pid,
                                                      "missing": missing.stderr, "resumed": resumed.stdout}))
         finally:
@@ -116,3 +142,19 @@ finally:
                 except subprocess.TimeoutExpired:
                     daemon.kill()
                     daemon.wait(timeout=5)
+
+
+def test_provider_only_launch_is_checked_against_frozen_resume_policy():
+    from types import SimpleNamespace
+    from hermes_cli.cli_init_mixin import _gateway_launch
+    from hermes_cli.gateway_session_store import _check_resume_launch
+
+    cli = SimpleNamespace(model="local-wire-stub", _explicit_model_override=False,
+                          _explicit_provider="custom")
+    launch = _gateway_launch(cli)
+    assert launch["model"] is None
+    assert launch["provider"] == "custom"
+    snapshot = {"info": {"launch_request": {"provider": "custom"}}}
+    _check_resume_launch(launch, snapshot)
+    with pytest.raises(Exception, match="--provider differs"):
+        _check_resume_launch({**launch, "provider": "other"}, snapshot)

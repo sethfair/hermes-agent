@@ -1426,7 +1426,9 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                     new_sid = _create_titled_session(continue_val)
                 else:
                     from hermes_cli.gateway_session_store import create_titled_session
-                    new_sid = create_titled_session(continue_val)
+                    # The gateway creates the titled row before main resumes it. Freeze this
+                    # invocation's route and budget at that creation, not profile defaults.
+                    new_sid = create_titled_session(continue_val, dict(vars(args)))
                 if new_sid:
                     args.resume = new_sid
                 else:
