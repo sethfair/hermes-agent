@@ -63,6 +63,28 @@ def test_promote_stuck_todo_succeeds(conn):
     assert kb.get_task(conn, child).status == "ready"
 
 
+def test_promote_fully_specified_triage_task_succeeds(conn):
+    task_id = kb.create_task(conn, title="fully specified", body="acceptance criteria", assignee="setup", triage=True)
+    ok, err = kb.promote_task(conn, task_id, actor="operator", reason="triage release")
+    assert ok and err is None
+    assert kb.get_task(conn, task_id).status == "ready"
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='promoted_manual' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event is not None
+    assert '"from_status": "triage"' in event["payload"]
+
+
+def test_promote_triage_refuses_undone_parent(conn):
+    parent = kb.create_task(conn, title="parent", assignee="setup")
+    child = kb.create_task(conn, title="triage child", parents=[parent], assignee="setup", triage=True)
+    ok, err = kb.promote_task(conn, child, actor="operator")
+    assert not ok
+    assert err and parent in err
+    assert kb.get_task(conn, child).status == "triage"
+
+
 def test_promote_refuses_undone_parent_and_names_the_real_remedy(conn):
     # #106195: promotion must never report a 'ready' that the first claim reverts.
     child, (parent,) = _stuck_todo(conn, parents_done=False)
