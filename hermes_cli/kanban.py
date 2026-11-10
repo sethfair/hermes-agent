@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_lifecycle as kbl
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
@@ -1119,6 +1120,45 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_release_triage(args: argparse.Namespace) -> int:
+    reason = _joined_words(args.reason)
+    author = _profile_author()
+    ids = list(dict.fromkeys(_bulk_ids(args)))
+    dry_run = bool(args.dry_run)
+
+    results: list[dict[str, object]] = []
+    with kbc.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kbl.release_triage_task(
+                conn, tid, actor=author, reason=reason, dry_run=dry_run,
+            )
+            results.append({
+                "task_id": tid,
+                "released": ok,
+                "dry_run": dry_run,
+                "reason": reason,
+                "error": err,
+            })
+
+    failed = [r for r in results if not r["released"]]
+    if getattr(args, "json", False):
+        _print_json(results[0] if len(results) == 1 else results)
+        return 0 if not failed else 1
+
+    tag = " (dry)" if dry_run else ""
+    label = "Would release" if dry_run else "Released"
+    suffix = f": {reason}" if reason else ""
+    for result in results:
+        if result["released"]:
+            print(f"{label} {result['task_id']} -> ready{tag}{suffix}")
+        else:
+            print(
+                f"cannot release {result['task_id']} from triage: {result['error']}",
+                file=sys.stderr,
+            )
+    return 0 if not failed else 1
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1330,6 +1370,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "release-triage": _cmd_release_triage,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
