@@ -142,12 +142,11 @@ events made with the default `GITHUB_TOKEN`. `workflow_dispatch` and
 
 ### Runners
 
-`blacksmith-*` labels are Blacksmith runners (`4vcpu` for small jobs,
-`32vcpu` for test suites and builds, `-arm` for native arm64). `macos-15`,
-`windows-latest-32-core` and `windows-latest-32-arm-core` are GitHub-hosted.
-No workflow runs on Intel macOS. Some publish jobs run on `ubuntu-latest` on purpose:
-`docker buildx imagetools` cannot commit manifest lists to Docker Hub from
-Blacksmith.
+All workflows use standard GitHub-hosted runners: `ubuntu-latest`,
+`ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm`, `macos-latest`, and
+`macos-15`.
+No workflow uses paid or self-hosted runner labels, and no workflow runs on
+Intel macOS.
 
 ---
 
@@ -212,7 +211,7 @@ of every suite that reads it.
 |---|---|---|---|
 | Detect affected areas | inline | always | never |
 | Python tests | `tests.yml` | `python` or `e2e` or `e2e_upgrade` | none of those lanes |
-| ↳ `Run tests (1/2, 2/2)` | | always inside `tests.yml` | |
+| ↳ `Run tests (1/8 … 8/8)` | | always inside `tests.yml` | |
 | ↳ `e2e` | | `e2e` lane (release or dispatch) | every PR and every push to `main` |
 | ↳ `e2e-upgrade-plan`, `e2e-upgrade (shard)` | | `e2e_upgrade` lane (release or dispatch) | every PR and every push |
 | OS-specific tests | `tests-os.yml` | `python` or `desktop_updater` or `e2e` or `e2e_upgrade` | none of those |
