@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.waiting import wait_until
+
 REPO = Path(__file__).resolve().parents[2]
 BASE = "6231b760c2325d2dc9f71afce51acf1163fdd908"
 CANDIDATE = "2b8e9678ef8ebca08e949ac56e057bc359b80c51"
@@ -36,8 +38,46 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _has_reviewed_commits(repo: Path) -> bool:
+    return all(command(repo, "git", "cat-file", "-e", f"{sha}^{{tree}}").returncode == 0
+               for sha in (CANDIDATE, BASE))
+
+
+def _fetch_reviewed_commits() -> bool:
+    if _has_reviewed_commits(REPO):
+        return True
+    # The checkout's own config and credentials (CI's checkout token, a user's helper) apply.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    result = subprocess.run(
+        ("git", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--depth=1",
+         "origin", CANDIDATE, BASE),
+        cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        stdin=subprocess.DEVNULL, timeout=600, check=False)
+    if _has_reviewed_commits(REPO):
+        return True
+    # Test files fetch concurrently and git refuses a second writer of .git/shallow.lock.
+    assert ".lock" in result.stderr, f"cannot fetch reviewed commits {CANDIDATE} and {BASE}: {result.stderr}"
+    return False
+
+
+def provide_reviewed_commits() -> None:
+    """Make the reviewed WRI-2276 commits readable in the source checkout.
+
+    A shallow checkout (CI's actions/checkout fetches one commit) lacks them, so fetch
+    both from its origin at depth 1. A full clone already has them and is not touched.
+    """
+    wait_until(_fetch_reviewed_commits, timeout=300, interval=1,
+               what=f"another fetch to release the lock on {REPO}")
+
+
 def candidate_tree(path: Path) -> Path:
+    provide_reviewed_commits()
     git(path.parent, "clone", "--shared", "--no-checkout", str(REPO), str(path))
+    if not _has_reviewed_commits(path):
+        # Git clones a shallow source by transport, which copies only its refs' history.
+        git(path, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--depth=1",
+            str(REPO), CANDIDATE, BASE)
     git(path, "checkout", "--detach", CANDIDATE)
     git(path, "config", "user.name", "Policy fixture")
     git(path, "config", "user.email", "policy@example.invalid")
