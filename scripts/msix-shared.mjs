@@ -8,6 +8,11 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 
+// Requests the Python validator already accepted in this process. Starting
+// Python and importing the release modules dominates the cost of a call, and the
+// verdict depends only on the request bytes; rejections are never remembered.
+const admittedChannelRequests = new Set()
+
 /** Build-only structured bridge; never read by the installed runtime.
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {import('../apps/desktop/electron/install-stamp.js').ChannelBuildRequest | null}
@@ -17,6 +22,14 @@ export function channelBuildRequest(env = process.env) {
   const value = JSON.parse(env._HERMES_CHANNEL_REQUEST_JSON)
   if (env.HERMES_DESKTOP_VARIANT !== 'bundled') throw new Error('Channel builds support only bundled packaging')
   if (env.HERMES_BUILD_COMMIT || env.HERMES_PAYLOAD_TAG) throw new Error('Channel request conflicts with commit or tag identity')
+  if (!admittedChannelRequests.has(env._HERMES_CHANNEL_REQUEST_JSON)) validateWithPython(env)
+  if (env.HERMES_PAYLOAD_VERSION && env.HERMES_PAYLOAD_VERSION !== value.version) throw new Error('Channel package version conflicts with prepared request')
+  Object.freeze(value.identity)
+  Object.freeze(value.bundleEnv)
+  return Object.freeze(value)
+}
+
+function validateWithPython(env) {
   // The bundled toolchain already supplies Python. Reuse the authoritative
   // validator rather than maintaining a third protocol decoder for packaging.
   const validator = [
@@ -29,10 +42,7 @@ export function channelBuildRequest(env = process.env) {
   execFileSync(env.HERMES_PYTHON || 'python', ['-I', '-S', '-c', validator, path.resolve(import.meta.dirname, '..')], {
     env, input: env._HERMES_CHANNEL_REQUEST_JSON, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000
   })
-  if (env.HERMES_PAYLOAD_VERSION && env.HERMES_PAYLOAD_VERSION !== value.version) throw new Error('Channel package version conflicts with prepared request')
-  Object.freeze(value.identity)
-  Object.freeze(value.bundleEnv)
-  return Object.freeze(value)
+  admittedChannelRequests.add(env._HERMES_CHANNEL_REQUEST_JSON)
 }
 
 
