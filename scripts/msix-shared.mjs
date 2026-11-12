@@ -29,6 +29,7 @@ export function channelBuildRequest(env = process.env) {
   return Object.freeze(value)
 }
 
+/** @param {NodeJS.ProcessEnv} env */
 function validateWithPython(env) {
   // The bundled toolchain already supplies Python. Reuse the authoritative
   // validator rather than maintaining a third protocol decoder for packaging.
