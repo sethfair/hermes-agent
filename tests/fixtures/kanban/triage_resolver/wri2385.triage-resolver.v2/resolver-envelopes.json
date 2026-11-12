@@ -1,0 +1,19 @@
+{
+  "operation_denial": {
+    "contract_version": "wri2385.triage-resolver.v2",
+    "error_code": "authority_unavailable",
+    "message": "resolver authority is unavailable",
+    "operation": "inspect",
+    "receipt": null,
+    "request_id": "123e4567-e89b-42d3-a456-426614174000"
+  },
+  "parse_error": {
+    "contract_version": null,
+    "envelope_version": "wri2385.triage-resolver.parse-error.v2",
+    "error_code": "malformed_request",
+    "message": "request frame is malformed",
+    "operation": null,
+    "receipt": null,
+    "request_id": null
+  }
+}

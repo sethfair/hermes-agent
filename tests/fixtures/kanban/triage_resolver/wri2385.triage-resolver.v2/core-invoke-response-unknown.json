@@ -1,0 +1,11 @@
+{
+  "board": "fixture-board",
+  "board_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "invoke_version": "wri2385.core-invoke.v2",
+  "machine_id": "313430c4378b466fadebe3ac9f49008ce25f541686e913b13e9b29f9afb0a83b",
+  "request_sha256": "f5ed27e0a7c32314ec5b725c5d5ed8c40b9fcb04b0a86cc925c876eb22fa2c6c",
+  "response_bytes": null,
+  "response_length": null,
+  "response_sha256": null,
+  "result": "unknown"
+}

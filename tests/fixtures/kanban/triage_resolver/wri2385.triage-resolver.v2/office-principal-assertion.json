@@ -1,0 +1,20 @@
+{
+  "algorithm": "Ed25519",
+  "assertion_version": "wri2385.office-principal-assertion.v2",
+  "audience": "nousresearch/hermes-agent:wri2385-triage-resolver",
+  "board_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "expires_at": 1800000015,
+  "issued_at": 1800000000,
+  "issuer": "writerflow/hermes-office",
+  "jti": "ABEiM0RVZneImaq7zN3u_w",
+  "kid": "fixture-key-v2",
+  "machine_id": "313430c4378b466fadebe3ac9f49008ce25f541686e913b13e9b29f9afb0a83b",
+  "operation": "inspect",
+  "principal": "office:user:seth",
+  "principal_epoch": 3,
+  "request_digest": "9b6f97a7c8a7334f64bf8479f55c04be56e28800ccd884efaee0b76229842aec",
+  "request_id": "123e4567-e89b-42d3-a456-426614174000",
+  "session_epoch": 7,
+  "session_id": "fixture-session-0000000000000001",
+  "signature": "PVwvtRNkvbwf3ns5TYOk4NdCGe6zTLb-H19T4sD9K4_uUWDCZwWIYGDNhlOLyE8r8w2FSGEKpmsNVYZ3DvahAg"
+}

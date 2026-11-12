@@ -1,0 +1,23 @@
+{
+  "codec": "wri2385-tagged-binary-v2",
+  "contract_version": "wri2385.triage-resolver.v2",
+  "domain_registry_count": 23,
+  "files": {
+    "codec-vectors.json": "d02009a1335d18daa65cbc0ed48932b9b940542fbfa76f89ac44866aaeeacc59",
+    "core-invoke-request.json": "c440adfaaeec848a90a45326f3d72b893199ef0903a6a2c0aeb089f81103f69a",
+    "core-invoke-response-completed.json": "d2708a49ad334d30d9e183aa8816ec8996d24967f035b7944197cf37d4405391",
+    "core-invoke-response-unknown.json": "9dfee0571604fd52379daee880f02fb8b4435bda5376c1eecc7f7f335e891501",
+    "office-principal-assertion.json": "58c50a8ca2863d6620555f40e70d218725c407287861de2a6055ebf2d4195219",
+    "office-sign-request.json": "64d49896c83cbb7146f3f737a473a960b78e296cbaeceb1702c73f185dbafeb2",
+    "office-sign-response.json": "8057538c4bf94d2d7a2946cec7fb1fff4041182c0cbb6140becac5c33b2d1530",
+    "resolver-envelopes.json": "3af52fc0f2a256504641b25f33d4f0c042f6fc47838ad2c18f4f6dfd57c6e521",
+    "resolver-request-frame.bin": "391c559da215d0d53ff0de68219f7f6a31046871f7965de191b7b8b5bcf8935f",
+    "resolver-response-frame.bin": "db67baad80a7553641dc8430a7fa1f9af59eabfb1cb40dd8fec544500cd34093"
+  },
+  "fixture_format_version": "wri2385.fixture-packet.v2",
+  "generator_commands": [
+    "python -m tests.fixtures.kanban.triage_resolver.tools.generate_fixtures",
+    "node --test tests/fixtures/kanban/triage_resolver/tools/*.test.mjs"
+  ],
+  "source_revision": "bba2061988e6c5a05c9b32626f616f2f7576b8ab"
+}

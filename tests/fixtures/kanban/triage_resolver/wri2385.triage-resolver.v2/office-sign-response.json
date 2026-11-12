@@ -1,0 +1,8 @@
+{
+  "claim_digest": "2ac30553aaa5d50cc09e2823d72f0284d6287a9fd371ae4f17165813518250e3",
+  "kid": "fixture-key-v2",
+  "office_assertion_row_id": "123e4567-e89b-42d3-a456-426614174001",
+  "sign_request_version": "wri2385.office-sign.v2",
+  "signature": "PVwvtRNkvbwf3ns5TYOk4NdCGe6zTLb-H19T4sD9K4_uUWDCZwWIYGDNhlOLyE8r8w2FSGEKpmsNVYZ3DvahAg",
+  "signer_status": "signed"
+}

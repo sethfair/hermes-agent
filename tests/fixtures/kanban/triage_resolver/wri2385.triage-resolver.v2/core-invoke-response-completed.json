@@ -1,0 +1,11 @@
+{
+  "board": "fixture-board",
+  "board_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "invoke_version": "wri2385.core-invoke.v2",
+  "machine_id": "313430c4378b466fadebe3ac9f49008ce25f541686e913b13e9b29f9afb0a83b",
+  "request_sha256": "f5ed27e0a7c32314ec5b725c5d5ed8c40b9fcb04b0a86cc925c876eb22fa2c6c",
+  "response_bytes": "AAAA3XsiY29udHJhY3RfdmVyc2lvbiI6IndyaTIzODUudHJpYWdlLXJlc29sdmVyLnYyIiwiZXJyb3JfY29kZSI6ImF1dGhvcml0eV91bmF2YWlsYWJsZSIsIm1lc3NhZ2UiOiJyZXNvbHZlciBhdXRob3JpdHkgaXMgdW5hdmFpbGFibGUiLCJvcGVyYXRpb24iOiJpbnNwZWN0IiwicmVjZWlwdCI6bnVsbCwicmVxdWVzdF9pZCI6IjEyM2U0NTY3LWU4OWItNDJkMy1hNDU2LTQyNjYxNDE3NDAwMCJ9",
+  "response_length": 225,
+  "response_sha256": "429ee275545aa1b94325d7cf387d5f71780b87e8db8753be579025eec43f805f",
+  "result": "completed"
+}
