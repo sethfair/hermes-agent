@@ -2229,6 +2229,7 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+    prepared_script: Optional[dict] = None,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
@@ -2267,7 +2268,11 @@ def _prepare_job_prompt(
     # (#96290).
     prerun_script = None
     script_path = job.get("script")
-    if script_path:
+    if prepared_script is not None:
+        from cron.scheduler_local_observation import consume_prepared_script
+
+        prerun_script = consume_prepared_script(job, prepared_script)
+    elif script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(
             job,
             script_path,
@@ -2314,6 +2319,8 @@ def _prepare_job_prompt(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         note_cron_skipped(job)
         return (True, "", SILENT_MARKER, None), None
+    from cron.scheduler_local_observation import selector_prompt
+    prompt += selector_prompt(job)
     return None, prompt
 
 
@@ -2539,6 +2546,7 @@ class _FireAudit:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+    prepared_script: Optional[dict] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
     ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
@@ -2560,13 +2568,29 @@ def run_job(
     if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
         owner_execution = None
     if not job.get("no_agent") and owner_execution is None:
+        from cron import scheduler_local_observation as local_observation
+        canonical_prepared = None
+        if local_observation.is_target(job):
+            if prepared_script is not None:
+                raise ValueError("prepared observer result requires canonical gateway ownership")
+            script_path = str(job.get("script") or "")
+            canonical_prepared = local_observation.prepare_canonical_script(
+                job,
+                _run_job_script_with_claim_heartbeat(
+                    job, script_path, workdir=_resolve_job_workdir(job, job["id"]),
+                    cancel_event=cancel_event),
+            )
+            if canonical_prepared["success"] and not _parse_wake_gate(canonical_prepared["output"]):
+                note_cron_skipped(job)
+                return (True, "", SILENT_MARKER, None)
         from cron.scheduler_authority import run_canonical_job
         return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
-                                 execution_id=execution_id)
+                                 execution_id=execution_id, prepared_script=canonical_prepared)
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    early, prompt = _prepare_job_prompt(
+        job, job_id, job_name, extra_prompt, cancel_event, prepared_script=prepared_script)
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2874,19 +2898,24 @@ def run_one_job(
     with _running_lock:
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
+    def _run_owned(lost_ownership):
+        from cron import scheduler_local_observation as local_observation
+        if local_observation.is_target(job):
+            from cron.jobs import fire_claim_fence
+            with fire_claim_fence(job["id"], expected_owner=fire_owner) as owns:
+                if not owns:
+                    return False
+                return _run_one_job_body(
+                    job, adapters=adapters, loop=loop, verbose=verbose,
+                    extra_prompt=extra_prompt, claim_lost=lost_ownership,
+                    transport_cancel=cancel_event, execution_token=execution_token)
+        return _run_one_job_body(
+            job, adapters=adapters, loop=loop, verbose=verbose,
+            extra_prompt=extra_prompt, claim_lost=lost_ownership,
+            transport_cancel=cancel_event, execution_token=execution_token)
     try:
         with self_removal_delivery_scope(job["id"]):
-            return _run_with_fire_claim_heartbeat(
-                job,
-                lambda lost_ownership: _run_one_job_body(
-                    job,
-                    adapters=adapters,
-                    loop=loop,
-                    verbose=verbose,
-                    extra_prompt=extra_prompt,
-                    claim_lost=lost_ownership,
-                    transport_cancel=cancel_event,
-                    execution_token=execution_token))
+            return _run_with_fire_claim_heartbeat(job, _run_owned)
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)
@@ -3318,6 +3347,9 @@ def _run_one_job_body(
         if _identity_token is None:
             logger.warning("Cron job %s lost execution ownership before start; skipping", job["id"])
             return True
+
+        from cron import scheduler_local_observation as local_observation
+        local_observation.begin_owned(job, execution_id, fire_owner)
 
         # Bind the firing profile's COMPLETE terminal policy for this fire — agent build, run, delivery
         # and bookkeeping (gateway/run.py _profile_runtime_scope does the same per turn) — else the

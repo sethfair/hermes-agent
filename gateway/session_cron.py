@@ -111,7 +111,8 @@ def _create(authority, actor, params):
     from gateway.session import SessionSource, SessionEntry
     from gateway.session_lifecycle import _now
 
-    if set(params) != {'job_id', 'request_id', 'extra_prompt'}:
+    if set(params) not in ({'job_id', 'request_id', 'extra_prompt'},
+                            {'job_id', 'request_id', 'extra_prompt', 'prepared_script'}):
         raise RuntimeStoreError('invalid_params')
     jid, request_id, extra = params['job_id'], params['request_id'], params['extra_prompt']
     if (not isinstance(jid, str) or not jid or not isinstance(request_id, str)
@@ -120,7 +121,14 @@ def _create(authority, actor, params):
     execution_id, request_id = request_id, cron_request_id(jid, request_id)
     sid = local_identity(authority.profile_id, actor.subject, request_id)
     if authority.db.get_session(sid) is not None:
-        return restore_local_session(authority, sid), request_id
+        ref = restore_local_session(authority, sid)
+        from gateway.session_local_recovery import local_adapter_map
+        policy = local_adapter_map(authority)[Platform.LOCAL].policies[sid]
+        frozen = json.loads(policy.request_json)
+        if (frozen.get('extra_prompt') != extra
+                or frozen.get('prepared_script') != params.get('prepared_script')):
+            raise RuntimeStoreError('admission_conflict')
+        return ref, request_id
     if ':' in execution_id:
         # Fresh admissions only: ``cron:<job>:<execution>`` then splits at its one ``:`` after the
         # job. Ledger ids are hex, so only a hand-made id has one; an identity admitted before this
@@ -129,6 +137,10 @@ def _create(authority, actor, params):
     job = get_job(jid)
     if job is None or job.get('no_agent'):
         raise RuntimeStoreError('not_found')
+    prepared_script = params.get('prepared_script')
+    if prepared_script is not None:
+        from cron.scheduler_local_observation import validate_prepared_script
+        validate_prepared_script(dict(job, execution_id=execution_id), prepared_script)
     config = _load_gateway_config()
     private = {}
     launch = {'source': 'cli', 'request_id': request_id, 'toolsets': []}
@@ -136,7 +148,9 @@ def _create(authority, actor, params):
         launch['cwd'] = job['workdir']
     policy = build_policy(launch, config, private_secrets=private)
     policy = replace(policy, source='cron', platform='cron', model=_load_cron_job_config(job, jid, job.get('name') or jid).model,
-                     request_json=json.dumps({'cron_job': job, 'extra_prompt': extra, 'request_id': request_id}))
+                     request_json=json.dumps({'cron_job': job, 'extra_prompt': extra,
+                                              'request_id': request_id,
+                                              'prepared_script': prepared_script}))
     policy = bind_launch_key(authority, sid, policy, None, config_secrets=private)
     from gateway.session_local_recovery import local_source
     source = local_source(authority, sid, actor.subject)
@@ -167,7 +181,8 @@ async def operation(authority, name, params, actor=None):
     # (CronExecutionUnknown pauses the job) on every restart that overlaps a cron run.
     if name == 'recover':
         from gateway.session_local_recovery import local_identity
-        if (set(params) != {'job_id', 'request_id', 'extra_prompt'}
+        if (set(params) not in ({'job_id', 'request_id', 'extra_prompt'},
+                                {'job_id', 'request_id', 'extra_prompt', 'prepared_script'})
                 or any(not isinstance(params[k], str) or not params[k] for k in ('job_id', 'request_id'))
                 or (params['extra_prompt'] is not None and not isinstance(params['extra_prompt'], str))):
             raise RuntimeStoreError('invalid_params')
@@ -186,7 +201,8 @@ async def operation(authority, name, params, actor=None):
         from gateway.session_local_recovery import local_adapter_map
         policy = local_adapter_map(authority)[Platform.LOCAL].policies[sid]
         frozen = json.loads(policy.request_json)
-        if frozen['extra_prompt'] != params['extra_prompt']:
+        if (frozen['extra_prompt'] != params['extra_prompt']
+                or frozen.get('prepared_script') != params.get('prepared_script')):
             raise RuntimeStoreError('admission_conflict')
         state['job'] = frozen['cron_job']
         # The receipt a firer whose submit answer was lost polls, exactly as if it had arrived.
@@ -305,7 +321,8 @@ async def execute(authority, ref, row, policy):
             # first: a stopped agent run reports "cancelled on request", not a lost fire claim.
             stop = _CombinedCancelEvent(CancelRequest(execution_id), cancel)
             result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
-                                             extra_prompt=data['extra_prompt'], cancel_event=stop)
+                                             extra_prompt=data['extra_prompt'], cancel_event=stop,
+                                             prepared_script=data.get('prepared_script'))
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}

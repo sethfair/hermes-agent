@@ -2518,7 +2518,13 @@ def mark_job_run(
     (cron/quota_hold.py, #89376).
     """
     def apply(jobs, _i, job):
-        if execution_id is not None and execution_id in job.get("canonical_completions", []):
+        target_witness = False
+        if execution_id is not None:
+            from cron.scheduler_local_observation import is_target
+            target_witness = is_target(job)
+        # The private observation target never takes the idempotent-replay shortcut below: a repeated
+        # witness for it is rejected (fail closed), not acknowledged.
+        if execution_id is not None and not target_witness and execution_id in job.get("canonical_completions", []):
             return True
         if expected_fire_owner is not None:
             claim = job.get("fire_claim")
@@ -2527,10 +2533,20 @@ def mark_job_run(
                     "mark_job_run: job_id %s fire claim owner changed; discarding stale completion",
                     job_id)
                 return False
+        if target_witness:
+            from cron import executions
+            if (not expected_fire_owner or execution_id is None or not success
+                    or delivery_error or status not in (None, "delivery_queued")
+                    or execution_id in job.get("canonical_completions", [])
+                    or executions.target_preterminal(execution_id, job_id, expected_fire_owner) is None):
+                logger.warning("mark_job_run: target completion witness rejected for %s", job_id)
+                return False
         now = _hermes_now().isoformat()
         extra = extra_fire.is_extra(job)  # read before the outcome clears the claim
         held = extra_fire.held_markers(job) if extra else {}
         _record_run_outcome(job, success, error, delivery_error, status, now)
+        if target_witness and job["last_status"] not in {"ok", "delivery_queued"}:
+            return False  # a target's completion witness is only ever minted by a successful run
         job.update(held)  # a run-now queued mid-run is its own fire, not this one
         if execution_id is not None:  # retire ids recovery can no longer replay; latest stays last
             from cron.scheduler_authority import replayable_completions as live
@@ -2849,6 +2865,11 @@ def _sweep_completed_oneshots(
             last_run_dt = _parse_aware(last_run) if isinstance(last_run, str) else None
             if last_run_dt is None or last_run_dt >= cutoff:
                 continue
+            witnesses = rj.get("canonical_completions") or []
+            if witnesses:
+                from cron.executions import has_unresolved_pin
+                if any(has_unresolved_pin(str(execution_id)) for execution_id in witnesses):
+                    continue
             raw_jobs.remove(rj)
             removed = True
             rid = rj.get("id")

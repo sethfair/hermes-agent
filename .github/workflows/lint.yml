@@ -195,7 +195,7 @@ jobs:
       - name: ruff check  .
         if: ${{ !cancelled() && steps.tools.outcome == 'success' && inputs.python }}
         run: |
-          ruff check .
+          python -m scripts.check_frozen_ruff
 
       # ── Blocking code-health ratchet (pull requests, Python and TypeScript) ───────────────
 

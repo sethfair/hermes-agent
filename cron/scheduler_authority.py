@@ -52,7 +52,8 @@ def _lift_pause(job_id, pause):
             pass
 
 
-def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
+def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None,
+                      prepared_script=None):
     from gateway.session_cron import owner_for_home, operation
     from hermes_cli.gateway_client import connect_gateway
     from hermes_constants import get_hermes_home
@@ -63,6 +64,8 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         request_id = job['execution_id'] = uuid.uuid4().hex
     params = {'job_id': job['id'], 'request_id': request_id,
               'extra_prompt': extra_prompt}
+    if prepared_script is not None:
+        params['prepared_script'] = prepared_script
     root = get_hermes_home() / 'cron' / 'admissions'
     journal = journal_path(params['job_id'], params['request_id'])
     record = {'params': params, 'receipt': None}

@@ -10,8 +10,9 @@ profile-archive and blob-size guards that CI runs in workflows of their own.
     python scripts/check --install-hook [pre-commit|pre-push]   # run it automatically
     python scripts/check --uninstall-hook
 
-CI runs the same command (``.github/workflows/lint.yml``), so a green local run means a green
-lint lane. Hooks are skippable (``--no-verify``); CI is not. The code-health part honours the
+The blocking CI steps use these command entry points; a local result is not remote CI evidence.
+Frozen-import exceptions are printed under their reviewed check policy. Hooks are skippable
+(``--no-verify``); CI is not. The code-health part honours the
 ``ENFORCEMENT`` switch in ``scripts/code_health/config.py`` (blocking / advisory / off).
 """
 
@@ -39,7 +40,6 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from scripts.code_health import gitio  # noqa: E402
-from scripts.code_health.ruff_runner import resolve_ruff  # noqa: E402
 
 _HOOK_MARK = "# hermes-agent scripts/check hook"
 # Hooks are shared by every worktree of the clone, so the checked-out branch decides nothing:
@@ -180,7 +180,7 @@ def _jobs(names: list[str], base: str | None, head: str | None,
             argv += ["--head", head] if head else []
             jobs[name] = _Job(argv, root, env)
         elif name == "ruff":
-            jobs[name] = _Job([*resolve_ruff(root), "check", "."], root, env)
+            jobs[name] = _Job([sys.executable, "-m", "scripts.check_frozen_ruff"], root, env)
         else:
             # The ratchet reads both sides from git. It runs from `root` like every other job, so
             # in a snapshot its engine, rules and policy files (profile_scope_patterns.json, the
@@ -278,13 +278,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"scripts/check: {exc}", file=sys.stderr)
         return 2
     failed = [name for name, (code, _) in results.items() if code != 0]
-    # A passing health run still carries advisories and comment-allowed findings that the
-    # reviewer must see, so its report is always shown.
+    # Successful policy-qualified reports retain their exact exception sites and reasons.
     for name, (code, output) in results.items():
-        if code != 0 or name == "health":
+        if code != 0 or name in {"health", "ruff", "footguns"}:
             label = "failed" if code != 0 else "ok"
             print(f"\n=== {name} ({label}) ===\n{output.rstrip()}")
-    status = "FAILED: " + ", ".join(failed) if failed else "ok"
+    status = "FAILED: " + ", ".join(failed) if failed else "ok under reported check policy"
     print(f"\nscripts/check: {len(results)} checks, {status}")
     return 1 if failed else 0
 
