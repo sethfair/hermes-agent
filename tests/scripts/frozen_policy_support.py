@@ -9,6 +9,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 BASE = "6231b760c2325d2dc9f71afce51acf1163fdd908"
+CANDIDATE = "2b8e9678ef8ebca08e949ac56e057bc359b80c51"
 OBSERVER = "scripts/observer_v2/engineering_recovery_observer.py"
 PARENT = "scripts/observer_v2/observer_parent_seam.py"
 NATIVE = "scripts/observer_v2/observer_native_v2.py"
@@ -37,7 +38,7 @@ def git(repo: Path, *args: str) -> str:
 
 def candidate_tree(path: Path) -> Path:
     git(path.parent, "clone", "--shared", "--no-checkout", str(REPO), str(path))
-    git(path, "checkout", "--detach", "2b8e9678ef8ebca08e949ac56e057bc359b80c51")
+    git(path, "checkout", "--detach", CANDIDATE)
     git(path, "config", "user.name", "Policy fixture")
     git(path, "config", "user.email", "policy@example.invalid")
     for rel in ("scripts/check", "scripts/check-windows-footguns.py",
