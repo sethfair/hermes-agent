@@ -5,7 +5,10 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+
+_BOOT_CEILING_SECS = 120.0
 
 
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
@@ -27,6 +30,20 @@ def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
         raise AssertionError("timed out waiting for compute host JSON") from exc
 
 
+def _read_hello(out: queue.Queue[dict], proc: subprocess.Popen) -> dict:
+    """Wait for the first frame, which is emitted only after the child's cold import of
+    ``tui_gateway.server`` (2-10s on a loaded 4-worker runner). Boot is a different budget
+    from the 2s frame round trip, so wait for it event-based: fail as soon as the child
+    exits, with a generous ceiling only to bound a hang."""
+    deadline = time.monotonic() + _BOOT_CEILING_SECS
+    while time.monotonic() < deadline:
+        try:
+            return out.get(timeout=0.2)
+        except queue.Empty:
+            assert proc.poll() is None, f"compute host exited before hello: rc={proc.returncode}"
+    raise AssertionError("timed out waiting for compute host hello")
+
+
 @pytest.mark.platforms("linux")
 def test_compute_host_line_json_hello_and_shutdown():
     repo = Path(__file__).resolve().parents[2]
@@ -45,11 +62,7 @@ def test_compute_host_line_json_hello_and_shutdown():
     assert proc.stdin is not None
     out = _stdout_queue(proc)
     try:
-        # The hello waits behind the child's cold imports: hold it to the supervisor's own
-        # budget, not a tighter one that only a quiet machine meets (~1.3s idle, 5s+ loaded).
-        from tui_gateway.host_supervisor import _HELLO_TIMEOUT_SECS
-
-        hello = _read_json_line(out, timeout=_HELLO_TIMEOUT_SECS)
+        hello = _read_hello(out, proc)
         assert hello["type"] == "hello"
         assert hello["host_pid"] == proc.pid
 
