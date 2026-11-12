@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from tests.scripts.frozen_policy_support import (
-    BASE, HASHES, NATIVE, OBSERVER, PARENT, POLICY_PASS, REPO,
-    assert_treated, candidate_tree, check, command,
+    BASE, CANDIDATE, OBSERVER, PARENT, POLICY_PASS, REPO,
+    assert_health_clean, assert_treated, candidate_tree, check, command,
 )
 
 
@@ -21,12 +21,17 @@ def candidate(tmp_path_factory):
 @pytest.mark.parametrize("selection,paths,count", [
     ("footguns", (OBSERVER,), 3),
     ("ruff", (OBSERVER, PARENT), 4),
-    ("health", (OBSERVER, PARENT, NATIVE), 12),
 ])
 def test_real_aggregate_retains_exception_sites(candidate, selection, paths, count):
     result = check(candidate, selection, "--base", BASE)
     assert_treated(result, paths)
     assert result.stdout.count("WRI-2276 exception:") == count, result.stdout
+
+
+@pytest.mark.parametrize("base", [BASE, CANDIDATE], ids=["policy-base", "later-base"])
+def test_real_health_excuses_nothing_at_any_base(candidate, base):
+    # CI measures against the base-branch tip, which moves past the policy's pin.
+    assert_health_clean(check(candidate, "health", "--base", base))
 
 
 def test_new_author_violation_still_blocks(candidate):

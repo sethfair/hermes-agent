@@ -10,13 +10,15 @@ from pathlib import Path
 from tests.waiting import wait_until
 
 REPO = Path(__file__).resolve().parents[2]
-BASE = "6231b760c2325d2dc9f71afce51acf1163fdd908"
-CANDIDATE = "2b8e9678ef8ebca08e949ac56e057bc359b80c51"
+# PR #7 rebound the policy: health is measured against its base, the merge of PR #6.
+BASE = "c0850d5c34ea4dcd666b42b3e4f571ac9cf29969"
+# PR #7's merge commit on main carries the reviewed frozen bytes.
+CANDIDATE = "969d4f2ad3f326f5210d8d94877c3046c6553a6a"
 OBSERVER = "scripts/observer_v2/engineering_recovery_observer.py"
 PARENT = "scripts/observer_v2/observer_parent_seam.py"
 NATIVE = "scripts/observer_v2/observer_native_v2.py"
 HASHES = {
-    OBSERVER: "1d24b40cf07b40a31160063f225c2dca0f10fc3d05130fdff453b9478cc0858f",
+    OBSERVER: "b13bf6d9b00381c915c60a3f9017e94b3914a6225872e9a4d266d2476a2a1134",
     PARENT: "b9e762b53dc820cb47b0833bf81dfb6bb3322f64c1b31c96f2c90b74bdc302e2",
     NATIVE: "04add5c2c28ad50672bb1a0e160b22d26b3efbd1d89ad042fa6ccb9cd29648af",
 }
@@ -105,3 +107,11 @@ def assert_treated(result: subprocess.CompletedProcess, paths: tuple[str, ...]) 
     for path in paths:
         assert path in output and HASHES[path] in output, output
     assert "reason=" in output, output
+
+
+def assert_health_clean(result: subprocess.CompletedProcess) -> None:
+    """The health census is empty: the frozen sources pass with nothing excused."""
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert " 0 blocking" in output, output
+    assert "WRI-2276 exception:" not in output and POLICY_PASS not in output, output

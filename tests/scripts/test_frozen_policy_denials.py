@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from tests.scripts.frozen_policy_support import (
-    BASE, OBSERVER, POLICY_PASS, assert_treated, candidate_tree, check, command, git,
+    BASE, CANDIDATE, OBSERVER, POLICY_PASS, assert_health_clean, assert_treated, candidate_tree,
+    check, command, git,
 )
 
 
@@ -96,16 +97,16 @@ def test_snapshot_qualifies_judged_bytes_not_live_files(candidate, mode):
         (candidate / OBSERVER).write_bytes(raw)
 
 
-def test_health_git_head_and_symbolic_base(candidate):
+def test_health_judges_head_bytes_not_live_files(candidate):
     raw = (candidate / OBSERVER).read_bytes()
     head = git(candidate, "rev-parse", "HEAD")
     (candidate / OBSERVER).write_bytes(raw + b"\n")
     try:
-        result = command(candidate, sys.executable, "-m", "scripts.code_health",
-                         "--head", head, "--base", BASE)
-        assert result.returncode == 0 and POLICY_PASS in result.stdout, result.stdout + result.stderr
-        wrong = check(candidate, "health", "--base", "HEAD^1")
-        assert wrong.returncode != 0 and POLICY_PASS not in wrong.stdout
+        assert_health_clean(command(candidate, sys.executable, "-m", "scripts.code_health",
+                                    "--head", head, "--base", BASE))
+        live = check(candidate, "health", "--base", "HEAD^1")
+        assert live.returncode != 0 and POLICY_PASS not in live.stdout
+        assert "frozen source mismatch" in live.stdout, live.stdout + live.stderr
     finally:
         (candidate / OBSERVER).write_bytes(raw)
     tree = git(candidate, "rev-parse", "HEAD^{tree}")
@@ -115,15 +116,14 @@ def test_health_git_head_and_symbolic_base(candidate):
     git(candidate, "checkout", "--detach", merge.stdout.strip())
     try:
         assert git(candidate, "rev-parse", "HEAD^1") == BASE
-        result = check(candidate, "health", "--base", "HEAD^1")
-        assert_treated(result, (OBSERVER, "scripts/observer_v2/observer_parent_seam.py",
-                                "scripts/observer_v2/observer_native_v2.py"))
+        assert_health_clean(check(candidate, "health", "--base", "HEAD^1"))
     finally:
         git(candidate, "checkout", "--detach", head)
 
 
 @pytest.fixture(scope="module")
 def health_findings(candidate):
+    """Real findings for the frozen sources measured as if they were new code."""
     from dataclasses import asdict
     from scripts.code_health.compare import compare
     from scripts.code_health.gitio import Change
@@ -136,20 +136,15 @@ def health_findings(candidate):
             [Change("A", None, path) for path in HASHES])]
 
 
-@pytest.mark.parametrize("field,value", [
-    ("detail", "CC 34 > target 20 (new code must meet the target)"),
-    ("scope", "other_function"), ("line", 170), ("blocking", False),
-    ("allowed_reason", "forged"),
-])
-def test_health_semantic_drift_is_not_an_exception(candidate, health_findings, field, value):
+@pytest.mark.parametrize("base", [BASE, CANDIDATE], ids=["policy-base", "later-base"])
+def test_inherited_health_findings_are_never_exceptions(candidate, health_findings, base):
     from scripts.frozen_import_policy import PolicyError, partition_findings
 
-    normal, exceptions = partition_findings(candidate, "health", health_findings, base=BASE)
-    assert not normal and len(exceptions) == 12
-    changed = copy.deepcopy(health_findings)
-    changed[0][field] = value
-    with pytest.raises(PolicyError):
-        partition_findings(candidate, "health", changed, base=BASE)
+    assert health_findings and all(item["blocking"] for item in health_findings)
+    assert partition_findings(candidate, "health", [], base=base) == ([], [])
+    for finding in health_findings:
+        with pytest.raises(PolicyError):
+            partition_findings(candidate, "health", [finding], base=base)
 
 
 def test_invalid_snapshot_cannot_borrow_valid_live_source(candidate):
@@ -182,11 +177,12 @@ def test_git_symlink_mode_is_not_regular_source(candidate):
         git(candidate, "read-tree", head)
 
 
-@pytest.mark.parametrize("checker,source", [
-    ("footguns", "import fcntl\n"),
-    ("health", "def f():\n    try:\n        return 1\n    except Exception:\n        return 2\n"),
+@pytest.mark.parametrize("checker,source,excused", [
+    ("footguns", "import fcntl\n", True),
+    # The health census is empty, so a clean run has nothing to excuse.
+    ("health", "def f():\n    try:\n        return 1\n    except Exception:\n        return 2\n", False),
 ])
-def test_direct_native_offscope_twin(candidate, checker, source):
+def test_direct_native_offscope_twin(candidate, checker, source, excused):
     path = candidate / "scripts/offscope_native.py"
     path.write_text(source, encoding="utf-8")
     argv = ([sys.executable, "scripts/check-windows-footguns.py", "--all"] if checker == "footguns"
@@ -198,7 +194,8 @@ def test_direct_native_offscope_twin(candidate, checker, source):
     finally:
         path.unlink()
     positive = command(candidate, *argv)
-    assert positive.returncode == 0 and POLICY_PASS in positive.stdout, positive.stdout + positive.stderr
+    assert positive.returncode == 0, positive.stdout + positive.stderr
+    assert (POLICY_PASS in positive.stdout) is excused, positive.stdout + positive.stderr
 
 
 @pytest.mark.parametrize("kind", ["exit2", "empty_failure", "bad_json", "timeout"])
