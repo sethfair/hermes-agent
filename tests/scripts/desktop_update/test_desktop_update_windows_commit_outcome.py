@@ -171,7 +171,7 @@ def test_result_finished_at_is_stamped_after_the_r6_release_wait(tmp_path: Path)
         holders.append((subprocess.Popen([sys.executable, '-c', _TIMED_CHECKOUT_HOLDER,
                                           str(install / '.hermes-update.lock'), '25']), time.time() + 25))
     try:
-        code, out, _, result, home = _handoff(tmp_path, '-NoGateway', prepare=hold_checkout)
+        code, out, _, result, home = _handoff(tmp_path, '-NoGateway', prepare=hold_checkout, HANDOFF_BUSY_SECONDS='30')
     finally:
         for proc, _ in holders:
             proc.kill(); proc.wait()
