@@ -10,6 +10,8 @@ import time
 import psutil
 import pytest
 
+from tests.waiting import wait_until
+
 
 _SCRIPT = r'''
 import json, os, subprocess, sys, time
@@ -174,7 +176,9 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
 
     def assign(job, proc):
         children.append(proc)
-        assert psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED
+        # psutil infers "stopped" from thread wait reasons, which settle a few ms after CREATE_SUSPENDED.
+        wait_until(lambda: psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED,
+                   what="suspended child to read as stopped")
         assert not marker.exists()
         # Query the actual kernel object, not implementation source/constants.
         limits = processes._ExtendedLimits()
