@@ -445,6 +445,7 @@ def _script_argv(
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    scoped_env: Optional[dict[str, str]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -497,6 +498,8 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        if scoped_env:
+            env.update(scoped_env)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -577,8 +580,21 @@ def _run_job_script_with_claim_heartbeat(
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+        nonce = job.get("_local_observation_nonce")
+        scoped_env = ({"HERMES_LOCAL_OBSERVATION_NONCE": nonce,
+                       "HERMES_LOCAL_OBSERVATION_EXECUTION_ID": job["execution_id"],
+                       "HERMES_LOCAL_OBSERVATION_JOB_ID": job["id"]}
+                      if nonce else None)
+        result = _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                                 interpreter=job.get("interpreter"), scoped_env=scoped_env)
+        if nonce:
+            from cron.scheduler_local_observation import bind_output, deny_unbound
+            try:
+                bind_output(job, *result)
+            except Exception:
+                deny_unbound(job)
+                raise
+        return result
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")

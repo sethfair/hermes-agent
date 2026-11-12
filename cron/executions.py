@@ -103,6 +103,24 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
+    conn.execute("""CREATE TABLE IF NOT EXISTS cron_prerun_bindings (
+        execution_id TEXT PRIMARY KEY REFERENCES executions(id),
+        job_id TEXT NOT NULL, profile_home TEXT NOT NULL,
+        process_id TEXT NOT NULL, pid INTEGER NOT NULL,
+        process_started_at INTEGER, fire_claim_by TEXT NOT NULL,
+        bind_state TEXT NOT NULL CHECK(bind_state IN
+            ('awaiting_canonical','preparing','bound','unknown')),
+        nonce_digest TEXT, admission_id TEXT NOT NULL,
+        source_sha256 TEXT NOT NULL, script_sha256 TEXT NOT NULL,
+        generation INTEGER, epoch_id TEXT, issuance_digest TEXT,
+        output_sha256 TEXT, unresolved_pin INTEGER NOT NULL DEFAULT 1
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS cron_local_finalizations (
+        execution_id TEXT PRIMARY KEY REFERENCES executions(id),
+        state TEXT NOT NULL CHECK(state IN
+            ('pending','succeeded','not_applicable','unknown')),
+        outcome_digest TEXT, created_at TEXT NOT NULL
+    )""")
 
 
 def _widen_status_check(conn: sqlite3.Connection) -> None:
@@ -144,6 +162,63 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[dict[str, Any]]:
     row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
     return dict(row) if row is not None else None
+
+
+def target_preterminal(execution_id: str, job_id: str, owner: str) -> Optional[dict[str, Any]]:
+    """Read-only match for the original running process and captured bound row."""
+    with _transaction() as conn:
+        row = _fetch(conn, execution_id)
+        binding = conn.execute("SELECT * FROM cron_prerun_bindings WHERE execution_id=?",
+                               (execution_id,)).fetchone()
+        if (not row or not binding or row["job_id"] != job_id or row["status"] != "running"
+                or row["process_id"] != _PROCESS_ID or row["pid"] != os.getpid()
+                or row["process_started_at"] is None
+                or binding["process_id"] != row["process_id"]
+                or binding["pid"] != row["pid"]
+                or binding["process_started_at"] != row["process_started_at"]
+                or binding["job_id"] != job_id or binding["fire_claim_by"] != owner
+                or binding["bind_state"] != "bound" or binding["unresolved_pin"] != 1):
+            return None
+        return dict(binding)
+
+
+def start_target_finalization(execution_id: str, job_id: str, owner: str) -> bool:
+    """Pin the pending disposition before native terminal bookkeeping begins."""
+    if not target_preterminal(execution_id, job_id, owner):
+        return False
+    with _transaction() as conn:
+        if conn.execute("SELECT 1 FROM cron_local_finalizations WHERE execution_id=?",
+                        (execution_id,)).fetchone():
+            return False
+        conn.execute("INSERT INTO cron_local_finalizations VALUES(?,'pending',NULL,?)",
+                     (execution_id, _hermes_now().isoformat()))
+        return True
+
+
+def finish_target_finalization(execution_id: str, state: str, outcome_digest: Optional[str],
+                               expected_binding: Optional[dict[str, Any]] = None) -> bool:
+    if state not in {"succeeded", "not_applicable", "unknown"}:
+        return False
+    with _transaction() as conn:
+        if expected_binding is not None:
+            row = conn.execute("SELECT * FROM cron_prerun_bindings WHERE execution_id=?",
+                               (execution_id,)).fetchone()
+            if row is None or dict(row) != expected_binding:
+                return False
+        cur = conn.execute("""UPDATE cron_local_finalizations SET state=?,outcome_digest=?
+            WHERE execution_id=? AND state='pending'
+              AND EXISTS (SELECT 1 FROM executions WHERE id=? AND status='completed'
+                          AND process_id=? AND pid=? AND finished_at IS NOT NULL AND error IS NULL)""",
+            (state, outcome_digest, execution_id, execution_id, _PROCESS_ID, os.getpid()))
+        return cur.rowcount == 1
+
+
+def has_unresolved_pin(execution_id: str) -> bool:
+    """Fail closed when a completion witness has no proven released binding."""
+    with _transaction() as conn:
+        row = conn.execute("SELECT unresolved_pin FROM cron_prerun_bindings WHERE execution_id=?",
+                           (execution_id,)).fetchone()
+        return row is None or row[0] != 0
 
 
 def _emit_execution_state(
@@ -238,6 +313,8 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown','cancelled','missed')
+               AND NOT EXISTS (SELECT 1 FROM cron_prerun_bindings b
+                               WHERE b.execution_id=executions.id AND b.unresolved_pin=1)
              ORDER BY julianday(finished_at) DESC, finished_at DESC,
                       julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
@@ -248,22 +325,26 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Persist a claimed attempt before executor/provider dispatch."""
+    """Persist a claimed attempt under the job's shared fire/installation fence."""
+    from cron.jobs import _fire_job_lock
     from cron.occurrences import scheduled_instant as canonical_instant
 
-    now = _hermes_now().isoformat()
-    execution_id = uuid.uuid4().hex
-    pid = os.getpid()
-    with _transaction() as conn:
-        conn.execute(
-            """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
-        )
-        record = _fetch(conn, execution_id)
+    with _fire_job_lock(str(job_id)) as acquired:
+        if not acquired:
+            raise RuntimeError("Cron execution ownership fence unavailable")
+        now = _hermes_now().isoformat()
+        execution_id = uuid.uuid4().hex
+        pid = os.getpid()
+        with _transaction() as conn:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at, scheduled_instant)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+                 _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+            )
+            record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
 

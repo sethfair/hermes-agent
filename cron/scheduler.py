@@ -2314,6 +2314,8 @@ def _prepare_job_prompt(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         note_cron_skipped(job)
         return (True, "", SILENT_MARKER, None), None
+    from cron.scheduler_local_observation import selector_prompt
+    prompt += selector_prompt(job)
     return None, prompt
 
 
@@ -2874,19 +2876,24 @@ def run_one_job(
     with _running_lock:
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
+    def _run_owned(lost_ownership):
+        from cron import scheduler_local_observation as local_observation
+        if local_observation.is_target(job):
+            from cron.jobs import fire_claim_fence
+            with fire_claim_fence(job["id"], expected_owner=fire_owner) as owns:
+                if not owns:
+                    return False
+                return _run_one_job_body(
+                    job, adapters=adapters, loop=loop, verbose=verbose,
+                    extra_prompt=extra_prompt, claim_lost=lost_ownership,
+                    transport_cancel=cancel_event, execution_token=execution_token)
+        return _run_one_job_body(
+            job, adapters=adapters, loop=loop, verbose=verbose,
+            extra_prompt=extra_prompt, claim_lost=lost_ownership,
+            transport_cancel=cancel_event, execution_token=execution_token)
     try:
         with self_removal_delivery_scope(job["id"]):
-            return _run_with_fire_claim_heartbeat(
-                job,
-                lambda lost_ownership: _run_one_job_body(
-                    job,
-                    adapters=adapters,
-                    loop=loop,
-                    verbose=verbose,
-                    extra_prompt=extra_prompt,
-                    claim_lost=lost_ownership,
-                    transport_cancel=cancel_event,
-                    execution_token=execution_token))
+            return _run_with_fire_claim_heartbeat(job, _run_owned)
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)
@@ -3318,6 +3325,9 @@ def _run_one_job_body(
         if _identity_token is None:
             logger.warning("Cron job %s lost execution ownership before start; skipping", job["id"])
             return True
+
+        from cron import scheduler_local_observation as local_observation
+        local_observation.begin_owned(job, execution_id, fire_owner)
 
         # Bind the firing profile's COMPLETE terminal policy for this fire — agent build, run, delivery
         # and bookkeeping (gateway/run.py _profile_runtime_scope does the same per turn) — else the
