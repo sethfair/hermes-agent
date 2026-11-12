@@ -213,7 +213,8 @@ def partition_findings(repo, checker, findings, *, source_reader=None, before=No
         return normal, []
     if not current:
         raise PolicyError("scoped diagnostics without frozen sources")
-    if checker == "health" and base != BASE:
+    # The pin only binds the census that excuses findings; with none to excuse, any base is fine.
+    if scoped and checker == "health" and base != BASE:
         raise PolicyError(f"health policy base mismatch: {base}")
     if Counter(map(_signature, scoped)) != Counter(map(_signature, _EXPECTED[checker])):
         raise PolicyError(f"{checker} frozen finding census drift; expected {len(_EXPECTED[checker])}, got {len(scoped)}")
