@@ -598,6 +598,12 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     return _probe_fork_bomb(git_cmd) is True
 
 
+# Git for Windows names its MSYS2 environment directory after the target: x64 moved from ``mingw64`` to
+# ``ucrt64`` (the windows-latest image ships 2.56 with only ``ucrt64``), arm64 uses ``clangarm64``, and
+# older installs keep ``mingw64``/``mingw32``.
+_GIT_FOR_WINDOWS_ENV_DIRS = ("ucrt64", "clangarm64", "mingw64", "mingw32")
+
+
 def _portable_git_candidates() -> list:
     """PortableGit candidates: shared root first (where the managed tree actually lives, not the
     profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
@@ -609,7 +615,11 @@ def _portable_git_candidates() -> list:
     from hermes_constants import get_default_hermes_root, get_hermes_home
     candidates = []
     with suppress(Exception):
-        candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
+        candidates += [
+            root / "git" / env_dir / "libexec" / "git-core" / "git.exe"
+            for root in (get_default_hermes_root(), Path(get_hermes_home()))
+            for env_dir in _GIT_FOR_WINDOWS_ENV_DIRS
+        ]
     return candidates
 
 
@@ -623,9 +633,9 @@ def _locate_real_git() -> Optional[Path]:
     invoked directly (#87876).
     """
     candidates = [
-        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
+        Path(base) / "Git" / env_dir / "libexec" / "git-core" / "git.exe"
         for base in (r"C:\Program Files", r"C:\Program Files (x86)")
-        for arch in ("clangarm64", "mingw64", "mingw32")
+        for env_dir in _GIT_FOR_WINDOWS_ENV_DIRS
     ] + _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 

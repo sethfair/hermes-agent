@@ -121,9 +121,9 @@ class TestGitTrampolineSelfHeal:
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
 
         candidates = _portable_git_candidates()
-        assert candidates[0] == (
-            root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
-        assert candidates[1] == (
-            profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
+        shared = [c for c in candidates if c.is_relative_to(root / "git")]
+        profile = [c for c in candidates if c.is_relative_to(profile_home / "git")]
+        assert shared and profile
+        assert candidates == shared + profile
+        assert root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" in shared
+        assert profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" in profile
