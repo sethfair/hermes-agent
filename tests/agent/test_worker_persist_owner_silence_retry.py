@@ -1,4 +1,5 @@
 """Worker persistence retries transport uncertainty without duplicating receipts."""
+import json
 import threading
 
 import pytest
@@ -151,6 +152,36 @@ def test_budget_exhaustion_keeps_last_transport_error_and_journal(tmp_path, monk
     assert rpc.calls == 2
     assert store.failure == "handshake timeout"
     assert store.journal["pending"]
+
+
+def test_startup_replay_uses_stricter_budget(tmp_path, monkeypatch):
+    import agent.runtime_session_store as module
+    from agent.runtime_session_store import RuntimeSessionStore
+
+    scope = {"execution_id": "exec", "session_id": "session", "epoch": 1, "generation": 1}
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    (outbox / "pending.json").write_text(json.dumps({
+        "scope": scope,
+        "next_sequence": 2,
+        "pending": [{"sequence": 1, "operation": "operation", "payload": {}}],
+    }))
+    monkeypatch.setattr(module, "STARTUP_REPLAY_BUDGET_S", 3.0)
+    monkeypatch.setattr(module, "OWNER_SILENCE_BUDGET_S", 180.0)
+    monkeypatch.setattr(module, "_sleep_or_cancel", lambda cancel, delay: None)
+    monkeypatch.setattr(module, "_monotonic", iter([0.0, 2.0, 4.0, 5.0]).__next__)
+
+    class RPC:
+        calls = 0
+
+        def __call__(self, method, **params):
+            self.calls += 1
+            raise TimeoutError("worker_receipt_timeout")
+
+    rpc = RPC()
+    with pytest.raises(TimeoutError, match="worker_receipt_timeout"):
+        RuntimeSessionStore(rpc, scope, outbox)
+    assert rpc.calls == 1
 
 
 def test_owner_silence_budget_matches_kanban_wait_budget(tmp_path, monkeypatch):
