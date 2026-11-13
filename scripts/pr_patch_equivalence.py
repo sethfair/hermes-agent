@@ -261,6 +261,8 @@ def check_hunks(files: list[FileDiff], ref: str) -> tuple[bool, list[str]]:
             ok &= good
             continue
         bad: list[str] = []
+        if fd.old_path and fd.old_path != fd.path and file_at(ref, fd.old_path) is not None:
+            bad.append(f"renamed from {fd.old_path}, old path still present at ref")
         for i, hunk in enumerate(fd.hunks, 1):
             for block, before, after in added_blocks(hunk):
                 if not any(block):

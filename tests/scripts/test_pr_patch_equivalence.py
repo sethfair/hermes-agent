@@ -149,3 +149,65 @@ def test_block_copied_elsewhere_in_file_is_not_a_landed_change(repo, tmp_path):
     assert out.returncode == 1, out.stdout
     assert "PASS" not in out.stdout
     assert "added block missing" in out.stdout
+
+
+LONG = "".join(f"line {i}\n" for i in range(10))
+LONG_EDITED = LONG.replace("line 4\n", "line 4 edited\nline 4b\n")
+
+
+def make_rename_pr(repo, tmp_path, new_text):
+    """PR that renames f.txt (LONG on main) to g.txt, with new_text as g.txt's content.
+
+    LONG is big enough that git detects the rename even with an edit.
+    """
+    commit(repo, LONG, "long base")
+    git(repo, "checkout", "-q", "-b", "pr")
+    git(repo, "mv", "f.txt", "g.txt")
+    (repo / "g.txt").write_text(new_text, encoding="utf-8")
+    git(repo, "add", "g.txt")
+    git(repo, "commit", "-q", "-m", "rename")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    (tmp_path / "pr.diff").write_text(git(repo, "diff", "-M", "main", "pr"), encoding="utf-8")
+    (tmp_path / "pr.mbox").write_text(git(repo, "format-patch", "--stdout", "-1", sha), encoding="utf-8")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "branch", "-q", "-D", "pr")
+    return str(tmp_path / "pr.diff"), str(tmp_path / "pr.mbox")
+
+
+def land_copy(repo, new_text):
+    """Land the new file on main while keeping the old one."""
+    (repo / "g.txt").write_text(new_text, encoding="utf-8")
+    git(repo, "add", "g.txt")
+    git(repo, "commit", "-q", "-m", "landed, old file kept")
+
+
+def drop_old(repo):
+    git(repo, "rm", "-q", "f.txt")
+    git(repo, "commit", "-q", "-m", "drop old")
+
+
+def test_rename_with_edit_fails_when_ref_keeps_old_file(repo, tmp_path):
+    diff, mbox = make_rename_pr(repo, tmp_path, LONG_EDITED)
+    land_copy(repo, LONG_EDITED)
+    out = check(repo, diff, mbox, "main")
+    assert out.returncode == 1, out.stdout
+    assert "PASS" not in out.stdout
+    assert "old path still present" in out.stdout
+
+
+def test_rename_with_edit_passes_when_old_file_is_gone(repo, tmp_path):
+    diff, mbox = make_rename_pr(repo, tmp_path, LONG_EDITED)
+    land_copy(repo, LONG_EDITED)
+    drop_old(repo)
+    out = check(repo, diff, mbox, "main")
+    assert out.returncode == 0, out.stdout
+
+
+def test_plain_rename_passes_only_when_old_file_is_gone(repo, tmp_path):
+    diff, mbox = make_rename_pr(repo, tmp_path, LONG)
+    land_copy(repo, LONG)
+    kept = check(repo, diff, mbox, "main")
+    assert kept.returncode == 1, kept.stdout
+    drop_old(repo)
+    gone = check(repo, diff, mbox, "main")
+    assert gone.returncode == 0, gone.stdout
