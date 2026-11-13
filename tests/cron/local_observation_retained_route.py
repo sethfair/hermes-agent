@@ -18,7 +18,7 @@ AUTHORIZED_PARENT=Path('/home/macpro/.cache/wri-2276-native-fixtures/t_caf4ddfa'
 LIVE_ROOT=Path('/home/macpro/.hermes')
 LINEAGE_KEYS=('HERMES_HOME','HERMES_DELEGATED_CHILD_CONTEXT','HERMES_KANBAN_DB','HERMES_KANBAN_TASK')
 DEFAULT_TIMEOUT=300
-NATIVE_PINS={'kanban_db.py':'fee49c5e11e86154d4946713b6c9e31b95b507d5394e8197784367d42739ca4e',
+NATIVE_PINS={'kanban_db.py':'35e1fb8f0aa9b2117b583879b8a224fb2ca16bc1a53021b98f6a62111fa6fa39',
              'kanban_db_connect.py':'4b6e14bd4796db77c255d8267ff2ae24cc463db25a4ee80abe3d80d83d29ccbc'}
 
 def check_path(path):
