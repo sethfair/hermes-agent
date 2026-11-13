@@ -8,6 +8,14 @@ from hermes_state_runtime import (adopt_worker_execution, begin_runtime_epoch,
                                   mutate_worker_execution, register_worker_execution)
 
 
+@pytest.fixture(autouse=True)
+def immediate_transport_failure(monkeypatch):
+    """Keep lost-ACK adoption tests bounded now transport errors are retryable."""
+    import agent.runtime_session_store as module
+
+    monkeypatch.setattr(module, "OWNER_SILENCE_BUDGET_S", 0.0)
+
+
 def _owner(db):
     return lambda method, **params: mutate_worker_execution(db, **params)
 
