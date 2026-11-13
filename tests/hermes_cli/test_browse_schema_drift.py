@@ -531,8 +531,38 @@ class SlowConnection:
             time.sleep(0.01)
             return handler() if handler is not None else 0
         return self._conn.set_progress_handler(slow, 5)
+    def execute(self, sql, *a):
+        mark("exec " + sql[:24] + " start")
+        try:
+            return self._conn.execute(sql, *a)
+        finally:
+            mark("exec " + sql[:24] + " end")
     def close(self):
-        return self._conn.close()
+        mark("close start")
+        try:
+            return self._conn.close()
+        finally:
+            mark("close end")
+
+T0 = time.monotonic()
+def mark(msg):
+    print(f"DIAGMARK T+{time.monotonic() - T0:.2f} {msg}", flush=True)
+
+import gateway.runtime_ownership as _ro
+_orig_release = _ro.ProfileOwnership.release
+def _release(self, home):
+    mark("lock release")
+    return _orig_release(self, home)
+_ro.ProfileOwnership.release = _release
+import hermes_state_repair as _hsr
+_orig_barriers = _hsr._reapply_durability_barriers
+def _barriers(conn):
+    mark("barriers start")
+    try:
+        return _orig_barriers(conn)
+    finally:
+        mark("barriers end")
+_hsr._reapply_durability_barriers = _barriers
 
 def holding_lock():
     """Only connections opened while THIS process holds gateway.lock are slowed."""
@@ -547,6 +577,7 @@ def slowed(path, *a, **kw):
     read_only = "mode=ro" in str(path)
     if holding_lock() and (phase == "integrity") == read_only:
         print("slowed", flush=True)  # this process holds gateway.lock and the slow phase begins
+        mark("slowed")
         return SlowConnection(conn)
     return conn
 
