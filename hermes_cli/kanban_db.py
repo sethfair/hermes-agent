@@ -325,6 +325,9 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
+DEFAULT_HOST_LOSS_COOLDOWN_SECONDS = 120
+
+
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
@@ -2353,7 +2356,9 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
+    from hermes_cli.kanban_owner_recovery import (
+        is_host_side_loss, owner_attempt_note, owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error,
+    )
     for row in stale:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -2384,6 +2389,7 @@ def release_stale_claims(
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            host_loss = is_host_side_loss(owner_attempt_note(conn, row["id"]))
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2407,6 +2413,7 @@ def release_stale_claims(
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
+                    **({"infrastructure": True} if host_loss else {}),
                 },
             )
             reclaimed += 1
@@ -2418,6 +2425,7 @@ def release_stale_claims(
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            infrastructure=host_loss,
         )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
@@ -2435,7 +2443,9 @@ def _record_reclaim(
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
     (payload merged with the termination report). Caller holds the txn."""
     run_id = _end_run(
-        conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
+        conn, task_id, outcome="reclaimed", status="reclaimed", error=error,
+        # ``infrastructure`` rides in the run metadata so ``check_respawn_guard`` can space the retry.
+        metadata={**termination, **({"infrastructure": True} if payload.get("infrastructure") else {})},
     )
     payload.update(termination)
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)

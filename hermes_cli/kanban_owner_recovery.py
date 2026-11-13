@@ -206,6 +206,23 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
     return ""
 
 
+# What the owner records when the HOST, not the card's own code, lost the attempt: a gateway too
+# stalled to answer the worker's write inside its receipt window (``worker_receipt_timeout``, which
+# the owner books under the exception's type, ``TimeoutError``) or whose pipe closed under it
+# (``EOFError``), and an admission the owner itself settled ``interrupted``. ``managed_worker_failed``
+# is deliberately absent: it is the worker's own uncaught exception, a genuine error.
+HOST_LOSS_REASONS = frozenset({'worker_receipt_timeout', 'TimeoutError', 'EOFError', 'managed_worker_pipe_closed'})
+_LOST_PREFIX = 'managed worker lost: '
+_ADMISSION_INTERRUPTED_NOTE = 'owner admission settled interrupted'
+
+
+def is_host_side_loss(note: str) -> bool:
+    """True when an ``owner_attempt_note`` names a loss the host caused, not the card."""
+    if note == _ADMISSION_INTERRUPTED_NOTE:
+        return True
+    return note.startswith(_LOST_PREFIX) and note[len(_LOST_PREFIX):] in HOST_LOSS_REASONS
+
+
 def reclaim_error(conn, task_id, claim_lock) -> str:
     """A stale-lock reclaim's run error, naming how the attempt ended when the owner recorded it."""
     note = owner_attempt_note(conn, task_id)
@@ -217,14 +234,19 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
 
     A bound interpreter whose ``worker_result`` says exit 0 after its managed execution was
     lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
-    turn never finished, so it books as a crash and charges the breaker, and the
-    protocol-violation streak (which reads the persisted payload) does not count it.
+    turn never finished, so it books as a crash. Only genuine worker errors charge the
+    breaker; infrastructure losses are exempt. The protocol-violation streak does not count it.
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
     note = owner_attempt_note(conn, task_id, lost)
     if not note:
         return
     dead.event_payload["attempt_note"] = note
+    if is_host_side_loss(note):
+        # Nothing about the card ran wrong: book it through the infrastructure path so it is not
+        # counted against the failure limit and the respawn guard spaces the retry.
+        dead.infrastructure = True
+        dead.event_payload["infrastructure"] = True
     if lost:
         dead.event_payload["worker_lost"] = lost
         if dead.protocol_violation:
