@@ -82,12 +82,16 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
     thread.start()
     url = f'http://127.0.0.1:{peer.server_port}/v1'
+    # The system prompt embeds the tmp path (~4 copies), so its size, and the rough-token estimate that
+    # picks the compaction turn, moves with the runner's tmp root. 12000 sat ~30 tokens from the
+    # PRESSURE_2 boundary: the CI runner's longer path compacted one turn early and left PRESSURE_1
+    # verbatim. 13000 is mid-window (compaction after PRESSURE_3 holds from 12.5k to ~14k).
     (home / 'config.yaml').write_text(json.dumps({
         'gateway': {'multiplex_profiles': False},
         'model': {'provider': 'custom', 'default': 'original', 'base_url': url, 'context_length': 64000},
         'auxiliary': {'title_generation': {'enabled': False},
                       'compression': {'provider': 'custom', 'model': 'summary', 'base_url': url}},
-        'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 12000,
+        'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 13000,
                         'threshold': 0.5, 'in_place': False},
         'platform_toolsets': {'cli': []}}))
     (home / 'models_dev_cache.json').write_text(json.dumps({'custom': {'id': 'custom', 'models': {
