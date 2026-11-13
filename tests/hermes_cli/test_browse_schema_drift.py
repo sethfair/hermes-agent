@@ -605,6 +605,29 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     assert "last_read_at" not in _session_columns(path)
 
 
+def test_budget_expiring_at_begin_immediate_is_a_budget_refusal(tmp_path):
+    """The browse budget can run out on the transaction's first statement: a slow host (the
+    macOS lane) interrupts ``BEGIN IMMEDIATE`` itself. That is the same budget refusal as an
+    interrupted DDL (BrowseBudgetExceeded -> "nothing was changed"), never a bare
+    ``OperationalError('interrupted')`` that browse reports as a corrupt store."""
+    import hermes_state_reconcile as reconcile
+
+    path = _lagging_store_with_history(_profile_home(tmp_path), rows=10)
+    before = _file_state(path)
+
+    class ExpiresAtFirstStatement(reconcile._Budget):
+        def arm(self, conn):
+            def expire():
+                self.expired = True
+                return 1
+            conn.set_progress_handler(expire, 1)
+
+    with pytest.raises(reconcile.BrowseBudgetExceeded):
+        reconcile._apply_additive_schema(path, ExpiresAtFirstStatement(60))
+    assert _file_state(path) == before
+    assert "last_read_at" not in _session_columns(path)
+
+
 def test_equal_cardinality_corrupt_index_plus_drift_is_not_written(tmp_path):
     """R2-3: quick_check does not compare index keys with the table, so two equal-size indexes
     with swapped root pages pass it. Browse must still refuse as corrupt and write nothing."""
