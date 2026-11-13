@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.code_health.ruff_runner import pinned_version
 from tests.waiting import wait_until
 
 REPO = Path(__file__).resolve().parents[2]
@@ -88,9 +89,19 @@ def candidate_tree(path: Path) -> Path:
                 ".github/workflows/lint.yml"):
         if (REPO / rel).exists():
             shutil.copy2(REPO / rel, path / rel)
+    add_paths = ["scripts", ".github/workflows/lint.yml"]
+    if (REPO / "pyproject.toml").exists() and (path / "pyproject.toml").exists():
+        reviewed_pin = pinned_version(path)
+        current_pin = pinned_version(REPO)
+        project = (path / "pyproject.toml").read_text(encoding="utf-8")
+        (path / "pyproject.toml").write_text(
+            project.replace(f'"ruff=={reviewed_pin}"', f'"ruff=={current_pin}"', 1),
+            encoding="utf-8",
+        )
+        add_paths.insert(0, "pyproject.toml")
     shutil.copytree(REPO / "scripts/code_health", path / "scripts/code_health",
                     dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
-    git(path, "add", "scripts", ".github/workflows/lint.yml")
+    git(path, "add", *add_paths)
     git(path, "commit", "--allow-empty", "-qm", "checker candidate")
     return path
 

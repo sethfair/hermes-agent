@@ -19,8 +19,9 @@ def candidate(tmp_path_factory):
 
 def test_blocking_workflow_command_matches_native_policy(candidate):
     workflow = YAML(typ="base").load((candidate / ".github/workflows/lint.yml").read_text(encoding="utf-8"))
-    job = workflow["jobs"]["ruff-blocking"]
-    step = next(step for step in job["steps"] if "run" in step)
+    job = workflow["jobs"]["lint"]
+    step = next(step for step in job["steps"]
+                if "scripts.check_frozen_ruff" in step.get("run", ""))
     argv = shlex.split(step["run"])
     if argv[0] == "python":
         argv[0] = sys.executable
