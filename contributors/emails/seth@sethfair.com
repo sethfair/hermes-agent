@@ -1,2 +1,2 @@
 sethfair
-# WRI-2276 private port author attribution
+# WRI-2402 fork agent/owner identity
