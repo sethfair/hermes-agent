@@ -65,8 +65,7 @@ _RETRYABLE = (TimeoutError, OSError, ConnectionClosed)
 
 
 def _retryable_persistence_error(exc):
-    return ((isinstance(exc, _RETRYABLE) and
-             (not isinstance(exc, TimeoutError) or str(exc) == 'worker_receipt_timeout'))
+    return (isinstance(exc, _RETRYABLE)
             or (isinstance(exc, WorkerPersistenceError) and str(exc) == 'owner_unavailable'))
 
 
