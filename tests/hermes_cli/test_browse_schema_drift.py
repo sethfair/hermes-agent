@@ -589,7 +589,14 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     assert browse.stdout.readline().strip() == "slowed", "the slow phase never ran under the lock"
     booting = ProfileOwnership()
     try:
-        bootstrap._reserve_waiting_out_browse_reconcile(booting, [home])  # default wait: must not raise
+        _t0 = time.monotonic()
+        try:
+            bootstrap._reserve_waiting_out_browse_reconcile(booting, [home])  # default wait: must not raise
+        except Exception as exc:  # DIAGNOSTIC (macOS)
+            _waited = time.monotonic() - _t0
+            _rec = (home / "gateway.lock").read_text()
+            _out = browse.communicate(timeout=60)[0]
+            pytest.fail(f"DIAG waited={_waited:.2f}s exc={exc!r} record={_rec!r} browse_out={_out!r}")
         assert booting.owns(home)
     finally:
         booting.close()
