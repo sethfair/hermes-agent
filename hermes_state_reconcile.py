@@ -234,7 +234,15 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
                                  isolation_level=None)) as conn:
         _reapply_durability_barriers(conn)
         budget.arm(conn)
-        conn.execute('BEGIN IMMEDIATE')
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+        except sqlite3.OperationalError as exc:
+            # A slow host can spend the whole budget before the first statement finishes: the
+            # progress handler then interrupts BEGIN itself. No transaction opened, nothing
+            # written; this is the same budget refusal as an interrupted DDL.
+            if budget.expired:
+                raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget') from exc
+            raise
         try:
             cursor = conn.cursor()
             apply_declared_schema(cursor)
