@@ -83,6 +83,8 @@ class _KanbanDB:
 
 def _resume(server, monkeypatch, db, session_id):
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    # The guard, not the agent build, is under test: no pre-warm thread may outlive the fixture.
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args, **_kwargs: None)
     return server.handle_request({
         "id": f"r-{session_id}",
         "method": "session.resume",
@@ -111,3 +113,22 @@ def test_gateway_resume_ordinary_session_unchanged(server, monkeypatch):
     assert "error" not in response, response
     # omit_messages reads the tip segment — proof the guard was survived.
     assert ("tip", "chat-1") in db.reads
+
+
+def test_gateway_resume_ordinary_session_schedules_no_agent_prewarm(server, monkeypatch):
+    """The guard test must not leave an agent build running past its own fixture.
+
+    `session.resume` pre-warms the agent on a timer thread, and that build lazily imports
+    `tui_gateway.entry`, which imports `tui_gateway.server`. The `server` fixture drops that
+    module from `sys.modules` after its import window, so a build still running at teardown
+    imports a second, half-initialised copy while the autouse reset in tests/conftest.py reads
+    `mod._sessions` ("partially initialized module ... no attribute '_sessions'", seen on
+    slow 4-core CI runners). Count timers instead of racing their threads.
+    """
+    timers = []
+    monkeypatch.setattr(server.threading, "Timer", lambda *args, **kwargs: timers.append(args[1].__qualname__) or MagicMock())
+
+    response = _resume(server, monkeypatch, _KanbanDB(), "chat-1")
+
+    assert "error" not in response, response
+    assert not [q for q in timers if q.startswith("_schedule_agent_build")], timers
