@@ -182,6 +182,26 @@ def test_rich_payload_is_linear_in_unclosed_backtick_runs():
     assert time.perf_counter() - started < 1.0
 
 
+def test_rich_protected_regions_match_the_alternation_regex():
+    """The linear region scan finds exactly the spans the original fence|table regex did."""
+    import random
+    import re
+
+    from plugins.platforms.telegram.rich_markdown import _iter_rich_protected_regions
+
+    original = re.compile(
+        r'(?:```[^\n]*\n[\s\S]*?```)'
+        r'|(?:^[^\n]*\|[^\n]*\n'
+        r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'
+        r'(?:\n[^\n]*\|[^\n]*)*)',
+        re.MULTILINE)
+    pieces = ["```", "``", "`", "\n", "\n", "a", " ", "|", "---", ":-:", "| a | b |", "py", "~~~"]
+    rng = random.Random(89)
+    for _ in range(3000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 40)))
+        assert list(_iter_rich_protected_regions(text)) == [m.span() for m in original.finditer(text)], text
+
+
 @pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()
