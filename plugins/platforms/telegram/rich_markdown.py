@@ -227,12 +227,41 @@ def escape_literal_hash_prefixes(text: str) -> str:
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
-_RICH_PROTECTED_REGION_RE = re.compile(
-    r'(?:```[^\n]*\n[\s\S]*?```)'                       # fenced code block
-    r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
+_RICH_FENCE_RE = re.compile(r'```[^\n]*\n[\s\S]*?```')  # fenced code block
+_RICH_TABLE_RE = re.compile(
+    r'^[^\n]*\|[^\n]*\n'                                # table header row (has a pipe)
     r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
-    r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows (newline-led, trailing \n left for prose)
+    r'(?:\n[^\n]*\|[^\n]*)*',                           # data rows (newline-led, trailing \n left for prose)
     re.MULTILINE)
+
+
+def _iter_rich_protected_regions(text: str):
+    """Yield ``(start, end)`` of fenced code blocks and pipe tables, leftmost first (a fence wins a
+    tie), each scan resuming at the end of the previous region.
+
+    Same regions as ``finditer`` over the alternation ``_RICH_FENCE_RE | _RICH_TABLE_RE``, but
+    linear: a fence attempt consumes its whole opening line, so a plain alternation retries an
+    unclosed fence at every backtick of a long line and rescans the line each time. A failed attempt
+    means no closing run follows that line's newline, which holds for every later opener as well,
+    so fences are abandoned after the first failure. A failed table search likewise covers every
+    later start, so tables are not re-searched after it.
+    """
+    pos = 0
+    fence = table = None
+    fences_possible = tables_possible = True
+    while True:
+        if fences_possible and (fence is None or fence.start() < pos):
+            i = text.find('```', pos)
+            fence = _RICH_FENCE_RE.match(text, i) if i != -1 else None
+            fences_possible = fence is not None
+        if tables_possible and (table is None or table.start() < pos):
+            table = _RICH_TABLE_RE.search(text, pos)
+            tables_possible = table is not None
+        hit = fence if fence and (not table or fence.start() <= table.start()) else table
+        if not hit:
+            return
+        yield hit.start(), hit.end()
+        pos = hit.end()
 
 
 # CommonMark lets an ordered list interrupt a paragraph only when it starts at 1, so a numbered
@@ -290,9 +319,9 @@ def rich_normalize_linebreaks(text: str) -> str:
         return text
     out: list[str] = []
     pos = 0
-    for m in _RICH_PROTECTED_REGION_RE.finditer(text):
-        out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', _rich_separate_ordered_lists(text[pos:m.start()])))
-        out.append(m.group(0))  # protected region kept verbatim
-        pos = m.end()
+    for start, end in _iter_rich_protected_regions(text):
+        out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', _rich_separate_ordered_lists(text[pos:start])))
+        out.append(text[start:end])  # protected region kept verbatim
+        pos = end
     out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', _rich_separate_ordered_lists(text[pos:])))
     return ''.join(out)
