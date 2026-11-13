@@ -628,6 +628,38 @@ def test_budget_expiring_at_begin_immediate_is_a_budget_refusal(tmp_path):
     assert "last_read_at" not in _session_columns(path)
 
 
+def test_slow_durability_barrier_is_bounded_by_the_browse_budget(tmp_path, monkeypatch):
+    """The macOS write barriers (``PRAGMA checkpoint_fullfsync`` / ``synchronous=FULL``) run on the
+    DDL connection while browse holds gateway.lock, so the budget must bound them too. On the macOS
+    lane ``synchronous=FULL`` took 7.5s on the slowed connection, unarmed, and gateway boot's wait
+    gave up (OwnershipConflict). Here every platform runs the barriers, and one is VM-heavy (a
+    stand-in for that slow host): browse must refuse inside its budget with nothing written."""
+    import contextlib
+    import time
+
+    import hermes_state_reconcile as reconcile
+    import hermes_state_wal
+
+    path = _lagging_store_with_history(_profile_home(tmp_path), rows=10)
+    before = _file_state(path)
+    slow_sql = ("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 30000000) "
+                "SELECT count(*) FROM c")
+
+    def barrier_on_every_platform(conn, pragma):
+        with contextlib.suppress(sqlite3.OperationalError):  # same best-effort contract as darwin
+            conn.execute(pragma)
+            conn.execute(slow_sql).fetchone()
+
+    monkeypatch.setattr(hermes_state_wal, "_darwin_pragma", barrier_on_every_platform)
+    budget_s = 0.5
+    started = time.monotonic()
+    with pytest.raises(reconcile.BrowseBudgetExceeded):
+        reconcile._apply_additive_schema(path, reconcile._Budget(budget_s))
+    assert time.monotonic() - started < budget_s + 1.5
+    assert _file_state(path) == before
+    assert "last_read_at" not in _session_columns(path)
+
+
 def test_equal_cardinality_corrupt_index_plus_drift_is_not_written(tmp_path):
     """R2-3: quick_check does not compare index keys with the table, so two equal-size indexes
     with swapped root pages pass it. Browse must still refuse as corrupt and write nothing."""
