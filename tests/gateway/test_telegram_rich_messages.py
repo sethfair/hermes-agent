@@ -182,6 +182,21 @@ def test_rich_payload_is_linear_in_unclosed_backtick_runs():
     assert time.perf_counter() - started < 1.0
 
 
+def test_rich_linebreaks_are_linear_in_closed_fences_without_a_table():
+    """Many tiny closed fences and no table normalize well inside two seconds and stay verbatim;
+    re-searching the whole remaining text for a table after every fence is quadratic (16k fences
+    took ~24s)."""
+    from plugins.platforms.telegram.rich_markdown import rich_normalize_linebreaks
+
+    text = "```\nx```\n" * 16384
+
+    started = time.perf_counter()
+    out = rich_normalize_linebreaks(text)
+
+    assert time.perf_counter() - started < 2.0
+    assert out.count("```\nx```") == 16384
+
+
 def test_rich_protected_regions_match_the_alternation_regex():
     """The linear region scan finds exactly the spans the original fence|table regex did."""
     import random

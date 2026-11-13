@@ -243,18 +243,20 @@ def _iter_rich_protected_regions(text: str):
     linear: a fence attempt consumes its whole opening line, so a plain alternation retries an
     unclosed fence at every backtick of a long line and rescans the line each time. A failed attempt
     means no closing run follows that line's newline, which holds for every later opener as well,
-    so fences are abandoned after the first failure.
+    so fences are abandoned after the first failure. A failed table search likewise covers every
+    later start, so tables are not re-searched after it.
     """
     pos = 0
     fence = table = None
-    fences_possible = True
+    fences_possible = tables_possible = True
     while True:
         if fences_possible and (fence is None or fence.start() < pos):
             i = text.find('```', pos)
             fence = _RICH_FENCE_RE.match(text, i) if i != -1 else None
             fences_possible = fence is not None
-        if table is None or table.start() < pos:
+        if tables_possible and (table is None or table.start() < pos):
             table = _RICH_TABLE_RE.search(text, pos)
+            tables_possible = table is not None
         hit = fence if fence and (not table or fence.start() <= table.start()) else table
         if not hit:
             return
