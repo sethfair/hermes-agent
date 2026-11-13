@@ -9,17 +9,16 @@ The PR is read from GitHub with ``gh api`` (nothing is fetched into or written t
 local repository). FORK_REF is any commit-ish that resolves in the current clone, for
 example ``origin/main`` after the caller's own ``git fetch``. Two checks, strongest first:
 
-1. patch-id (``git patch-id --stable``): the whole-PR diff, or each PR commit, equals a
-   commit already in FORK_REF's history. Tolerates rebases, reorders and message changes;
-   whole-PR equality also covers a squash.
-2. hunk presence: for each hunk of the PR diff, the added lines appear as a contiguous
-   block in the file at FORK_REF and the removed lines no longer do. Tolerates squashes,
-   cherry-picks with conflict resolution and later unrelated edits to the same file;
-   whitespace at line ends is ignored.
-
-Method 2 is a content check, not proof of identical history: a hunk that was later
-reverted and re-applied differently could pass or fail on content alone, so the
-evidence names the commit that introduced each file's lines where one exists.
+1. content at FORK_REF (required for PASS): for each hunk of the PR diff, the added lines
+   appear as a contiguous block in the file at FORK_REF *in the hunk's position* (the
+   block's adjacent context lines, before or after, must sit next to it, so a copy of the
+   same lines elsewhere in the file does not count) and the removed lines no longer do.
+   Files without text hunks are checked by blob id (binary), by mode, and for renames by
+   the old path being gone. Whitespace at line ends is ignored.
+2. patch-id (``git patch-id --stable``): the whole-PR diff, or each PR commit, equals a
+   commit already in FORK_REF's history. This is extra evidence only: a commit that landed
+   and was later reverted still matches, so a patch-id match never turns a failed content
+   check into PASS.
 """
 
 from __future__ import annotations
@@ -30,9 +29,13 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 DEFAULT_SOURCE_REPO = "writerflow/hermes-kanban"
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+INDEX_RE = re.compile(r"^index ([0-9a-f]+)\.\.([0-9a-f]+)(?: (\d+))?$")
+CONTEXT_LINES = 3
+TIMEOUT = 120
 
 
 class LookupFailure(Exception):
@@ -42,10 +45,13 @@ class LookupFailure(Exception):
 def run(args: list[str], stdin: str | None = None) -> str:
     try:
         proc = subprocess.run(
-            args, input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            args, input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False, timeout=TIMEOUT,
         )
     except FileNotFoundError as exc:
         raise LookupFailure(f"required tool not found: {args[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise LookupFailure(f"{' '.join(args[:3])} timed out after {TIMEOUT}s") from exc
     if proc.returncode != 0:
         raise LookupFailure(f"{' '.join(args[:3])} failed: {proc.stderr.strip()[:300]}")
     return proc.stdout
@@ -69,6 +75,10 @@ class FileDiff:
     path: str
     status: str  # added | deleted | modified
     hunks: list[list[str]] = field(default_factory=list)
+    old_path: str | None = None  # set for a rename or copy source
+    new_blob: str | None = None  # abbreviated post-image blob id from the ``index`` line
+    new_mode: str | None = None
+    binary: bool = False
 
 
 def parse_diff(diff: str) -> list[FileDiff]:
@@ -79,6 +89,8 @@ def parse_diff(diff: str) -> list[FileDiff]:
         if line.startswith("diff --git "):
             m = re.match(r"diff --git a/(.*) b/(.*)$", line)
             cur = FileDiff(path=m.group(2) if m else line, status="modified")
+            if m and m.group(1) != m.group(2):
+                cur.old_path = m.group(1)
             files.append(cur)
             hunk = None
         elif cur is None:
@@ -87,6 +99,16 @@ def parse_diff(diff: str) -> list[FileDiff]:
             cur.status = "added"
         elif hunk is None and line.startswith("deleted file mode"):
             cur.status = "deleted"
+        elif hunk is None and line.startswith("rename from "):
+            cur.old_path = line[len("rename from "):]
+        elif hunk is None and line.startswith("new mode "):
+            cur.new_mode = line[len("new mode "):].strip()
+        elif hunk is None and (idx := INDEX_RE.match(line)):
+            cur.new_blob = idx.group(2)
+            if idx.group(3):
+                cur.new_mode = idx.group(3)
+        elif hunk is None and (line.startswith("Binary files ") or line.startswith("GIT binary patch")):
+            cur.binary = True
         elif HUNK_RE.match(line):
             hunk = []
             cur.hunks.append(hunk)
@@ -116,13 +138,107 @@ def contains_block(lines: list[str], block: list[str]) -> bool:
     return any(lines[i : i + n] == block for i in range(len(lines) - n + 1))
 
 
+def added_blocks(hunk: list[str]) -> list[tuple[list[str], list[str], list[str]]]:
+    """Added runs of a hunk as (block, before, after).
+
+    ``before``/``after`` are the post-image context lines directly adjacent to the run, at
+    most CONTEXT_LINES each; a run touching another change on a side has no context there.
+    """
+    post = [(ln[0], ln[1:].rstrip()) for ln in hunk if ln[0] in "+ "]
+    out = []
+    i = 0
+    while i < len(post):
+        if post[i][0] != "+":
+            i += 1
+            continue
+        j = i
+        while j < len(post) and post[j][0] == "+":
+            j += 1
+        before: list[str] = []
+        k = i - 1
+        while k >= 0 and post[k][0] == " " and len(before) < CONTEXT_LINES:
+            before.insert(0, post[k][1])
+            k -= 1
+        after: list[str] = []
+        k = j
+        while k < len(post) and post[k][0] == " " and len(after) < CONTEXT_LINES:
+            after.append(post[k][1])
+            k += 1
+        out.append(([t for _, t in post[i:j]], before, after))
+        i = j
+    return out
+
+
+def contains_anchored(lines: list[str], block: list[str], before: list[str], after: list[str]) -> bool:
+    """Block present with its leading or trailing hunk context directly beside it.
+
+    One side is enough so later edits to the other side's context do not fail a landed
+    change. With no context at all (new file, whole-file rewrite) the plain block counts.
+    """
+    n = len(block)
+    for i in range(len(lines) - n + 1):
+        if lines[i : i + n] != block:
+            continue
+        if not before and not after:
+            return True
+        if before and i >= len(before) and lines[i - len(before) : i] == before:
+            return True
+        if after and lines[i + n : i + n + len(after)] == after:
+            return True
+    return False
+
+
+def git_text(args: list[str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False, timeout=TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LookupFailure(f"{' '.join(args[:3])} timed out after {TIMEOUT}s") from exc
+    return proc.stdout if proc.returncode == 0 else None
+
+
 def file_at(ref: str, path: str) -> list[str] | None:
-    proc = subprocess.run(
-        ["git", "show", f"{ref}:{path}"], capture_output=True, text=True, encoding="utf-8", errors="replace"
-    )
-    if proc.returncode != 0:
-        return None
-    return [ln.rstrip() for ln in proc.stdout.splitlines()]
+    out = git_text(["git", "show", f"{ref}:{path}"])
+    return None if out is None else [ln.rstrip() for ln in out.splitlines()]
+
+
+def blob_at(ref: str, path: str) -> str | None:
+    out = git_text(["git", "rev-parse", "--verify", f"{ref}:{path}"])
+    return out.strip() if out else None
+
+
+def mode_at(ref: str, path: str) -> str | None:
+    out = git_text(["git", "ls-tree", ref, "--", path])
+    return out.split()[0] if out and out.split() else None
+
+
+def check_no_text(fd: FileDiff, ref: str) -> tuple[bool, list[str]]:
+    """Evidence for a file with no text hunks: blob id (binary), mode, rename source."""
+    ok = True
+    ev: list[str] = []
+    if fd.old_path and fd.old_path != fd.path:
+        gone = file_at(ref, fd.old_path) is None
+        ev.append(f"  {'ok  ' if gone else 'MISS'} {fd.path}: renamed from {fd.old_path}, old path {'gone' if gone else 'still present'} at ref")
+        ok &= gone
+    if fd.new_blob and set(fd.new_blob) != {"0"}:
+        actual = blob_at(ref, fd.path)
+        same = bool(actual) and actual.startswith(fd.new_blob)
+        ev.append(f"  {'ok  ' if same else 'MISS'} {fd.path}: blob {fd.new_blob} {'matches' if same else 'differs from ' + str(actual)[:12]} at ref")
+        ok &= same
+    elif fd.binary:
+        ev.append(f"  MISS {fd.path}: binary change with no index line, cannot verify content")
+        ok = False
+    if fd.new_mode:
+        mode = mode_at(ref, fd.path)
+        good = mode == fd.new_mode
+        ev.append(f"  {'ok  ' if good else 'MISS'} {fd.path}: mode {fd.new_mode} {'matches' if good else 'differs (' + str(mode) + ')'} at ref")
+        ok &= good
+    if not ev:
+        ev.append(f"  MISS {fd.path}: nothing in the diff to verify (no hunks, blob id, mode or rename)")
+        ok = False
+    return ok, ev
 
 
 def check_hunks(files: list[FileDiff], ref: str) -> tuple[bool, list[str]]:
@@ -140,14 +256,16 @@ def check_hunks(files: list[FileDiff], ref: str) -> tuple[bool, list[str]]:
             ok = False
             continue
         if not fd.hunks:
-            evidence.append(f"  ok   {fd.path}: no content hunks (mode/rename only), file exists")
+            good, ev = check_no_text(fd, ref)
+            evidence.extend(ev)
+            ok &= good
             continue
         bad: list[str] = []
         for i, hunk in enumerate(fd.hunks, 1):
-            for block in runs(hunk, "+"):
+            for block, before, after in added_blocks(hunk):
                 if not any(block):
                     continue  # blank-only runs carry no evidence
-                if not contains_block(content, block):
+                if not contains_anchored(content, block, before, after):
                     bad.append(f"hunk {i}: added block missing: {next(x for x in block if x)[:70]!r}")
             for block in runs(hunk, "-"):
                 if any(block) and contains_block(content, block):
@@ -174,7 +292,8 @@ def fork_patch_index(ref: str, paths: list[str], limit: int) -> dict[str, str]:
 
 
 def pr_commit_patches(repo: str, pr: int) -> list[tuple[str, str]]:
-    commits = json.loads(gh_api(f"repos/{repo}/pulls/{pr}/commits?per_page=100"))
+    pages = json.loads(run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr}/commits?per_page=100"]))
+    commits = [c for page in pages for c in page]
     return [
         (c["sha"], gh_api(f"repos/{repo}/commits/{c['sha']}", "application/vnd.github.patch"))
         for c in commits
@@ -198,8 +317,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         if args.diff_file:
-            diff = open(args.diff_file, encoding="utf-8").read()
-            commit_mbox = open(args.commit_patches_file, encoding="utf-8").read() if args.commit_patches_file else ""
+            diff = Path(args.diff_file).read_text(encoding="utf-8-sig")
+            commit_mbox = Path(args.commit_patches_file).read_text(encoding="utf-8-sig") if args.commit_patches_file else ""
             commit_patches = [("(file)", commit_mbox)] if commit_mbox else []
         else:
             diff = gh_api(f"repos/{args.source_repo}/pulls/{args.pr}", "application/vnd.github.v3.diff")
@@ -235,19 +354,18 @@ def main(argv: list[str] | None = None) -> int:
         print("per-commit patch-id:")
         print("\n".join(per_commit))
 
-    # 2. hunk presence.
+    # 2. content at the ref is required; patch-id above is supporting evidence only.
     hunks_ok, evidence = check_hunks(files, sha)
-    print("hunk presence at ref:")
+    print("content at ref:")
     print("\n".join(evidence))
     if hunks_ok:
-        methods.append("hunk presence: every added block present and removed block gone")
-
-    if methods:
+        methods.append("content: every added block present in position, removed blocks gone")
         print("PASS")
         print("  evidence: " + "; ".join(methods))
         return 0
     print("FAIL")
-    print("  evidence: no patch-id match for the whole PR or all its commits, and hunk presence failed (see MISS lines)")
+    note = " (patch-id matched, but a matching commit may have been reverted)" if methods else ""
+    print("  evidence: content check failed, see MISS lines" + note)
     return 1
 
 
