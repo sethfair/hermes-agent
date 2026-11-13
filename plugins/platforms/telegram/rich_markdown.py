@@ -228,9 +228,15 @@ def escape_literal_hash_prefixes(text: str) -> str:
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
 _RICH_FENCE_RE = re.compile(r'```[^\n]*\n[\s\S]*?```')  # fenced code block
+#
+# Linear by construction: each split has exactly one way to match. The header's first star stops
+# at the line's FIRST pipe (`[^\n|]*`), and the delimiter's second whitespace run exists only when
+# the optional leading pipe was consumed. With two overlapping stars either split was retried at
+# every offset on failure (quadratic). The data-row group is already linear: nothing mandatory
+# follows it.
 _RICH_TABLE_RE = re.compile(
-    r'^[^\n]*\|[^\n]*\n'                                # table header row (has a pipe)
-    r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
+    r'^[^\n|]*\|[^\n]*\n'                               # table header row (has a pipe)
+    r'[ \t]*(?:\|[ \t]*)?:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
     r'(?:\n[^\n]*\|[^\n]*)*',                           # data rows (newline-led, trailing \n left for prose)
     re.MULTILINE)
 

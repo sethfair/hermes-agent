@@ -11,7 +11,10 @@ The ``telegram`` package is mocked by ``tests/gateway/conftest.py``
 """
 
 import asyncio
+import itertools
 import logging
+import random
+import re
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -182,6 +185,60 @@ def test_rich_payload_is_linear_in_unclosed_backtick_runs():
     assert time.perf_counter() - started < 1.0
 
 
+_RICH_CAP = TelegramAdapter.RICH_MESSAGE_MAX_CHARS
+
+
+def _pipe_heavy_cases(cap):
+    """Contents at the full rich cap that stress the table regex."""
+    return [
+        # The short first line forces newline processing; the long last line has no newline, which
+        # is the old header's quadratic failure.
+        pytest.param("x\n" + "|" * (cap - 2), id="header-pipes-no-newline"),
+        pytest.param("|" * (cap - 3) + "\nxx", id="header-pipes-then-prose"),
+        # Header, then a delimiter candidate of only whitespace: the old two `[ \t]*` split it at
+        # every offset (tens of seconds).
+        pytest.param("|\n" + " " * (cap - 3) + "x", id="delimiter-spaces"),
+        pytest.param("|\n" + "\t" * (cap - 3) + "x", id="delimiter-tabs"),
+        # A pipe between the runs does not stop the quadratic split (old ~7 s).
+        pytest.param("|\n" + " " * (cap // 2) + "|" + " " * (cap // 2 - 5) + "x", id="delimiter-ws-pipe-ws"),
+        # Guards for the unchanged data-row group: linear before and after.
+        pytest.param("|a|b|\n|-|-|\n" + "|" * (cap - 12), id="data-row-pipe-heavy"),
+        pytest.param("|a|b|\n|-|-|" + "\n|x|y|" * ((cap - 11) // 6), id="data-rows-many-short"),
+        pytest.param("|a|b|\n|-|-|\n" + "x" * (cap - 12), id="data-row-pipeless-long"),
+    ]
+
+
+@pytest.mark.parametrize("content", _pipe_heavy_cases(_RICH_CAP))
+def test_rich_payload_is_linear_in_pipe_heavy_lines(content):
+    """Pipe-heavy and whitespace-heavy table candidates at the full rich cap build their payload in
+    well under a second; the table regex's overlapping stars were quadratic on them.
+
+    The bound matches the neighbouring backtick test (tests/AGENTS.md asks for >= 2 s on shared
+    runners; the new code takes milliseconds and the 2x-cap test below keeps the discrimination).
+    """
+    adapter = _make_adapter()
+    assert len(content) <= adapter.RICH_MESSAGE_MAX_CHARS
+
+    started = time.perf_counter()
+    payload = adapter._rich_message_payload(content)
+
+    assert time.perf_counter() - started < 1.0
+    assert payload["markdown"]
+
+
+def test_table_regex_stays_linear_on_double_cap_pipes():
+    """A direct search over twice the cap of pipes (old ~5 s) scales linearly, so a faster CPU
+    cannot let a quadratic regex pass."""
+    from plugins.platforms.telegram.rich_markdown import _RICH_TABLE_RE
+
+    text = "|" * (2 * _RICH_CAP)
+
+    started = time.perf_counter()
+    assert _RICH_TABLE_RE.search(text) is None
+
+    assert time.perf_counter() - started < 1.0
+
+
 def test_rich_linebreaks_are_linear_in_closed_fences_without_a_table():
     """Many tiny closed fences and no table normalize well inside two seconds and stay verbatim;
     re-searching the whole remaining text for a table after every fence is quadratic (16k fences
@@ -215,6 +272,191 @@ def test_rich_protected_regions_match_the_alternation_regex():
     for _ in range(3000):
         text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 40)))
         assert list(_iter_rich_protected_regions(text)) == [m.span() for m in original.finditer(text)], text
+
+
+# --- Table regex rewrite: exact-span equivalence with the frozen pre-rewrite pattern -------------
+# The linear rewrite must not move a single span, so everything below compares span LISTS against
+# this test-local copy of the old, quadratic pattern (the oracle). It is never used by production.
+_OLD_TABLE_SRC = (
+    r'^[^\n]*\|[^\n]*\n'
+    r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'
+    r'(?:\n[^\n]*\|[^\n]*)*'
+)
+_OLD_TABLE_RE = re.compile(_OLD_TABLE_SRC, re.MULTILINE)
+_OLD_ALTERNATION_RE = re.compile(r'(?:```[^\n]*\n[\s\S]*?```)|(?:' + _OLD_TABLE_SRC + ')', re.MULTILINE)
+
+_TABLE_ALPHABET = ("|", "-", ":", " ", "\t", "\n", "x")
+_FUZZ_PIECES = [
+    "|", "-", ":", " ", "\t", "\n", "\n\n", "x", "\r\n", "\r", "x|y", " " * 7, "-" * 9, "|" * 5,
+    "| a | b |", "|-|-|", "|---|---|", ":-:", " :--- ", "---:", "| :-- | --: |",
+    "`", "``", "```", "````", "~~~", "py", "> ",
+]
+
+# (text, number of protected regions the old alternation finds). Counts are the old behaviour,
+# including its quirks (CRLF delimiters and lone CRs are not tables).
+_PINNED_TABLE_CASES = [
+    pytest.param("| a | b |\n|---|---|\n| 1 | 2 |", 1, id="plain"),
+    pytest.param("a | b\n--|--\n1 | 2", 1, id="no-outer-pipes"),
+    pytest.param("| a | b | c |\n|:---|:---:|---:|\n| 1 | 2 | 3 |", 1, id="alignment"),
+    pytest.param("| a | b |\n \t|---|---|\n| 1 | 2 |", 1, id="delimiter-leading-whitespace"),
+    pytest.param("`a|b`\n|-|-|\nrow | x", 1, id="inline-code-header"),
+    pytest.param("```\n| a | b |\n|---|---|\n```", 1, id="fence-holds-table"),
+    pytest.param("| a | b |\r\n|---|---|\r\n| 1 | 2 |\r\n", 1, id="crlf-stops-at-cr"),
+    pytest.param("| a | b |\r|---|---|\r| 1 | 2 |", 0, id="lone-cr"),
+    pytest.param("| a | b |\n|-|-|", 1, id="no-trailing-newline"),
+    pytest.param("| a | b |\n|-|-|\n", 1, id="trailing-newline-outside-span"),
+    pytest.param("| a | b |\n|-|-|\n| 1 | 2 |\nprose", 1, id="followed-by-prose"),
+    pytest.param("| a | b |\n|-|-|\n\n| c | d |\n|-|-|", 2, id="two-tables"),
+    pytest.param("| a | b |\n|-|-|\n| c | d |\n|-|-|", 1, id="stacked-delimiter-is-a-row"),
+    pytest.param("|---|---|", 0, id="delimiter-only"),
+    pytest.param("a\n---\nb", 0, id="one-column-no-pipe"),
+    pytest.param("| a |\n|---|", 0, id="one-column-pipe"),
+    pytest.param("| a | b |\n|-|-|\n```\nx\n```", 2, id="fence-after-table"),
+    # Maya advisory A1 backstops: a fence/table tie (fence wins) and a table cached before a fence
+    # that covers it, followed by a later real table.
+    pytest.param("```|\n|-|-|\n```", 1, id="A1-fence-table-tie"),
+    pytest.param("```x\n|a|\n|-|-|\n```\n|b|\n|-|-|", 2, id="A1-stale-cached-table"),
+    pytest.param("|" * 64, 0, id="long-pipes"),
+    pytest.param("|\n" + " " * 64 + "x", 0, id="whitespace-delimiter-fails"),
+    pytest.param("|\n" + " " * 32 + "|" + " " * 32 + "x", 0, id="ws-pipe-ws-delimiter-fails"),
+]
+
+
+def _spans(regex, text):
+    return [m.span() for m in regex.finditer(text)]
+
+
+def _fuzz_corpus(seed, count):
+    rng = random.Random(seed)
+    return ["".join(rng.choice(_FUZZ_PIECES) for _ in range(rng.randint(1, 60))) for _ in range(count)]
+
+
+def test_rich_table_regex_matches_old_spans_exhaustively_to_length_7():
+    """Every string of length 0-7 over the table alphabet (960,800 of them; length 7 is the shortest
+    header + multi-column delimiter + data row) yields identical table spans."""
+    from plugins.platforms.telegram.rich_markdown import _RICH_TABLE_RE
+
+    checked = 0
+    for length in range(8):
+        for chars in itertools.product(_TABLE_ALPHABET, repeat=length):
+            text = "".join(chars)
+            checked += 1
+            assert _spans(_RICH_TABLE_RE, text) == _spans(_OLD_TABLE_RE, text), repr(text)
+    assert checked == sum(7**n for n in range(8))
+
+
+def test_rich_table_regex_matches_old_search_from_every_offset():
+    """The region scan resumes with ``search(text, pos)``; every offset of every string up to
+    length 6 over the table alphabet finds the same span (or none) as the old pattern."""
+    from plugins.platforms.telegram.rich_markdown import _RICH_TABLE_RE
+
+    def found(regex, text, pos):
+        m = regex.search(text, pos)
+        return m.span() if m else None
+
+    for length in range(7):
+        for chars in itertools.product(_TABLE_ALPHABET, repeat=length):
+            text = "".join(chars)
+            for pos in range(len(text) + 1):
+                assert found(_RICH_TABLE_RE, text, pos) == found(_OLD_TABLE_RE, text, pos), (text, pos)
+
+
+def test_rich_protected_regions_match_old_alternation_on_seeded_fuzz():
+    """50,000 strings of table, fence, CRLF/CR and whitespace pieces: the table regex spans and the
+    complete protected-region scan equal the old fence|table alternation."""
+    from plugins.platforms.telegram.rich_markdown import _RICH_TABLE_RE, _iter_rich_protected_regions
+
+    for text in _fuzz_corpus(89, 50_000):
+        assert _spans(_RICH_TABLE_RE, text) == _spans(_OLD_TABLE_RE, text), repr(text)
+        assert list(_iter_rich_protected_regions(text)) == _spans(_OLD_ALTERNATION_RE, text), repr(text)
+
+
+@pytest.mark.parametrize(("text", "regions"), _PINNED_TABLE_CASES)
+def test_rich_table_pinned_cases_match_old_spans(text, regions):
+    from plugins.platforms.telegram.rich_markdown import _RICH_TABLE_RE, _iter_rich_protected_regions
+
+    old_regions = _spans(_OLD_ALTERNATION_RE, text)
+    assert len(old_regions) == regions
+    assert list(_iter_rich_protected_regions(text)) == old_regions
+    assert _spans(_RICH_TABLE_RE, text) == _spans(_OLD_TABLE_RE, text)
+
+
+# Mutation strength: the corpus above must be able to tell the old behaviour from plausible
+# near-misses, or a large corpus proves nothing. Mutants live only in the tests.
+_HEADER = r'^[^\n|]*\|[^\n]*\n'
+_DELIMITER = r'[ \t]*(?:\|[ \t]*)?:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'
+_ROWS = r'(?:\n[^\n]*\|[^\n]*)*'
+
+
+def _compose(header=_HEADER, delimiter=_DELIMITER, rows=_ROWS):
+    return re.compile(header + delimiter + rows, re.MULTILINE)
+
+
+_TABLE_MUTANTS = {
+    "header-stops-at-second-pipe": _compose(header=r'^[^\n|]*\|[^\n|]*\n'),
+    "header-loses-line-anchor": _compose(header=r'[^\n|]*\|[^\n]*\n'),
+    "delimiter-loses-leading-whitespace": _compose(delimiter=_DELIMITER[len(r'[ \t]*'):]),
+    "delimiter-extra-column-optional": _compose(delimiter=_DELIMITER.replace(')+', ')*', 1)),
+    "delimiter-dashes-optional": _compose(delimiter=_DELIMITER.replace('-+', '-*')),
+    "delimiter-loses-trailing-whitespace": _compose(delimiter=_DELIMITER[:-len(r'[ \t]*')]),
+    "rows-allow-pipeless": _compose(rows=r'(?:\n[^\n]*)*'),
+    "rows-pipe-at-column-zero": _compose(rows=r'(?:\n\|[^\n]*)*'),
+    "rows-swallow-trailing-newline": _compose(rows=_ROWS + r'\n?'),
+}
+
+
+def _scan_regions(text, table_re, *, fence_wins_tie=True, recompute_stale_table=True):
+    """Test-local copy of the production region scan with two switchable defects (the mutants)."""
+    fence_re = re.compile(r'```[^\n]*\n[\s\S]*?```')
+    pos, fence, table, out = 0, None, None, []
+    while True:
+        if fence is None or fence.start() < pos:
+            i = text.find('```', pos)
+            fence = fence_re.match(text, i) if i != -1 else None
+        if table is None or (recompute_stale_table and table.start() < pos):
+            table = table_re.search(text, pos)
+        hit = fence
+        if fence is None or (table is not None and (
+                table.start() < fence.start() or (not fence_wins_tie and table.start() == fence.start()))):
+            hit = table
+        if hit is None:
+            return out
+        out.append(hit.span())
+        pos = hit.end()
+
+
+def _mutation_corpus():
+    return [case.values[0] for case in _PINNED_TABLE_CASES] + _fuzz_corpus(89, 50_000)
+
+
+def test_rich_table_fuzz_corpus_kills_every_table_regex_mutant():
+    corpus = _mutation_corpus()
+    # The composition of the unmutated parts is the production pattern's behaviour.
+    assert all(_spans(_compose(), t) == _spans(_OLD_TABLE_RE, t) for t in corpus)
+
+    survivors = [
+        name for name, mutant in _TABLE_MUTANTS.items()
+        if all(_spans(mutant, t) == _spans(_OLD_TABLE_RE, t) for t in corpus)
+    ]
+    assert survivors == []
+
+
+def test_rich_table_fuzz_corpus_kills_region_scan_mutants():
+    from plugins.platforms.telegram.rich_markdown import _RICH_TABLE_RE
+
+    corpus = _mutation_corpus()
+    # The test-local scan, undamaged, is the production scan.
+    assert all(_scan_regions(t, _RICH_TABLE_RE) == _spans(_OLD_ALTERNATION_RE, t) for t in corpus)
+
+    mutants = {
+        "table-wins-tie": {"fence_wins_tie": False},
+        "stale-table-not-recomputed": {"recompute_stale_table": False},
+    }
+    survivors = [
+        name for name, flags in mutants.items()
+        if all(_scan_regions(t, _RICH_TABLE_RE, **flags) == _spans(_OLD_ALTERNATION_RE, t) for t in corpus)
+    ]
+    assert survivors == []
 
 
 @pytest.mark.asyncio
