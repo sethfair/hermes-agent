@@ -422,6 +422,8 @@ def _scan_regions(text, table_re, *, fence_wins_tie=True, recompute_stale_table=
         if hit is None:
             return out
         out.append(hit.span())
+        if hit.end() <= pos:  # a mutant that stops advancing would loop forever; end the scan, spans already diverge
+            return out
         pos = hit.end()
 
 
