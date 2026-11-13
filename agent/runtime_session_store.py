@@ -16,9 +16,23 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
+from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
+
+RECEIPT_ATTEMPT_TIMEOUT_S = 20.0
+OWNER_SILENCE_BUDGET_S = 180.0
+STARTUP_REPLAY_BUDGET_S = 30.0
+_monotonic = time.monotonic
+
+
+def _sleep_or_cancel(cancel, delay):
+    if cancel is None:
+        time.sleep(delay)
+        return False
+    return cancel.wait(delay)
 
 _worker_process = False
 
@@ -45,6 +59,15 @@ def apply_row_annotations(messages, annotations):
 
 class WorkerPersistenceError(RuntimeError):
     pass
+
+
+_RETRYABLE = (TimeoutError, OSError, ConnectionClosed)
+
+
+def _retryable_persistence_error(exc):
+    return ((isinstance(exc, _RETRYABLE) and
+             (not isinstance(exc, TimeoutError) or str(exc) == 'worker_receipt_timeout'))
+            or (isinstance(exc, WorkerPersistenceError) and str(exc) == 'owner_unavailable'))
 
 
 def _caller_summary(limit=8):
@@ -105,11 +128,19 @@ class _OwnerLink:
         self.awaiting = request_id
         self.ws.send(message)
 
-    def receive(self, timeout):
-        try:
-            reply = self.replies.get(timeout=timeout)
-        except queue.Empty:
-            raise TimeoutError('worker_receipt_timeout') from None
+    def receive(self, timeout, cancel=None):
+        deadline = _monotonic() + timeout
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise WorkerPersistenceError('worker_cancelled')
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                raise TimeoutError('worker_receipt_timeout')
+            try:
+                reply = self.replies.get(timeout=min(0.25, remaining))
+                break
+            except queue.Empty:
+                continue
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -122,12 +153,15 @@ class WorkerRPC:
     One connection serves every call (serialized by ``lock``, correlated by id); it is
     discovered, identified and ticketed on connect exactly as each call once was.
     """
+    RECEIPT_ATTEMPT_TIMEOUT_S = RECEIPT_ATTEMPT_TIMEOUT_S
+
     def __init__(self, home):
         self.home = Path(home).resolve()
         self.lock = threading.Lock()
         self.endpoint = None
         self.link = None
         self.request_id = 0
+        self.cancel = None
 
     def _connection(self):
         if self.link is not None:
@@ -194,7 +228,8 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                receive_cancel = None if self.cancel is not None and self.cancel.is_set() else self.cancel
+                response = link.receive(self.RECEIPT_ATTEMPT_TIMEOUT_S, cancel=receive_cancel)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
@@ -229,6 +264,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
         self.failure = None
+        self.cancel: threading.Event | None = None
         self.path = Path(outbox_dir) / 'pending.json'
         make_user_dir(self.path.parent, mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink() or self.path.is_symlink():
@@ -256,7 +292,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 self.journal = {'scope': self.scope, 'next_sequence': 1, 'pending': []}
                 self._save(self.journal)
             if self.journal['pending']:
-                self.retry_pending()
+                self.retry_pending(startup_replay=True)
             if reconciled and self.scope != dict(scope):
                 # Replay must land the journal exactly on the adopted assignment (a pending
                 # publication moves it to the child); anything else is not this successor's outbox.
@@ -330,13 +366,48 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.journal = candidate
             return self.retry_pending()[0]
 
-    def retry_pending(self):
+    def retry_pending(self, *, startup_replay=False):
         with self.lock:
             results = []
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    started = _monotonic()
+                    budget = STARTUP_REPLAY_BUDGET_S if startup_replay else OWNER_SILENCE_BUDGET_S
+                    attempt = 1
+                    while True:
+                        if attempt > 1 and self.cancel is not None and self.cancel.is_set():
+                            raise WorkerPersistenceError('worker_cancelled')
+                        try:
+                            result = self.rpc('worker.persist', **self.scope, **entry)
+                            if attempt > 1:
+                                logger.info('worker.persist retry recovered operation=%s sequence=%s retries=%s elapsed_s=%.3f',
+                                            entry['operation'], entry['sequence'], attempt - 1, _monotonic() - started)
+                            break
+                        except Exception as exc:
+                            elapsed = _monotonic() - started
+                            if self.cancel is not None and self.cancel.is_set():
+                                logger.info('worker.persist retry disposition=cancelled operation=%s sequence=%s',
+                                            entry['operation'], entry['sequence'])
+                                raise WorkerPersistenceError('worker_cancelled') from exc
+                            if not _retryable_persistence_error(exc):
+                                logger.info('worker.persist retry disposition=fatal operation=%s sequence=%s',
+                                            entry['operation'], entry['sequence'])
+                                raise
+                            logger.warning('worker.persist retry operation=%s sequence=%s attempt=%s elapsed_s=%.3f exception=%s reason=owner_silent_or_transport_lost',
+                                           entry['operation'], entry['sequence'], attempt, elapsed, type(exc).__name__)
+                            if elapsed >= budget:
+                                logger.info('worker.persist retry disposition=budget_exhausted operation=%s sequence=%s',
+                                            entry['operation'], entry['sequence'])
+                                raise
+                            from agent.retry_utils import jittered_backoff
+                            delay = min(jittered_backoff(attempt, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0),
+                                        max(0.0, budget - elapsed))
+                            if _sleep_or_cancel(self.cancel, delay):
+                                raise WorkerPersistenceError('worker_cancelled') from exc
+                            if _monotonic() >= budget + started:
+                                raise exc
+                            attempt += 1
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
