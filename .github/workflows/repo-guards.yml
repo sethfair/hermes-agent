@@ -3,7 +3,7 @@ name: Repository guards
 # Every cheap repository check that ci.yaml starts right after `detect`, as ONE job on one runner.
 #
 # Each of these used to be its own job (most of them their own workflow file) on the same
-# blacksmith-4vcpu-ubuntu-2404 runner: a 2s checkout, 0-13s of work, and a full billed minute.
+# ubuntu-latest runner: a 2s checkout, 0-13s of work, and a full billed minute.
 # They share the trigger (after detect), the OS and the architecture, so they now share the
 # checkout. What told them apart is kept per step: the lane gate in each step's `if:`, the
 # step name, and the review-status-* artifact the live PR comment reads.
@@ -65,10 +65,10 @@ permissions:
 jobs:
   guards:
     name: Repository guards
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           ref: ${{ inputs.commit }}
           # Full history: merge bases (history, contributors, prompt surface, lockfile diff,
