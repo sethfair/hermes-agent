@@ -232,8 +232,13 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     budget.check()
     with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
                                  isolation_level=None)) as conn:
-        _reapply_durability_barriers(conn)
+        # Armed BEFORE the barriers: they run under gateway.lock too, and on a slow macOS host a
+        # barrier PRAGMA can outlast the whole budget (``PRAGMA synchronous=FULL`` took 7.5s on the
+        # macOS lane). Unarmed, it held the lock past gateway boot's wait: a startup refusal.
         budget.arm(conn)
+        _reapply_durability_barriers(conn)
+        # An interrupted barrier is swallowed (best-effort); never write without it, refuse instead.
+        budget.check()
         try:
             conn.execute('BEGIN IMMEDIATE')
         except sqlite3.OperationalError as exc:
