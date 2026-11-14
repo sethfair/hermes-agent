@@ -8,9 +8,8 @@ import sys
 from pathlib import Path
 
 from scripts.code_health.ruff_runner import pinned_version
-from tests.waiting import wait_until
-
 REPO = Path(__file__).resolve().parents[2]
+SEED_PACK = REPO / "tests/fixtures/frozen_policy/reviewed-objects.pack"
 # PR #7 rebound the policy: health is measured against its base, the merge of PR #6.
 BASE = "c0850d5c34ea4dcd666b42b3e4f571ac9cf29969"
 # PR #7's merge commit on main carries the reviewed frozen bytes.
@@ -41,46 +40,84 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _has_reviewed_commits(repo: Path) -> bool:
-    return all(command(repo, "git", "cat-file", "-e", f"{sha}^{{tree}}").returncode == 0
-               for sha in (CANDIDATE, BASE))
+def _seed_reviewed_objects(repo: Path) -> None:
+    """Install the committed reviewed-object fixture without consulting a remote."""
+    git(repo, "init", "-q")
+    source_objects = Path(git(REPO, "rev-parse", "--path-format=absolute", "--git-path", "objects"))
+    alternates = repo / ".git/objects/info/alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(str(source_objects) + "\n", encoding="utf-8")
+    with SEED_PACK.open("rb") as seed:
+        result = subprocess.run(
+            ("git", "index-pack", "--stdin"), cwd=repo, stdin=seed,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=600, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    git(repo, "sparse-checkout", "init", "--no-cone")
+    git(repo, "sparse-checkout", "set", "/scripts/observer_v2/",
+        "/scripts/frozen_import_policy.py", "/scripts/check",
+        "/scripts/check-windows-footguns.py", "/scripts/check_frozen_ruff.py",
+        "/scripts/code_health/", "/scripts/ci/", "/scripts/reviewed.py", "/scripts/later.py",
+        "/.github/workflows/lint.yml", "/pyproject.toml", "/ruff.toml",
+        "/tests/cron/fixtures/observer-v2-reference/")
 
 
-def _fetch_reviewed_commits() -> bool:
-    if _has_reviewed_commits(REPO):
-        return True
-    # The checkout's own config and credentials (CI's checkout token, a user's helper) apply.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    result = subprocess.run(
-        ("git", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--depth=1",
-         "origin", CANDIDATE, BASE),
-        cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        stdin=subprocess.DEVNULL, timeout=600, check=False)
-    if _has_reviewed_commits(REPO):
-        return True
-    # Test files fetch concurrently and git refuses a second writer of .git/shallow.lock.
-    assert ".lock" in result.stderr, f"cannot fetch reviewed commits {CANDIDATE} and {BASE}: {result.stderr}"
-    return False
+def _clear_seed_worktree(repo: Path) -> None:
+    for relative in ("scripts", ".github", "tests", "pyproject.toml", "ruff.toml"):
+        target = repo / relative
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
 
 
-def provide_reviewed_commits() -> None:
-    """Make the reviewed WRI-2276 commits readable in the source checkout.
+def _reduced_reviewed_tree(repo: Path, revision: str) -> str:
+    """Materialize only the files exercised by this fixture, then snapshot them."""
+    _clear_seed_worktree(repo)
+    git(repo, "read-tree", "--reset", "-u", revision)
+    git(repo, "read-tree", "--empty")
+    paths = [relative for relative in
+             ("scripts", ".github/workflows/lint.yml", "tests", "pyproject.toml", "ruff.toml")
+             if (repo / relative).exists()]
+    git(repo, "add", "-f", *paths)
+    return git(repo, "write-tree")
 
-    A shallow checkout (CI's actions/checkout fetches one commit) lacks them, so fetch
-    both from its origin at depth 1. A full clone already has them and is not touched.
-    """
-    wait_until(_fetch_reviewed_commits, timeout=300, interval=1,
-               what=f"another fetch to release the lock on {REPO}")
+
+def _localize_reachable_objects(repo: Path) -> None:
+    """Copy reduced-history trees and overlay blobs out of the source alternate."""
+    trees = []
+    for line in git(repo, "rev-list", "--objects", "HEAD").splitlines():
+        oid = line.split(" ", 1)[0]
+        if git(repo, "cat-file", "-t", oid) == "tree":
+            result = subprocess.run(("git", "cat-file", "tree", oid), cwd=repo,
+                                    capture_output=True, timeout=60, check=False)
+            assert result.returncode == 0, result.stderr.decode(errors="replace")
+            trees.append((oid, result.stdout))
+    alternates = repo / ".git/objects/info/alternates"
+    detached = alternates.with_suffix(".detached")
+    alternates.rename(detached)
+    for expected, raw in trees:
+        result = subprocess.run(("git", "hash-object", "-t", "tree", "-w", "--stdin"),
+                                cwd=repo, input=raw, capture_output=True, timeout=60, check=False)
+        assert result.returncode == 0 and result.stdout.decode().strip() == expected
+    for path in repo.rglob("*"):
+        if path.is_file() and ".git" not in path.relative_to(repo).parts:
+            git(repo, "hash-object", "-w", str(path))
+    detached.unlink()
 
 
 def candidate_tree(path: Path) -> Path:
-    provide_reviewed_commits()
-    git(path.parent, "clone", "--shared", "--no-checkout", str(REPO), str(path))
-    if not _has_reviewed_commits(path):
-        # Git clones a shallow source by transport, which copies only its refs' history.
-        git(path, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--depth=1",
-            str(REPO), CANDIDATE, BASE)
+    path.mkdir()
+    _seed_reviewed_objects(path)
+    git(path, "config", "user.name", "Policy fixture")
+    git(path, "config", "user.email", "policy@example.invalid")
+    base_tree = _reduced_reviewed_tree(path, BASE)
+    reduced_base = git(path, "commit-tree", base_tree, "-m", "reviewed fixture base")
+    candidate_tree_oid = _reduced_reviewed_tree(path, CANDIDATE)
+    reduced_candidate = git(path, "commit-tree", candidate_tree_oid, "-p", BASE,
+                            "-m", "reviewed fixture candidate")
+    git(path, "replace", BASE, reduced_base)
+    git(path, "replace", CANDIDATE, reduced_candidate)
     git(path, "checkout", "--detach", CANDIDATE)
     git(path, "config", "user.name", "Policy fixture")
     git(path, "config", "user.email", "policy@example.invalid")
@@ -103,6 +140,7 @@ def candidate_tree(path: Path) -> Path:
                     dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
     git(path, "add", *add_paths)
     git(path, "commit", "--allow-empty", "-qm", "checker candidate")
+    _localize_reachable_objects(path)
     return path
 
 
