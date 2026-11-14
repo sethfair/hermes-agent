@@ -190,6 +190,13 @@ def test_owner_silence_budget_matches_kanban_wait_budget(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HOME", str(tmp_path))
     from agent.runtime_session_store import OWNER_SILENCE_BUDGET_S
+    from pathlib import Path
+    import sys
+    import types
+    real_is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: False
+                        if "hermes-update-pull" in str(path) else real_is_file(path))
+    monkeypatch.setitem(sys.modules, "hermes_bootstrap", types.ModuleType("hermes_bootstrap"))
     from hermes_cli.kanban_worker_client import OWNER_WAIT_S
 
     assert OWNER_SILENCE_BUDGET_S == OWNER_WAIT_S
@@ -218,4 +225,141 @@ def test_cancelled_retry_preserves_pending_entry(tmp_path, monkeypatch):
         store._apply("operation", {})
     assert rpc.calls == 1
     assert store.journal["pending"]
+
+
+def test_cancel_during_real_receive_returns_without_waiting(tmp_path):
+    from agent.runtime_session_store import _OwnerLink, WorkerPersistenceError
+    import time
+
+    class Socket:
+        def recv(self):
+            threading.Event().wait(10)
+
+    link = _OwnerLink(Socket())
+    cancel = threading.Event()
+    timer = threading.Timer(0.05, cancel.set)
+    timer.start()
+    started = time.monotonic()
+    with pytest.raises(WorkerPersistenceError, match="worker_cancelled"):
+        link.receive(5, cancel=cancel)
+    timer.cancel()
+    assert time.monotonic() - started < 1
+
+
+def test_cancel_during_backoff_stops_retry_and_preserves_first_attempt(tmp_path, monkeypatch):
+    import time
+    from agent import retry_utils
+    from agent.runtime_session_store import WorkerPersistenceError
+
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *args, **kwargs: 1.0)
+    cancel = threading.Event()
+    calls = []
+
+    class RPC:
+        def __call__(self, method, **params):
+            calls.append(params)
+            if len(calls) == 1:
+                threading.Timer(0.05, cancel.set).start()
+                raise TimeoutError("worker_receipt_timeout")
+            return {"value": "committed"}
+
+    store = make_store(tmp_path, RPC())
+    store.cancel = cancel
+    started = time.monotonic()
+    with pytest.raises(WorkerPersistenceError, match="worker_cancelled"):
+        store._apply("operation", {})
+    assert time.monotonic() - started < 1
+    assert len(calls) == 1
+    assert store.journal["pending"]
+
+
+def test_preset_cancel_still_allows_first_attempt(tmp_path):
+    cancel = threading.Event()
+    cancel.set()
+    calls = []
+
+    def rpc(method, **params):
+        calls.append(params)
+        return {"value": "committed"}
+
+    store = make_store(tmp_path, rpc)
+    store.cancel = cancel
+    assert store._apply("operation", {}) == {"value": "committed"}
+    assert len(calls) == 1
+
+
+def test_real_receipt_handler_commits_one_row_for_retried_lost_ack(tmp_path):
+    from agent.runtime_session_store import RuntimeSessionStore
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s", "cli")
+    epoch = begin_runtime_epoch(db, instance_id="owner")
+    scope = {"epoch": epoch, "execution_id": "worker", "session_id": "s", "generation": 0}
+    register_worker_execution(db, **scope, kind="compute", adoption_secret="private")
+    calls = [0]
+
+    def rpc(method, **params):
+        result = mutate_worker_execution(db, **params)
+        calls[0] += 1
+        if calls[0] == 1:
+            raise TimeoutError("lost_ack")
+        return result
+
+    try:
+        store = RuntimeSessionStore(rpc, scope, tmp_path / "outbox")
+        import agent.runtime_session_store as module
+        old = module.OWNER_SILENCE_BUDGET_S
+        module.OWNER_SILENCE_BUDGET_S = 0
+        try:
+            with pytest.raises(TimeoutError):
+                store._apply("usage.main", {"input_tokens": 1})
+            store._outbox_owner.close()
+            reopened = RuntimeSessionStore(lambda method, **params: mutate_worker_execution(db, **params),
+                                           scope, tmp_path / "outbox")
+        finally:
+            module.OWNER_SILENCE_BUDGET_S = old
+        receipts = db._read_one("SELECT COUNT(*) FROM worker_receipts")
+        assert receipts is not None and receipts[0] == 1
+        session = db.get_session("s")
+        assert session is not None and session["input_tokens"] == 1
+        reopened.close()
+    finally:
+        db.close()
+
+
+def test_cohort_of_five_stores_recover_same_owner(tmp_path):
+    from agent.runtime_session_store import RuntimeSessionStore
+    calls = {}
+
+    def rpc(method, **params):
+        key = params["execution_id"]
+        calls[key] = calls.get(key, 0) + 1
+        if calls[key] == 1:
+            raise TimeoutError("worker_receipt_timeout")
+        return {"value": key}
+
+    stores = [RuntimeSessionStore(rpc, {"execution_id": str(i), "session_id": "s", "epoch": 1,
+                                        "generation": 1}, tmp_path / str(i)) for i in range(5)]
+    try:
+        for i, store in enumerate(stores):
+            assert store._apply("operation", {"payload": i}) == {"value": str(i)}
+            assert store.journal["pending"] == []
+    finally:
+        for store in stores:
+            store.close()
+
+
+def test_worker_cancel_wiring_shares_controls_event(tmp_path):
+    from agent.runtime_session_store import WorkerRPC
+
+    controls_stopped = threading.Event()
+    rpc = WorkerRPC(tmp_path / "home")
+    store = make_store(tmp_path / "store", rpc)
+    store.cancel = controls_stopped
+    rpc.cancel = controls_stopped  # type: ignore[assignment]
+    assert store.cancel is controls_stopped
+    assert rpc.cancel is controls_stopped
+    store.close()
 
