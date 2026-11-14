@@ -67,7 +67,8 @@ async def test_cron_cancel_between_claim_and_execution_registration_stops_the_jo
     monkeypatch.setattr(run, '_profile_runtime_scope', lambda home: nullcontext())
     seen = {}
 
-    def run_job(job, *, extra_prompt, execution_id, cancel_event):
+    def run_job(job, *, extra_prompt, execution_id, cancel_event, prepared_script):
+        assert prepared_script is None
         seen['cancelled_at_start'] = cancel_event.is_set()
         return (False, '', '', 'cancelled')
     monkeypatch.setattr(scheduler, 'run_job', run_job)
@@ -114,7 +115,8 @@ async def test_owner_execution_binds_the_scheduler_cron_identity_inside_run_job(
     monkeypatch.setattr(run, '_profile_runtime_scope', lambda home: nullcontext())
     seen = {}
 
-    def run_job(job, *, extra_prompt, execution_id, cancel_event):
+    def run_job(job, *, extra_prompt, execution_id, cancel_event, prepared_script):
+        assert prepared_script is None
         seen['execution_id'] = execution_id
         seen['identity'] = current_cron_execution()
         return (True, 'doc', 'answer', None)

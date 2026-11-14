@@ -21,6 +21,11 @@ from scripts.code_health.report import (
     summarize_tree,
     verdict,
 )
+from scripts.code_health.model import Finding
+from scripts.frozen_import_policy import (
+    HASHES, PolicyError, capture_sources, exception_reason, git_source_reader,
+    partition_findings, report_exceptions,
+)
 from scripts.code_health.ruff_runner import pinned_version, resolve_ruff
 
 _FOOTER = """
@@ -93,6 +98,10 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
     started = time.monotonic()
     switch_rev = switch_rev or base
     mode = enforcement(repo, switch_rev)
+    reader = git_source_reader(repo, head) if head else None
+    before = capture_sources(repo, reader)
+    if before and mode != "blocking":
+        raise PolicyError("frozen-import acceptance requires blocking health measurement")
     if mode == "off":
         _skipped(f"code health: off (ENFORCEMENT in {_SWITCH_FILE} on {switch_rev[:12]})", as_json)
         return 0
@@ -100,6 +109,7 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
     head_paths = sorted({c.new for c in changes if c.new and in_scope(c.new)})
     base_paths = sorted({c.old for c in changes if c.old and in_scope(c.old)})
     if not head_paths:
+        partition_findings(repo, "health", [], source_reader=reader, before=before, base=base)
         _skipped("code health: no measured files changed", as_json)
         return 0
     # Base files are measured too: a deleted .py still needs ruff on the base side.
@@ -110,11 +120,18 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
     head_m = measurer.measure(head, head_paths)
     findings = compare(base_m, head_m, changes)
     apply_allows(findings, head_m)
+    retained, exceptions = partition_findings(repo, "health", [asdict(f) for f in findings],
+                                              source_reader=reader, before=before, base=base)
+    findings = [Finding(**item) for item in retained]
     blocking, advisory = verdict(findings)
     failed = bool(blocking) and mode == "blocking"
     if as_json:
-        print(json.dumps([asdict(f) for f in findings], indent=2))
+        records = retained + [{**item, "allowed_reason":
+                               f"WRI-2276 frozen-import policy; sha256={HASHES[item['path']]}; "
+                               f"reason={exception_reason(item)}"} for item in exceptions]
+        print(json.dumps(records, indent=2))
         return 1 if failed else 0
+    report_exceptions("health", exceptions, passed=not blocking)
     body = format_findings(findings)
     if body:
         print(body)

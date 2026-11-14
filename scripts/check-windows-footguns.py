@@ -19,8 +19,8 @@ Usage:
     python scripts/check-windows-footguns.py --diff main
 
 Exit status:
-    0 — no Windows footguns found (or all matches suppressed)
-    1 — at least one unsuppressed match
+    0 — no remaining blockers under the reported check policy
+    1 — blocking findings, failed measurement or invalid exception eligibility
 
 Encoding policy: READS pass encoding='utf-8-sig' (Windows tooling —
 PowerShell Set-Content/Out-File, some editors — BOM-prefixes files it
@@ -750,10 +750,7 @@ def _is_write_shaped(line: str) -> bool:
 
 def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footgun]]:
     """Return a list of (line_number, line, footgun) for unsuppressed matches."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+    text = path.read_text(encoding="utf-8", errors="replace")
     matches: list[tuple[int, str, Footgun]] = []
 
     # Track whether we're inside a triple-quoted string (docstring/raw block).
@@ -889,6 +886,49 @@ def print_rules() -> None:
         print()
 
 
+def _scan_findings(roots):
+    findings = []
+    scanned = 0
+    failed = False
+    for path in iter_files(roots):
+        scanned += 1
+        try:
+            matches = scan_file(path, FOOTGUNS)
+        except OSError as exc:
+            print(f"footguns: scan read failed: {path}: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        for lineno, line, fg in matches:
+            findings.append(dict(path=path.relative_to(REPO_ROOT).as_posix(), line=lineno,
+                                 text=line, name=fg.name, message=fg.message, fix=fg.fix))
+    return findings, scanned, failed
+
+
+def _policy_scan(roots):
+    # Direct-script execution puts scripts/, not the repository, on sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.frozen_import_policy import (
+        PolicyError, capture_sources, partition_findings, report_exceptions,
+    )
+    try:
+        before = capture_sources(REPO_ROOT)
+        findings, scanned, failed = _scan_findings(roots)
+        if failed:
+            return 1
+        retained, exceptions = partition_findings(REPO_ROOT, "footguns", findings, before=before)
+    except (PolicyError, OSError) as exc:
+        print(f"footguns policy failed: {exc}", file=sys.stderr)
+        return 1
+    for item in retained:
+        print(f"{item['path']}:{item['line']}: [{item['name']}]\n"
+              f"    {item['text'].strip()}\n    — {item['message']}\n"
+              f"    Fix: {item['fix'].splitlines()[0]}\n")
+    report_exceptions("footguns", exceptions, passed=not retained)
+    print(f"footguns: {len(findings)} raw findings; {len(exceptions)} exceptions; "
+          f"{len(retained)} remaining blockers ({scanned} files scanned)")
+    return 1 if retained else 0
+
+
 def main(argv: list[str]) -> int:
     # Windows terminals default to cp1252, which can't encode the ✓/✗
     # characters used in the output. Reconfigure streams to UTF-8 so the
@@ -932,38 +972,7 @@ def main(argv: list[str]) -> int:
             )
             return 0
 
-    total_matches = 0
-    files_scanned = 0
-    for path in iter_files(roots):
-        files_scanned += 1
-        matches = scan_file(path, FOOTGUNS)
-        for lineno, line, fg in matches:
-            rel = path.relative_to(REPO_ROOT).as_posix()
-            print(f"{rel}:{lineno}: [{fg.name}]")
-            print(f"    {line.strip()}")
-            print(f"    — {fg.message}")
-            print(f"    Fix: {fg.fix.splitlines()[0]}")
-            print()
-            total_matches += 1
-
-    if total_matches:
-        print(
-            f"\n✗ {total_matches} Windows footgun(s) found across "
-            f"{files_scanned} file(s) scanned.",
-            file=sys.stderr,
-        )
-        print(
-            "  If an individual match is a false positive or intentionally "
-            "platform-gated, suppress it with `# windows-footgun: ok` on "
-            "the same line.\n  Run with --list to see all rules.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(
-        f"✓ No Windows footguns found ({files_scanned} file(s) scanned)."
-    )
-    return 0
+    return _policy_scan(roots)
 
 
 if __name__ == "__main__":

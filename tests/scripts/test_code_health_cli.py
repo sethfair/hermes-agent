@@ -31,7 +31,9 @@ _GUARD_SCRIPTS = (
     "scripts/ci/check_lazy_deps_imports.py", "scripts/ci/check_profile_archive_boundary.py",
     "scripts/ci/check_agents_md_size.py", "scripts/ci/check_blob_size.py", "scripts/ci/check_line_endings.py",
 )
-_SUPPORT = ("scripts/ci/profile_scope_patterns.json", "scripts/install_root_lint_baseline.json", "agent/subdirectory_hints.py", *_GUARD_SCRIPTS)
+_SUPPORT = ("scripts/ci/profile_scope_patterns.json", "scripts/install_root_lint_baseline.json",
+            "agent/subdirectory_hints.py", "scripts/frozen_import_policy.py",
+            "scripts/check_frozen_ruff.py", *_GUARD_SCRIPTS)
 # The config guards fail when a tree they scan is missing, so the fixture carries an empty stand-in.
 _SCANNED_TREES = sorted({*check_config_yaml_readers.DEFAULT_TREES, *check_config_yaml_writers.DEFAULT_TREES})
 _LEGACY = "def legacy(x):\n" + "".join(f"    if x == {i}:\n        return {i}\n" for i in range(21))

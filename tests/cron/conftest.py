@@ -94,7 +94,8 @@ def owner_execution_runner():
     from gateway.session_cron import current_execution, execute
     from hermes_state_registry import acquire, release
 
-    def run(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
+    def run(job, *, extra_prompt=None, cancel_event=None, execution_id=None,
+            prepared_script=None):
         from cron.scheduler import _get_hermes_home
 
         db = acquire(_get_hermes_home() / "state.db")
@@ -108,7 +109,8 @@ def owner_execution_runner():
         row = {"admission_id": identity, "request_id": request_id,
                "principal_id": "cron-owner", "owner_epoch": 1, "generation": 1, "payload": {"text": extra_prompt or ""}}
         policy = SimpleNamespace(request_json=json.dumps({
-            "cron_job": job, "extra_prompt": extra_prompt, "request_id": request_id}))
+            "cron_job": job, "extra_prompt": extra_prompt, "request_id": request_id,
+            "prepared_script": prepared_script}))
 
         async def execute_job():
             previous = current_execution()

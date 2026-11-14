@@ -1,0 +1,1753 @@
+"""Proposed recovery observer successor for job 61a6b39fba27.
+
+Legacy native notepad and global ack are read-only migration evidence. Version-2
+local checks use an issued sidecar identity and never establish external proof.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import math
+import os
+import pathlib
+import re
+import sqlite3
+import stat
+import sys
+import tempfile
+import time
+from contextlib import closing
+from contextlib import contextmanager
+from urllib.parse import quote
+from native_status_policy import NATIVE_STATUS_POLICY
+
+JOB_ID = "61a6b39fba27"
+BOARD = "default"
+PROFILE_HOME = pathlib.Path("/home/macpro/.hermes/profiles/rowan")
+NONTERMINAL = {"blocked", "triage", "todo", "ready", "running", "review", "scheduled"}
+MAX_ACK_BYTES = 262144
+MAX_LEDGER_BYTES = 1048576
+MUTABLE_ROOT_FIELDS = ("issue", "status", "phase", "owner", "staging", "cause",
+    "cause_fingerprint", "evidence", "clearing_proof", "action", "disposition",
+    "pickup", "alert_receipt", "gates", "next_checkpoint", "checked_at",
+    "due_at", "unknown", "observed_local_fingerprint", "missing_retained")
+PROVISIONAL_FROZEN = ("unknown", "disposition", "gates", "alert_receipt",
+    "pickup", "clearing_proof", "action_result", "status")
+
+
+class StaleAck(RuntimeError):
+    pass
+
+
+def _reject_symlink_ancestors(path):
+    path = pathlib.Path(path).absolute()
+    if any(part.is_symlink() for part in (path, *path.parents)):
+        raise ValueError("symlinked input path or ancestor")
+    return path
+
+
+def _bytes(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def _digest(value):
+    return hashlib.sha256(_bytes(value)).hexdigest()
+
+
+def attachment_digest(path, expected_size, expected_dir=None):
+    """Bind an attachment to bytes, not merely unchanged path/size metadata."""
+    if not isinstance(expected_size, int) or expected_size < 0 or expected_size > 25 * 1024 * 1024:
+        raise ValueError("attachment size outside bounded observer range")
+    path = _reject_symlink_ancestors(path)
+    if expected_dir is not None and path.parent != _reject_symlink_ancestors(expected_dir):
+        raise ValueError("attachment path outside task attachment directory")
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("attachment is not a regular file")
+        if info.st_size != expected_size:
+            raise StaleAck("attachment size changed before observation")
+        content = stream.read(expected_size + 1)
+        if len(content) != expected_size:
+            raise StaleAck("attachment changed during observation")
+        after = os.fstat(stream.fileno())
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != \
+           (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise StaleAck("attachment changed during observation")
+        return hashlib.sha256(content).hexdigest()
+
+def source_hints(title, body, comments=()):
+    """Only probable source locators. A due full inventory catches omitted sources."""
+    primary = re.findall(r"\bWRI-\d+\b", title or "")
+    if not primary:
+        primary = re.findall(r"\b(?:Linear|issue)\s+(WRI-\d+)\b", body or "", re.I)
+    # Explicit handoff/result lines, not an indiscriminate historical mention scan.
+    lines = [line for text in [body or "", *comments] for line in (text or "").splitlines()
+             if re.search(r"\b(?:source|dependency|result|handoff)\s*[:=]", line, re.I)]
+    remote = set(re.findall(r"\b(?:imac|macpro)/t_[0-9a-f]{8}\b", "\n".join(lines)))
+    return {"linear": sorted(set(primary[:1])), "remote": sorted(remote)}
+
+
+def _validate_ack(value):
+    if not isinstance(value, dict) or value.get("version") != 1 or value.get("board") != BOARD or value.get("job") != JOB_ID:
+        raise ValueError("invalid ack identity/version")
+    if not isinstance(value.get("local"), dict) or not isinstance(value.get("sources"), dict):
+        raise ValueError("invalid ack maps")
+    if not all(isinstance(k, str) and k.startswith("t_") and isinstance(v, str)
+               for k, v in value["local"].items()):
+        raise ValueError("invalid local fingerprints")
+    for root, groups in value["sources"].items():
+        if not isinstance(root, str) or not root.startswith("t_") or not isinstance(groups, dict):
+            raise ValueError("invalid source root")
+        for kind, sources in groups.items():
+            if kind == "inventory":
+                if not isinstance(sources, dict) or not all(k in sources for k in
+                    ("checked_at", "next_due", "local_fingerprint", "receipt")):
+                    raise ValueError("invalid inventory receipt")
+                checked, deadline = sources["checked_at"], sources["next_due"]
+                if not all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in (checked, deadline)) or not checked <= deadline <= checked + 900:
+                    raise ValueError("invalid inventory deadline")
+                if not isinstance(sources["local_fingerprint"], str) or not sources["local_fingerprint"] or not isinstance(sources["receipt"], str) or not sources["receipt"]:
+                    raise ValueError("missing inventory proof")
+                continue
+            if kind == "remote_inventory_verified":
+                if not isinstance(sources, bool):
+                    raise ValueError("invalid remote inventory verification")
+                continue
+            if kind not in ("linear", "remote") or not isinstance(sources, dict):
+                raise ValueError("invalid source group")
+            for key, state in sources.items():
+                if not isinstance(key, str) or not key or not isinstance(state, dict):
+                    raise ValueError("invalid source")
+                if "next_due" not in state or not isinstance(state["next_due"], (int, float)) or not math.isfinite(state["next_due"]):
+                    raise ValueError("missing source deadline")
+                checked = state.get("checked_at")
+                if checked is not None and (not isinstance(checked, (int, float)) or not math.isfinite(checked) or
+                    not checked <= state["next_due"] <= checked + 900):
+                    raise ValueError("unbounded source deadline")
+    if len(_bytes(value)) > MAX_ACK_BYTES:
+        raise ValueError("ack too large")
+
+
+def _ack_path(directory):
+    directory = pathlib.Path(directory)
+    if directory.is_symlink() or directory.parent.is_symlink():
+        raise ValueError("symlinked ack directory")
+    path = directory / "ack.json"
+    if path.is_symlink():
+        raise ValueError("symlinked ack file")
+    return path
+
+
+def read_ack(directory):
+    path = _ack_path(directory)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, "missing"
+    with os.fdopen(fd, "rb") as stream:
+        raw = stream.read(MAX_ACK_BYTES + 1)
+    if len(raw) > MAX_ACK_BYTES:
+        raise ValueError("ack too large")
+    value = json.loads(raw)
+    _validate_ack(value)
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def _ledger_path(directory):
+    directory = pathlib.Path(directory)
+    if directory.is_symlink() or directory.parent.is_symlink():
+        raise ValueError("symlinked ledger directory")
+    path = directory / "ledger.json"
+    if path.is_symlink():
+        raise ValueError("symlinked ledger file")
+    return path
+
+
+def _validate_ledger(value):
+    if not isinstance(value, dict) or value.get("version") not in (1, 2) or value.get("board") != BOARD or value.get("job") != JOB_ID:
+        raise ValueError("invalid ledger identity")
+    raw, roots = value.get("legacy_raw"), value.get("roots")
+    if not isinstance(raw, dict) or not isinstance(roots, dict):
+        raise ValueError("invalid ledger maps")
+    if len(_bytes(value)) > MAX_LEDGER_BYTES:
+        raise ValueError("ledger too large")
+    for key, item in raw.items():
+        if not (key == "recovery_index" or key == "recovery_cursor" or key.startswith("recovery_root_t_")):
+            raise ValueError("invalid legacy key")
+        if not isinstance(item, dict) or not isinstance(item.get("value_utf8"), str) or not isinstance(item.get("updated_at"), str):
+            raise ValueError("invalid legacy value")
+        if hashlib.sha256(item["value_utf8"].encode("utf-8")).hexdigest() != item.get("sha256"):
+            raise ValueError("legacy raw hash mismatch")
+    if value["version"] == 2:
+        allowed_top = {"version", "board", "job", "legacy_raw", "roots",
+                       "legacy_cursor_absent", "legacy_ack_sha", "legacy_v1_ledger",
+                       "legacy_v1_sha", "native_revisions", "missing_retained"}
+        if not set(value).issubset(allowed_top):
+            raise ValueError("untrusted v2 ledger top-level claim")
+        if ("legacy_cursor_absent" in value or "recovery_cursor" in raw) and \
+           (type(value.get("legacy_cursor_absent")) is not bool or
+            value["legacy_cursor_absent"] != ("recovery_cursor" not in raw)):
+            raise ValueError("legacy cursor presence disagrees with immutable raw snapshot")
+        if "legacy_v1_ledger" in value:
+            predecessor = value["legacy_v1_ledger"]
+            if not isinstance(predecessor, dict) or predecessor.get("version") != 1 or \
+               value.get("legacy_v1_sha") != _digest(predecessor):
+                raise ValueError("invalid archived v1 ledger")
+        revisions = value.get("native_revisions", {})
+        if not isinstance(revisions, dict):
+            raise ValueError("invalid native revision map")
+        for key, history in revisions.items():
+            if not isinstance(history, list) or not history:
+                raise ValueError("invalid native revision history")
+            prior_sha = raw.get(key, {}).get("sha256", "absent")
+            for revision in history:
+                payload = revision.get("value_utf8_or_null")
+                current_sha = hashlib.sha256(payload.encode()).hexdigest() if isinstance(payload, str) else "absent"
+                if revision.get("key") != key or revision.get("sha256_or_absent") != current_sha or \
+                   revision.get("prior_revision_sha") != prior_sha or \
+                   revision.get("present") != isinstance(payload, str):
+                    raise ValueError("broken native revision chain")
+                prior_sha = current_sha
+    for root, item in roots.items():
+        if not isinstance(root, str) or not root.startswith("t_") or not isinstance(item, dict):
+            raise ValueError("invalid ledger root")
+        if value["version"] == 2:
+            if "remote_inventory_verified" in item or "all_sources_checked" in item:
+                raise ValueError("untrusted global inventory claim")
+            allowed_root = set(MUTABLE_ROOT_FIELDS) | {
+                "legacy_key", "legacy_value", "legacy_updated_at", "legacy_sha256",
+                "sources", "source_history", "receipt", "receipt_history",
+                "action_result", "action_result_history", "mutation_history"}
+            if not set(item).issubset(allowed_root):
+                raise ValueError("untrusted v2 ledger root claim")
+            if item.get("receipt") is not None:
+                raise ValueError("v2 effect receipt requires reviewed native admission reader")
+            if item.get("unknown") is not True:
+                raise ValueError("v2 root remains UNKNOWN until a reviewed positive reader exists")
+            groups = item.get("sources", {})
+            if not isinstance(groups, dict) or set(groups) != {"external_sources"}:
+                raise ValueError("v2 external source map must not carry legacy positive claims")
+            sources = groups["external_sources"]
+            allowed_source_fields = {"principal", "route", "locator", "page_completion",
+                "revision", "comment_event_ids", "checked_at", "next_due", "state",
+                "reason", "read_receipt_id", "evidence_locator"}
+            if not isinstance(sources, dict) or any(
+                not isinstance(key, str) or not key.startswith(("linear:", "remote:", "legacy-v1:")) or
+                not isinstance(source, dict) or not set(source).issubset(allowed_source_fields) or
+                source.get("state") not in
+                ("UNKNOWN", "denied", "partial", "stale") or
+                any(source.get(field) is not None for field in
+                    ("revision", "checked_at", "page_completion", "comment_event_ids",
+                     "read_receipt_id", "evidence_locator")) or
+                source.get("next_due", 0) not in (None, 0)
+                for key, source in sources.items()):
+                raise ValueError("untrusted external source claim")
+        if item.get("legacy_key") in raw:
+            recorded = raw[item["legacy_key"]]
+            if (item.get("legacy_value") != recorded["value_utf8"] or
+                    item.get("legacy_sha256") != recorded["sha256"] or
+                    item.get("legacy_updated_at") != recorded["updated_at"]):
+                raise ValueError("legacy root bytes/hash/timestamp mismatch")
+        receipt = item.get("receipt")
+        if receipt is not None:
+            if not isinstance(receipt, dict) or receipt.get("root_id") != root:
+                raise ValueError("invalid ledger receipt root")
+            proof = {key: val for key, val in receipt.items() if key != "receipt_id"}
+            if receipt.get("receipt_id") != _digest(proof):
+                raise ValueError("invalid ledger receipt hash")
+            if not isinstance(receipt.get("consumed_local_fingerprint"), str) or not isinstance(receipt.get("checked_sources"), dict):
+                raise ValueError("invalid ledger receipt evidence")
+
+
+def read_ledger(directory):
+    path = _ledger_path(directory)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, "missing"
+    with os.fdopen(fd, "rb") as stream:
+        raw = stream.read(MAX_LEDGER_BYTES + 1)
+    if len(raw) > MAX_LEDGER_BYTES:
+        raise ValueError("ledger too large")
+    value = json.loads(raw)
+    _validate_ledger(value)
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def read_local_observation(directory):
+    path = _reject_symlink_ancestors(pathlib.Path(directory) / "local-observation-v1.json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, "missing"
+    with os.fdopen(fd, "rb") as stream:
+        raw = stream.read(MAX_ACK_BYTES + 1)
+    if len(raw) > MAX_ACK_BYTES:
+        raise ValueError("local observation too large")
+    value = json.loads(raw)
+    if (value.get("version"), value.get("job_id"), value.get("board_id")) != (1, JOB_ID, BOARD) or \
+       not isinstance(value.get("pending"), dict) or not isinstance(value.get("roots"), dict):
+        raise ValueError("invalid local observation identity")
+    admission = value.get("current_issued", {})
+    if (not isinstance(admission, dict) or len(admission) > 10000 or
+        type(value.get("admission_generation", 0)) is not int or
+        value.get("admission_generation", 0) < 0 or
+        value.get("admission_state", "invalidating") not in ("invalidating", "committed") or
+        any(not re.fullmatch(r"t_[0-9a-f]{8}", root) or
+            not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{64}", ident)
+            for root, ident in admission.items())):
+        raise ValueError("invalid local admission")
+    for root, pending in value["pending"].items():
+        if (not re.fullmatch(r"t_[0-9a-f]{8}", root) or not isinstance(pending, dict) or
+            not isinstance(pending.get("observation_id"), str) or
+            not re.fullmatch(r"[0-9a-f]{64}", pending["observation_id"])):
+            raise ValueError("invalid pending observation")
+    if admission and (value.get("admission_state") != "committed" or any(
+            value["pending"].get(root, {}).get("observation_id") != ident
+            for root, ident in admission.items())):
+        raise ValueError("admission disagrees with pending")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+@contextmanager
+def _observation_lock(directory):
+    directory = _reject_symlink_ancestors(directory)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with closing(os.fdopen(os.open(directory / "ack.lock", os.O_CREAT | os.O_RDWR |
+                                   os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "a+b")) as shared:
+        fcntl.flock(shared, fcntl.LOCK_EX)
+        with closing(os.fdopen(os.open(directory / "local-observation.lock", os.O_CREAT |
+                                       os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "a+b")) as local:
+            fcntl.flock(local, fcntl.LOCK_EX)
+            yield
+
+
+def _replace_local(directory, value):
+    data = _bytes(value)
+    if len(data) > MAX_ACK_BYTES:
+        raise ValueError("local observation too large")
+    fd, temp = tempfile.mkstemp(prefix=".local-observation-", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, pathlib.Path(directory) / "local-observation-v1.json")
+        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+    reread, sha = read_local_observation(directory)
+    if reread != value or sha != hashlib.sha256(data).hexdigest():
+        raise RuntimeError("local observation readback mismatch")
+    return sha
+
+
+def observe_local(directory, expected_ledger_sha, snapshot, roots):
+    """Issue pending identities from a trusted board snapshot, never a caller tuple."""
+    with _observation_lock(directory):
+        if read_ledger(directory)[1] != expected_ledger_sha:
+            raise StaleAck("ledger changed before local observation")
+        prior, _ = read_local_observation(directory)
+        prior = prior or {"version":1,"job_id":JOB_ID,"board_id":BOARD,
+                          "ledger_sha":expected_ledger_sha,"pending":{},"roots":{}}
+        if set(roots) & set(prior.get("current_issued", {})):
+            raise StaleAck("historical issuance cannot overwrite current admission")
+        observation = snapshot(set(roots))
+        fingerprints, events = observation[:2]
+        attachments = observation[2] if len(observation) > 2 else set()
+        issued = {}
+        for root in sorted(roots):
+            if root not in fingerprints or root not in events:
+                raise StaleAck("missing local observation root")
+            observed_at = time.time()
+            event_ids = events[root]
+            fingerprint = fingerprints[root]
+            ident = _digest((JOB_ID, BOARD, root, fingerprint, event_ids, observed_at))
+            prior["pending"][root] = {"fingerprint":fingerprint, "event_ids":event_ids,
+                                      "observed_at":observed_at, "observation_id":ident,
+                                      "attachment_bearing":root in attachments}
+            issued[root] = ident
+        prior["ledger_sha"] = expected_ledger_sha
+        return _replace_local(directory, prior), issued
+
+def begin_native_prerun(directory):
+    """Revoke prior admission before any native preflight can fail."""
+    with _observation_lock(directory):
+        prior, _ = read_local_observation(directory)
+        if prior is None:
+            prior = {"version":1,"job_id":JOB_ID,"board_id":BOARD,
+                     "ledger_sha":"missing","pending":{},"roots":{}}
+        prior["current_issued"] = {}
+        prior["admission_state"] = "invalidating"
+        prior["admission_generation"] = prior.get("admission_generation", 0) + 1
+        return _replace_local(directory, prior)
+
+def commit_native_prerun(directory, expected_ledger_sha, snapshot, roots):
+    """Publish a complete (possibly empty) admission under the existing lock order."""
+    with _observation_lock(directory):
+        prior, _ = read_local_observation(directory)
+        if prior is None or prior.get("admission_state") != "invalidating":
+            raise StaleAck("native admission has not been invalidated")
+        if read_ledger(directory)[1] != expected_ledger_sha:
+            raise StaleAck("ledger changed before native issuance")
+        fingerprints, events, attachments = snapshot(set(roots))
+        issued = {}
+        for root in sorted(roots):
+            if not re.fullmatch(r"t_[0-9a-f]{8}", root) or root not in fingerprints or root not in events:
+                raise StaleAck("missing local observation root")
+            observed_at = time.time()
+            ident = _digest((JOB_ID, BOARD, prior["admission_generation"],
+                             root, fingerprints[root], events[root], observed_at))
+            prior["pending"][root] = {"fingerprint":fingerprints[root],
+                "event_ids":events[root], "observed_at":observed_at,
+                "observation_id":ident, "attachment_bearing":root in attachments}
+            issued[root] = ident
+        prior["ledger_sha"] = expected_ledger_sha
+        prior["current_issued"] = issued
+        prior["admission_state"] = "committed"
+        try:
+            return _replace_local(directory, prior), issued
+        except Exception:
+            # A failed fsync/readback may have occurred AFTER os.replace. Revoke
+            # any possibly visible admission before propagating scheduler failure.
+            current, _ = read_local_observation(directory)
+            if current is not None and current.get("admission_state") == "committed":
+                current["current_issued"] = {}
+                current["admission_state"] = "invalidating"
+                _replace_local(directory, current)
+            raise
+
+
+def local_check(directory, selection, expected_sidecar_sha, expected_ledger_sha, snapshot):
+    """Accept only issued identities still identical at the final board snapshot."""
+    with _observation_lock(directory):
+        prior, actual = read_local_observation(directory)
+        if actual != expected_sidecar_sha or prior is None:
+            raise StaleAck("local pending observation unavailable or changed")
+        ledger, ledger_sha = read_ledger(directory)
+        if ledger_sha != expected_ledger_sha or prior["ledger_sha"] != ledger_sha:
+            raise StaleAck("ledger changed before local check")
+        if not isinstance(selection, dict) or not selection or len(selection) > 10000 or \
+           prior.get("admission_state") != "committed" or any(
+            not isinstance(root, str) or not re.fullmatch(r"t_[0-9a-f]{8}", root) or
+            not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{64}", ident) or
+            prior.get("current_issued", {}).get(root) != ident or
+            prior["pending"].get(root, {}).get("observation_id") != ident
+            for root, ident in selection.items()):
+            raise ValueError("selection is not a current issued observation")
+        observation = snapshot(set(selection))
+        fingerprints, events = observation[:2]
+        attachments = observation[2] if len(observation) > 2 else set()
+        for root in selection:
+            if root in attachments or prior["pending"][root].get("attachment_bearing"):
+                raise StaleAck("attachment-bearing root stays UNKNOWN until stable content boundary")
+            pending = prior["pending"][root]
+            if (fingerprints.get(root), events.get(root)) != (pending["fingerprint"], pending["event_ids"]):
+                raise StaleAck(f"new local evidence on {root}")
+            effect = (ledger or {}).get("roots", {}).get(root, {}).get("receipt")
+            record = {"local_fingerprint":pending["fingerprint"],
+                      "consumed_event_ids":pending["event_ids"],
+                      "local_observed_at":pending["observed_at"],
+                      "local_observation_id":pending["observation_id"],
+                      "ledger_effect_receipt_id_or_null":effect.get("receipt_id") if effect else None}
+            record["local_cursor_sha"] = _digest(record)
+            prior["roots"][root] = record
+            del prior["pending"][root]
+            del prior["current_issued"][root]
+        return _replace_local(directory, prior)
+
+
+def select_local(directory, board, expected_sidecar_sha, expected_ledger_sha,
+                 targets=None, limit=1, output_dir=None):
+    """Offer only committed current, unconsumed board observations; never ack."""
+    for digest in (expected_sidecar_sha, expected_ledger_sha):
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("expected complete SHA256 digest")
+    if targets is not None and (not isinstance(targets, list) or not targets or
+            len(targets) > 10000 or len(set(map(str, targets))) != len(targets) or
+            any(not isinstance(root, str) or not re.fullmatch(r"t_[0-9a-f]{8}", root)
+                for root in targets)):
+        raise ValueError("invalid explicit targets")
+    if type(limit) is not int or not 1 <= limit <= 10000:
+        raise ValueError("invalid selection limit")
+    result = {"expected_sidecar_sha": expected_sidecar_sha,
+              "expected_ledger_sha": expected_ledger_sha, "root_ids": [], "reasons": {}}
+    with _observation_lock(directory):
+        sidecar, sidecar_sha = read_local_observation(directory)
+        ledger, ledger_sha = read_ledger(directory)
+        if sidecar_sha != expected_sidecar_sha or ledger_sha != expected_ledger_sha:
+            raise StaleAck("selection input changed")
+        if sidecar is None or ledger is None or ledger.get("version") != 2 or \
+           sidecar.get("ledger_sha") != ledger_sha or sidecar.get("admission_state") != "committed":
+            return dict(result, status="stale", reasons={"admission":"not committed or ledger unavailable"})
+        issued = sidecar["current_issued"]
+        candidates = {}
+        for root, ident in issued.items():
+            pending = sidecar["pending"].get(root)
+            consumed = sidecar["roots"].get(root)
+            if not pending or pending.get("observation_id") != ident:
+                result["reasons"][root] = "issuance mismatch"
+            elif pending.get("attachment_bearing"):
+                result["reasons"][root] = "attachment bearing"
+            elif consumed and (consumed.get("local_fingerprint"), consumed.get("consumed_event_ids")) == \
+                    (pending.get("fingerprint"), pending.get("event_ids")):
+                result["reasons"][root] = "already consumed"
+            else:
+                candidates[root] = pending
+        if candidates:
+            fingerprints, events, attachments, missing = board_snapshot(
+                board, set(candidates), include_events=True, allow_missing=True,
+                return_missing=True)
+            for root, pending in list(candidates.items()):
+                if root in missing:
+                    result["reasons"][root] = "missing retained board card"
+                elif root in attachments:
+                    result["reasons"][root] = "new attachment"
+                elif (fingerprints.get(root), events.get(root)) != \
+                     (pending.get("fingerprint"), pending.get("event_ids")):
+                    result["reasons"][root] = "new local evidence"
+                else:
+                    continue
+                del candidates[root]
+        if targets is not None:
+            for root in targets:
+                if root not in candidates:
+                    result["reasons"].setdefault(root, "not in current issuance")
+            if any(root not in candidates for root in targets):
+                raise StaleAck("explicit target ineligible: " + json.dumps(result["reasons"], sort_keys=True))
+            selected = targets
+        else:
+            now = time.time()
+            def priority(root):
+                due = ledger["roots"].get(root, {}).get("due_at")
+                due = due if isinstance(due, (int, float)) and not isinstance(due, bool) \
+                    and math.isfinite(due) and due <= now else None
+                return (0, due, root) if due is not None else \
+                    (1, candidates[root].get("observed_at", float("inf")), root)
+            selected = sorted(candidates, key=priority)[:limit]
+        if not selected:
+            return dict(result, status="none")
+        output_dir = _reject_symlink_ancestors(output_dir or PROFILE_HOME / "cache" / "scratch")
+        if not output_dir.is_dir() or output_dir.stat().st_mode & 0o077:
+            raise ValueError("selection scratch directory must be private")
+        data = _bytes({root: issued[root] for root in selected})
+        fd, name = tempfile.mkstemp(prefix="wri-2276-selection-", suffix=".json", dir=output_dir)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                fd = -1
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            dirfd = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+            readfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(readfd, "rb") as stream:
+                reread = stream.read(MAX_ACK_BYTES + 1)
+            if reread != data or parse_selection(reread) != {root: issued[root] for root in selected}:
+                raise RuntimeError("selection artifact readback mismatch")
+            return dict(result, status="selected", selection_path=name,
+                        selection_sha256=hashlib.sha256(reread).hexdigest(), root_ids=selected)
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            os.unlink(name)
+            raise
+
+
+def commit_ledger(directory, candidate, expected_sha, _lock_held=False, _migration=False):
+    _validate_ledger(candidate)
+    directory = pathlib.Path(directory)
+    if directory.is_symlink() or directory.parent.is_symlink():
+        raise ValueError("symlinked ledger directory")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = _ledger_path(directory)
+    lock = directory / "ack.lock"  # Same lock protects ledger-before-ack admission.
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "a+b") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        if not _lock_held:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        prior, current = read_ledger(directory)
+        if current != expected_sha:
+            raise StaleAck(f"ledger changed: expected {expected_sha}, found {current}")
+        if prior is None and candidate["version"] == 2 and (not _migration or candidate.get("native_revisions")):
+            raise ValueError("v2 creation requires trusted native migration, not ledger candidate")
+        if prior is not None and prior["version"] == 1 and candidate["version"] == 2 and _migration:
+            if candidate.get("legacy_v1_ledger") != prior or candidate.get("legacy_v1_sha") != current or \
+               not set(prior["roots"]).issubset(candidate["roots"]):
+                raise ValueError("v1 migration must archive entire predecessor and retain roots")
+            for root, old_root in prior["roots"].items():
+                expected_ids = {name if name.startswith(("linear:", "remote:")) else "legacy-v1:" + name.encode().hex()
+                                for name in (old_root.get("sources") or {})}
+                actual_ids = set(candidate["roots"][root]["sources"]["external_sources"])
+                if not expected_ids.issubset(actual_ids):
+                    raise ValueError("v1 migration lost source IDs")
+            # Full immutable predecessor remains in candidate; the current native
+            # raw snapshot is permitted to differ and is independently reread.
+            prior = None
+        if prior:
+            if prior["version"] == 2:
+                if candidate.get("legacy_raw") != prior["legacy_raw"]:
+                    raise ValueError("legacy raw is immutable after v2 migration")
+                if candidate.get("legacy_cursor_absent") != prior.get("legacy_cursor_absent") or \
+                   ("legacy_cursor_absent" in candidate) != ("legacy_cursor_absent" in prior):
+                    raise ValueError("legacy cursor presence is immutable after v2 migration")
+                if any(candidate["roots"][root].get("receipt") != old.get("receipt")
+                       for root, old in prior["roots"].items()):
+                    raise ValueError("v2 effect receipt is immutable until native effect reader exists")
+                if candidate.get("legacy_v1_ledger") != prior.get("legacy_v1_ledger") or \
+                   candidate.get("legacy_v1_sha") != prior.get("legacy_v1_sha") or \
+                   candidate.get("legacy_ack_sha") != prior.get("legacy_ack_sha"):
+                    raise ValueError("archived v1 ledger is immutable")
+                if not _lock_held and candidate.get("native_revisions", {}) != prior.get("native_revisions", {}):
+                    raise ValueError("native revisions require trusted native read, not ledger candidate")
+                for key, history in prior.get("native_revisions", {}).items():
+                    updated = candidate.get("native_revisions", {}).get(key, [])
+                    if updated[:len(history)] != history:
+                        raise ValueError("cannot discard native revision history")
+            if prior["version"] != candidate["version"]:
+                raise ValueError("version migration requires a separate reviewed migration route")
+            if not set(prior["roots"]).issubset(candidate["roots"]) or not set(prior["legacy_raw"]).issubset(candidate["legacy_raw"]):
+                raise ValueError("ledger cannot discard historical roots or raw keys")
+            if any(prior["legacy_raw"][key] != candidate["legacy_raw"][key] for key in prior["legacy_raw"]):
+                raise ValueError("ledger cannot rewrite historical raw keys")
+            for root, old in prior["roots"].items():
+                new = candidate["roots"][root]
+                if prior["version"] == 2 and any(old.get(field) != new.get(field)
+                                                  for field in PROVISIONAL_FROZEN):
+                    raise ValueError("v2 provisional root cannot self-attest clearing or receipt")
+                for field in ("legacy_key", "legacy_value", "legacy_updated_at"):
+                    if old.get(field) != new.get(field):
+                        raise ValueError("ledger cannot discard historical root evidence")
+                old_receipt, new_receipt = old.get("receipt"), new.get("receipt")
+                old_history = old.get("receipt_history", [])
+                new_history = new.get("receipt_history", [])
+                if old_receipt is not None and old_receipt != new_receipt and (not isinstance(new_history, list) or
+                        new_history != [*old_history, old_receipt]):
+                    raise ValueError("ledger cannot replace receipt without immutable history")
+                if prior["version"] == 2 and new_history != old_history:
+                    raise ValueError("v2 receipt history requires reviewed native effect reader")
+                if not isinstance(new_history, list) or new_history[:len(old_history)] != old_history:
+                    raise ValueError("ledger cannot discard receipt history")
+                old_effect, new_effect = old.get("action_result"), new.get("action_result")
+                old_effect_history = old.get("action_result_history", [])
+                new_effect_history = new.get("action_result_history", [])
+                if (not isinstance(old_effect_history, list) or not isinstance(new_effect_history, list) or
+                        new_effect_history != [*old_effect_history, *([old_effect] if old_effect is not None and old_effect != new_effect else [])]):
+                    raise ValueError("ledger cannot rewrite action result without immutable history")
+                old_sources, new_sources = old.get("sources") or {}, new.get("sources") or {}
+                if not set(old_sources).issubset(new_sources):
+                    raise ValueError("ledger cannot silently discard sources")
+                if prior["version"] == 2:
+                    old_external = old_sources.get("external_sources", {})
+                    new_external = new_sources.get("external_sources", {})
+                    if not set(old_external).issubset(new_external):
+                        raise ValueError("ledger cannot discard external IDs")
+                    if any(new_external[k].get("revision") is not None or
+                           new_external[k].get("checked_at") is not None
+                           for k in new_external):
+                        raise ValueError("untrusted external refresh")
+                old_source_history = old.get("source_history", [])
+                new_source_history = new.get("source_history", [])
+                changed_sources = [{"source": key, "previous": old_sources[key]}
+                                   for key in sorted(old_sources)
+                                   if old_sources[key] != new_sources[key]]
+                if prior["version"] == 2:
+                    # Retain the previous full external entry, including unknown fields.
+                    changed_sources = [{"source": key, "previous": old_external[key]}
+                                       for key in sorted(old_external)
+                                       if old_external[key] != new_external[key]]
+                if not isinstance(new_source_history, list) or new_source_history != [*old_source_history, *changed_sources]:
+                    raise ValueError("ledger cannot rewrite source evidence without immutable history")
+                changes = [{"field": field, "previous": old.get(field), "new": new.get(field)}
+                           for field in MUTABLE_ROOT_FIELDS if old.get(field) != new.get(field)]
+                if prior["version"] == 2 and old_external != new_external:
+                    changes.append({"field":"sources.external_sources", "previous":old_external,
+                                    "new":new_external})
+                old_mutations = old.get("mutation_history", [])
+                new_mutations = new.get("mutation_history", [])
+                if not isinstance(old_mutations, list) or not isinstance(new_mutations, list) or \
+                   new_mutations[:len(old_mutations)] != old_mutations:
+                    raise ValueError("ledger cannot discard mutation history")
+                additions = new_mutations[len(old_mutations):]
+                if changes:
+                    if len(additions) != 1 or not isinstance(additions[0], dict) or \
+                       additions[0].get("changes") != changes or \
+                       not isinstance(additions[0].get("actor"), str) or not additions[0]["actor"] or \
+                       not isinstance(additions[0].get("evidence_locator"), str) or not additions[0]["evidence_locator"]:
+                        raise ValueError("ledger mutation needs exact changes, actor and evidence locator")
+                elif additions:
+                    raise ValueError("ledger mutation history has no corresponding change")
+            if prior["version"] == 2:
+                for root in set(candidate["roots"]) - set(prior["roots"]):
+                    new_root = candidate["roots"][root]
+                    if any(new_root.get(field) for field in
+                           ("receipt_history", "action_result_history", "source_history", "mutation_history")):
+                        raise ValueError("new provisional root cannot claim prior history")
+                    if any(new_root.get(field) is not None
+                           for field in PROVISIONAL_FROZEN if field != "unknown"):
+                        raise ValueError("new provisional root cannot claim positive evidence")
+        return _replace_ledger(directory, candidate)
+
+
+def _replace_ledger(directory, candidate):
+    """Shared replacement; caller holds ack.lock and validates preservation first."""
+    path = _ledger_path(directory)
+    data = _bytes(candidate)
+    fd, temp = tempfile.mkstemp(prefix=".ledger-", dir=directory)
+    replaced = False
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+        replaced = True
+        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    except OSError as exc:
+        if replaced:
+            try:
+                _, observed = read_ledger(directory)
+            except Exception as read_exc:
+                observed = f"unreadable:{type(read_exc).__name__}"
+            raise RuntimeError(f"ambiguous ledger replace; readback={observed}; directory durability unconfirmed") from exc
+        raise
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+    reread, digest = read_ledger(directory)
+    if reread != candidate or digest != hashlib.sha256(data).hexdigest():
+        raise RuntimeError("ledger readback mismatch")
+    return digest
+
+
+def _status_board_identity(board, policy):
+    path = _reject_symlink_ancestors(board)
+    info = path.stat()
+    if (str(path.resolve()), info.st_dev, info.st_ino) != (
+            policy['board_path'], policy['device'], policy['inode']):
+        raise StaleAck('board-identity-mismatch')
+    return {'path':str(path), 'device':info.st_dev, 'inode':info.st_ino}
+
+
+def _status_source(conn, policy):
+    """Explicit native rows from the snapshot opened after writer reservation."""
+    event_columns = ['id','task_id','kind','payload','created_at','run_id']
+    if set(row[1] for row in conn.execute('PRAGMA table_info(task_events)')) != set(event_columns) or \
+       set(row[1] for row in conn.execute('PRAGMA table_info(task_runs)')) != set(policy['run_columns']):
+        raise StaleAck('native-schema-mismatch')
+    events = [dict(row) for row in conn.execute(
+        'SELECT id,task_id,kind,payload,created_at,run_id FROM task_events WHERE task_id=? ORDER BY id',
+        (policy['root'],))]
+    actual = {str(row['id']):_digest(row) for row in events}
+    missing = sorted(set(policy['event_rows']) - set(actual), key=int)
+    added = sorted(set(actual) - set(policy['event_rows']), key=int)
+    changed = sorted(key for key in set(actual) & set(policy['event_rows'])
+                     if actual[key] != policy['event_rows'][key])
+    errors = []
+    if missing:
+        errors.append('native-history-incomplete missing=' + ','.join(missing))
+        if not added and not changed:
+            errors.append('pruning-compatible')
+    if added or changed or (not missing and _digest(events) != policy['events_sha']):
+        errors.append('native-revision-changed added=' + ','.join(added) + ' changed=' + ','.join(changed))
+    if time.time() >= policy['expires_at']:
+        errors.append('policy-window-expired')
+    if errors:
+        raise StaleAck('; '.join(errors))
+    task = conn.execute('SELECT id,status FROM tasks WHERE id=?',(policy['root'],)).fetchone()
+    columns = ','.join('"' + key + '"' for key in policy['run_columns'])
+    run = conn.execute('SELECT ' + columns + ' FROM task_runs WHERE id=?',(policy['run'],)).fetchone()
+    by_id = {row['id']:row for row in events}
+    completion, archive = by_id.get(policy['completion']), by_id.get(policy['archive'])
+    if task is None or task['status'] != policy['new'] or run is None or \
+       dict(run).get('task_id') != policy['root'] or \
+       dict(run).get('status') != 'done' or dict(run).get('outcome') != 'completed' or \
+       _digest(dict(run)) != policy['run_sha'] or \
+       completion is None or archive is None or \
+       completion['kind'] != 'completed' or completion['run_id'] != policy['run'] or \
+       archive['kind'] != 'archived' or completion['id'] >= archive['id'] or \
+       completion['created_at'] > archive['created_at']:
+        raise StaleAck('native-task-run-mismatch')
+    if conn.execute('SELECT COUNT(*) FROM task_attachments WHERE task_id=?',(policy['root'],)).fetchone()[0]:
+        raise StaleAck('native-attachments-present')
+    return events
+
+
+def reconcile_native_status(directory, board_path, expected_ledger_sha):
+    """Observe the fixed archival, without external proof or scheduler admission."""
+    policy = NATIVE_STATUS_POLICY
+    directory = _reject_symlink_ancestors(directory)
+    identity = _status_board_identity(board_path, policy)
+    # Existing fence holds ack.lock then BEGIN IMMEDIATE, with no database DML.
+    with _cutover_source_lock(directory, board_path):
+        _status_board_identity(board_path, policy)  # stat only while SQLite locks are held
+        uri = 'file:' + quote(str(board_path)) + '?mode=ro'
+        with closing(sqlite3.connect(uri, uri=True, timeout=15)) as source:
+            source.row_factory = sqlite3.Row
+            source.execute('PRAGMA query_only=ON')
+            source.execute('BEGIN')
+            events = _status_source(source, policy)
+            prior, current = read_ledger(directory)
+            if prior is None or prior['version'] != 2 or policy['root'] not in prior['roots']:
+                raise StaleAck('native-status-needs-bound-v2-root')
+            root = prior['roots'][policy['root']]
+            provenance = {'actor':'native-status-observer', 'evidence_locator':policy['evidence_locator'],
+                'policy_sha':_digest(policy), 'board_identity':identity, 'task_id':policy['root'],
+                'event_sha':policy['events_sha'], 'event_ids':[row['id'] for row in events],
+                'completion_event':policy['completion'], 'archive_event':policy['archive'],
+                'run_id':policy['run'], 'run_sha':policy['run_sha'],
+                'historical_plan_sha':policy['historical_plan_sha'], 'expected_prior_sha':policy['prior_sha'],
+                'changes':[{'field':'status','previous':policy['previous'],'new':policy['new']}]}
+            history = root.get('mutation_history', [])
+            if root.get('status') == policy['new'] and history:
+                last = history[-1]
+                stamp = last.get('observed_at') if isinstance(last,dict) else None
+                if isinstance(stamp,(int,float)) and not isinstance(stamp,bool) and \
+                   math.isfinite(stamp) and stamp < policy['expires_at'] and \
+                   last == dict(provenance, observed_at=stamp):
+                    restored = json.loads(json.dumps(prior))
+                    restored['roots'][policy['root']]['status'] = policy['previous']
+                    restored['roots'][policy['root']]['mutation_history'].pop()
+                    if _digest(restored) == policy['prior_sha']:
+                        _status_board_identity(board_path, policy)
+                        if time.time() >= policy['expires_at']:
+                            raise StaleAck('policy-window-expired')
+                        return {'outcome':'already-observed','old_sha':current,'new_sha':current,
+                                'source_revision':policy['events_sha']}
+                raise StaleAck('native-status-replay-mismatch')
+            if current != expected_ledger_sha or current != policy['prior_sha'] or \
+               root.get('status') != policy['previous']:
+                raise StaleAck('native-status-prior-mismatch')
+            candidate = json.loads(json.dumps(prior))
+            candidate['roots'][policy['root']]['status'] = policy['new']
+            candidate['roots'][policy['root']].setdefault('mutation_history',[]).append(
+                dict(provenance,observed_at=time.time()))
+            _validate_ledger(candidate)
+            # Exact constructed delta is stronger than the ordinary frozen-field guard;
+            # that guard remains intact on commit_ledger, including _lock_held calls.
+            restored = json.loads(json.dumps(candidate))
+            restored['roots'][policy['root']]['status'] = policy['previous']
+            restored['roots'][policy['root']]['mutation_history'].pop()
+            if restored != prior:
+                raise ValueError('native-status-preservation-mismatch')
+            _status_board_identity(board_path, policy)
+            if time.time() >= policy['expires_at']:
+                raise StaleAck('policy-window-expired')
+            next_sha = _replace_ledger(directory, candidate)
+            _status_board_identity(board_path, policy)
+            return {'outcome':'status-observed','old_sha':current,'new_sha':next_sha,
+                    'source_revision':policy['events_sha']}
+
+
+def commit_ack(directory, candidate, expected_sha, fresh_local=None, monitored=None, fresh_events=None):
+    _validate_ack(candidate)
+    if not set(candidate["sources"]).issubset(candidate["local"]):
+        raise ValueError("source root absent from local acknowledgement")
+    if monitored is not None and not set(candidate["sources"]).issubset(monitored):
+        raise ValueError("source root absent from active recovery index")
+    for root, groups in candidate["sources"].items():
+        inventory = groups.get("inventory")
+        if inventory and inventory["local_fingerprint"] != candidate["local"][root]:
+            raise ValueError("inventory receipt bound to different local evidence")
+    directory = pathlib.Path(directory)
+    if directory.is_symlink() or directory.parent.is_symlink():
+        raise ValueError("symlinked ack directory")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = _ack_path(directory)
+    lock = directory / "ack.lock"
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "a+b") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        _, current = read_ack(directory)
+        if current != expected_sha:
+            raise StaleAck(f"ack changed: expected {expected_sha}, found {current}")
+        prior, _ = read_ack(directory)
+        ledger, ledger_sha = read_ledger(directory)
+        if ledger is not None and ledger["version"] == 2:
+            raise RuntimeError("global ack immutable after v2 cutover")
+        if ledger is not None:
+            # Ledger receipts are agent-authored. They cannot independently prove
+            # current Linear comments or a complete cross-host Done-card inventory.
+            # Until a trusted live source verifier is implemented, leave the cursor
+            # due rather than accepting an asserted remote_inventory_verified flag.
+            if candidate["sources"]:
+                raise ValueError("independent external source verification unavailable; keep due")
+            if candidate.get("ledger_sha") != ledger_sha:
+                raise ValueError("ack ledger revision mismatch")
+            receipt_ids = candidate.get("receipt_ids")
+            if not isinstance(receipt_ids, dict):
+                raise ValueError("ack missing ledger receipt IDs")
+            for root, fingerprint in candidate["local"].items():
+                current_root = ledger["roots"].get(root, {})
+                receipt = current_root.get("receipt")
+                if current_root.get("unknown") or not receipt or receipt.get("receipt_id") != receipt_ids.get(root):
+                    raise ValueError("ack requires current checked root ledger receipt")
+                if receipt.get("consumed_local_fingerprint") != fingerprint:
+                    raise ValueError("ack local fingerprint differs from ledger receipt")
+                new_groups = candidate["sources"].get(root, {})
+                if (not new_groups.get("remote_inventory_verified") or
+                        not new_groups.get("inventory") or not new_groups.get("linear")):
+                    raise ValueError("ack source inventory incomplete; keep root due")
+                checked = receipt.get("checked_sources", {})
+                inventory = new_groups.get("inventory")
+                if inventory and checked.get("inventory") != inventory["local_fingerprint"]:
+                    raise ValueError("ack inventory lacks ledger receipt")
+                for kind in ("linear", "remote"):
+                    for key, state in new_groups.get(kind, {}).items():
+                        if (state.get("unknown") or not state.get("receipt") or
+                                not state.get("revision") or checked.get(f"{kind}:{key}") != state["revision"]):
+                            raise ValueError("ack source lacks checked ledger revision")
+        if prior is not None:
+            if not set(prior["local"]).issubset(candidate["local"]):
+                raise ValueError("ack cannot discard monitored local cards")
+            for root, groups in prior["sources"].items():
+                new = candidate["sources"].get(root, {})
+                for kind in ("linear", "remote"):
+                    if not set(groups.get(kind, {})).issubset(new.get(kind, {})):
+                        raise ValueError("ack cannot discard monitored external sources")
+        if fresh_local is not None:
+            current_local = fresh_local() if callable(fresh_local) else fresh_local
+            for root, fingerprint in candidate["local"].items():
+                if ledger is not None and current_local.get(root) != fingerprint:
+                    raise StaleAck(f"new local evidence on {root}; do not acknowledge stale sample")
+                renewed = prior is None or fingerprint != prior["local"].get(root)
+                old_inventory = (prior or {}).get("sources", {}).get(root, {}).get("inventory")
+                inventory = candidate["sources"].get(root, {}).get("inventory")
+                if inventory and inventory != old_inventory:
+                    renewed = True
+                if renewed and current_local.get(root) != fingerprint:
+                    raise StaleAck(f"new local evidence on {root}; do not acknowledge stale sample")
+        if fresh_events is not None and ledger is not None:
+            current_events = fresh_events() if callable(fresh_events) else fresh_events
+            for root in candidate["local"]:
+                receipt = ledger["roots"][root]["receipt"]
+                if (not isinstance(receipt.get("consumed_event_ids"), list) or
+                        receipt["consumed_event_ids"] != current_events.get(root)):
+                    raise StaleAck(f"new or missing events on {root}; keep cursor due")
+        data = _bytes(candidate)
+        fd, temp = tempfile.mkstemp(prefix=".ack-", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, path)
+            dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        reread, digest = read_ack(directory)
+        if reread != candidate or digest != hashlib.sha256(data).hexdigest():
+            raise RuntimeError("ack readback mismatch")
+        return digest
+
+
+def seed_sources(root, issue, remote_cards, previous, now):
+    """Build an unverified source frontier; caller must verify before renewing due."""
+    if not root.startswith("t_") or not issue or not isinstance(remote_cards, list):
+        raise ValueError("source seed needs root, issue and explicit remote list")
+    groups = {"linear": {}, "remote": {}, "remote_inventory_verified": False}
+    for kind, names in (("linear", [issue]), ("remote", remote_cards)):
+        for name in names:
+            if not isinstance(name, str) or not name:
+                raise ValueError("invalid source name")
+            old = previous.get(kind, {}).get(name)
+            groups[kind][name] = dict(old) if isinstance(old, dict) else {
+                "next_due": now, "unknown": "initial-check-required"}
+    return groups
+
+
+def decide(local, ack, now, required=None, monitored=None):
+    required = required or {}
+    monitored = (set(local) | set(required) | set((ack or {}).get("sources", {}))) if monitored is None else set(monitored)
+    if ack is None:
+        changed = sorted(local)
+        return {"wakeAgent": True, "context": {"changed": changed[:100],
+                "fingerprints": {k: local[k] for k in changed[:100]}, "due": [],
+                "unknown": ["cursor-missing"] + (["observer-output-overflow"] if len(changed) > 100 else [])}}
+    _validate_ack(ack)
+    changed = sorted(k for k in set(local) | set(ack["local"]) if local.get(k) != ack["local"].get(k))
+    due, unknown = [], []
+    for root in monitored:
+        groups = ack["sources"].get(root)
+        if root not in local:
+            unknown.append(f"{root}:local-missing")
+        if not groups or not groups.get("linear") or not groups.get("remote_inventory_verified"):
+            unknown.append(f"{root}:source-map-incomplete")
+        if groups:
+            inventory = groups.get("inventory")
+            if not inventory or inventory["local_fingerprint"] != local.get(root) or inventory["checked_at"] > now + 60:
+                unknown.append(f"{root}:inventory-unverified")
+            elif inventory["next_due"] <= now:
+                due.append((inventory["next_due"], f"{root}:inventory"))
+            for kind in ("linear", "remote"):
+                missing = set(required.get(root, {}).get(kind, ())) - set(groups.get(kind, {}))
+                unknown.extend(f"{root}:{kind}:{item}:unmapped" for item in sorted(missing))
+    for root, groups in ack["sources"].items():
+        if root not in monitored:
+            continue
+        for kind in ("linear", "remote"):
+            sources = groups.get(kind, {})
+            for key, state in sources.items():
+                ident = f"{root}:{kind}:{key}"
+                if state.get("unknown"):
+                    unknown.append(ident)
+                elif (not isinstance(state.get("checked_at"), (int, float)) or
+                      state["checked_at"] > now + 60 or not state.get("revision") or not state.get("receipt")):
+                    unknown.append(f"{ident}:unverified-check")
+                if state["next_due"] <= now:
+                    due.append((state["next_due"], ident))
+    due.sort()
+    context = {"changed": changed[:100], "fingerprints": {k: local[k] for k in changed[:100] if k in local},
+               "due": [ident for _, ident in due[:100]], "unknown": sorted(unknown)[:100]}
+    if len(changed) > 100 or len(due) > 100 or len(unknown) > 100:
+        context["unknown"].append("observer-output-overflow")
+    return {"wakeAgent": bool(changed or due or unknown), "context": context}
+
+
+def read_legacy(path):
+    """Read original recovery keys without mutating or normalizing their bytes."""
+    uri = "file:" + quote(str(_reject_symlink_ancestors(path))) + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=15)) as conn:
+        rows = conn.execute(
+            "SELECT key,value,updated_at FROM cron_notepad WHERE job_id=? "
+            "AND (key LIKE 'recovery_root_t_%' OR key IN ('recovery_index','recovery_cursor'))",
+            (JOB_ID,)).fetchall()
+    raw = {key: {"value_utf8": value, "updated_at": updated,
+                 "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()}
+           for key, value, updated in rows}
+    roots = {key.removeprefix("recovery_root_") for key in raw
+             if key.startswith("recovery_root_t_")}
+    cursor = raw.get("recovery_cursor")
+    if cursor:
+        try:
+            data = json.loads(cursor["value_utf8"])
+            if isinstance(data, dict) and isinstance(data.get("roots"), dict):
+                roots.update(root for root in data["roots"] if root.startswith("t_"))
+        except (ValueError, TypeError):
+            pass  # Raw bytes retained; unparseable facts remain UNKNOWN.
+    index = raw.get("recovery_index")
+    if index:
+        try:
+            data = json.loads(index["value_utf8"])
+            roots.update(key.removeprefix("recovery_root_") for key in data.get("active", [])
+                         if isinstance(key, str) and key.startswith("recovery_root_t_"))
+        except (ValueError, TypeError):
+            pass
+    return {"raw": raw, "roots": sorted(roots), "cursor_absent": cursor is None}
+
+
+def migration_candidate(legacy, local=None, ack=None, prior_ledger=None, prior_sha=None, ack_sha=None):
+    """Lossless raw archive plus conservative typed seed; no live writes."""
+    raw = legacy["raw"]
+    cursor = {}
+    if "recovery_cursor" in raw:
+        try:
+            cursor = json.loads(raw["recovery_cursor"]["value_utf8"]).get("roots", {})
+        except (ValueError, TypeError, AttributeError):
+            cursor = {}
+    roots = {}
+    aliases = {"issue": ("issue",), "status": ("status", "observed_status"),
+               "phase": ("phase",), "owner": ("owner",),
+               "staging": ("staging", "initial_staging"),
+               "cause": ("cause", "cause_fingerprint"),
+               "cause_fingerprint": ("cause_fingerprint", "cause"),
+               "evidence": ("evidence", "evidence_locator"),
+               "clearing_proof": ("clearing_proof", "proof"),
+               "action": ("action", "last_action"),
+               "action_result": ("action_result", "last_result"),
+               "disposition": ("disposition",),
+               "pickup": ("pickup",), "alert_receipt": ("alert_receipt",),
+               "gates": ("gates", "gate", "outstanding_gate"),
+               "next_checkpoint": ("next_checkpoint", "next_event", "next"),
+               "checked_at": ("checked_at", "checked", "last_checked_source"),
+               "due_at": ("due_at", "due", "next_due")}
+    local = local or {}
+    ack = ack or {}
+    roots_to_seed = (set(legacy["roots"]) | set(local) | set(ack.get("local", {})) |
+                     set(ack.get("sources", {})) | set((prior_ledger or {}).get("roots", {})))
+    for root in sorted(roots_to_seed):
+        key = "recovery_root_" + root
+        entry = raw.get(key)
+        source = {}
+        if entry:
+            try:
+                source = json.loads(entry["value_utf8"])
+            except (TypeError, ValueError):
+                source = {}
+        if not isinstance(source, dict):
+            source = {}
+        cursor_source = cursor.get(root, {}) if isinstance(cursor, dict) else {}
+        if not isinstance(cursor_source, dict):
+            cursor_source = {}
+        record = {"legacy_key": key if entry else None,
+                  "legacy_value": entry["value_utf8"] if entry else None,
+                  "legacy_updated_at": entry["updated_at"] if entry else None,
+                  "legacy_sha256": entry["sha256"] if entry else None,
+                  "observed_local_fingerprint": local.get(root),
+                  "unknown": True, "sources": {"external_sources": {}}, "receipt": None}
+        for field, keys in aliases.items():
+            values = [source[k] for k in keys if k in source]
+            values += [cursor_source[k] for k in keys if k in cursor_source]
+            value = values[0] if values and all(v == values[0] for v in values) else None
+            if field in ("checked_at", "due_at") and (isinstance(value, bool) or
+                    not isinstance(value, (int, float)) or not math.isfinite(value)):
+                value = None
+            if field in ("issue", "status", "phase", "owner", "staging", "cause",
+                         "cause_fingerprint", "clearing_proof", "action", "disposition") and not isinstance(value, str):
+                value = None
+            if field == "action_result" and not isinstance(value, (dict, str)):
+                value = None
+            record[field] = value
+        if isinstance(source.get("card"), str) and source["card"] != root:
+            record["unknown"] = True
+        external_ids = set()
+        if isinstance(record.get("issue"), str) and re.fullmatch(r"WRI-\d+", record["issue"]):
+            external_ids.add("linear:" + record["issue"])
+        groups = ack.get("sources", {}).get(root, {})
+        if isinstance(groups, dict):
+            for group, entries in groups.items():
+                for name in entries if isinstance(entries, dict) else ("__group__",):
+                    if group == "linear" and re.fullmatch(r"WRI-\d+", name):
+                        identifier = "linear:" + name
+                    elif group == "remote" and re.fullmatch(r"(?:imac|macpro)/t_[0-9a-f]{8}", name):
+                        identifier = "remote:" + name.replace("/", "/default/", 1)
+                    else:
+                        identifier = "legacy-v1:" + ("ack:" + group + ":" + name).encode().hex()
+                    external_ids.add(identifier)
+        previous_sources = (prior_ledger or {}).get("roots", {}).get(root, {}).get("sources", {})
+        external_ids.update(name if name.startswith(("linear:", "remote:")) else "legacy-v1:" + name.encode().hex()
+                            for name in previous_sources if isinstance(name, str))
+        # Historical references are conservative discovery hints, never checked receipts.
+        for text in ([entry["value_utf8"]] if entry else []):
+            external_ids.update("linear:" + issue for issue in re.findall(r"\bWRI-\d+\b", text))
+            external_ids.update("remote:" + name.replace("/", "/default/", 1)
+                                for name in re.findall(r"\b(?:imac|macpro)/t_[0-9a-f]{8}\b", text))
+        for identifier in sorted(external_ids):
+            record["sources"]["external_sources"][identifier] = {
+                "principal":None,"route":None,"locator":identifier,
+                "page_completion":None,"revision":None,"comment_event_ids":None,
+                "checked_at":None,"next_due":0,"state":"UNKNOWN",
+                "reason":"unverified migrated reference","read_receipt_id":None,
+                "evidence_locator":None}
+        roots[root] = record
+    result = {"version": 2, "board": BOARD, "job": JOB_ID,
+              "legacy_raw": raw, "roots": roots,
+              "legacy_cursor_absent": legacy["cursor_absent"]}
+    if ack_sha is not None:
+        result["legacy_ack_sha"] = ack_sha
+    if prior_ledger is not None:
+        if prior_ledger.get("version") != 1 or prior_sha != _digest(prior_ledger):
+            raise ValueError("invalid v1 predecessor binding")
+        result["legacy_v1_ledger"] = prior_ledger
+        result["legacy_v1_sha"] = prior_sha
+    _validate_ledger(result)
+    return result
+
+
+def reconcile_native(directory, native_db, expected_ledger_sha):
+    """Append native notepad changes while retaining immutable migration bytes."""
+    with _observation_lock(directory):
+        old, sha = read_ledger(directory)
+        if sha != expected_ledger_sha or old is None or old["version"] != 2:
+            raise StaleAck("native reconciliation needs current v2 ledger")
+        first = read_legacy(native_db)
+        candidate = json.loads(json.dumps(old))
+        histories = candidate.setdefault("native_revisions", {})
+        changed = []
+        keys = set(old["legacy_raw"]) | set(histories) | set(first["raw"])
+        for key in sorted(keys):
+            previous = (histories.get(key) or [old["legacy_raw"].get(key, {})])[-1]
+            previous_sha = previous.get("sha256_or_absent", previous.get("sha256", "absent"))
+            current = first["raw"].get(key)
+            current_sha = current["sha256"] if current else "absent"
+            current_at = current["updated_at"] if current else None
+            previous_at = previous.get("updated_at_or_null", previous.get("updated_at"))
+            if current_sha == previous_sha and current_at == previous_at:
+                continue
+            revision = {"key":key,"present":current is not None,
+                        "value_utf8_or_null":current["value_utf8"] if current else None,
+                        "updated_at_or_null":current_at,"sha256_or_absent":current_sha,
+                        "observed_at":time.time(),"prior_revision_sha":previous_sha,
+                        "evidence_locator":f"native notepad {key}: {previous_sha} → {current_sha}"}
+            histories.setdefault(key, []).append(revision)
+            changed.append(key)
+        if not changed:
+            return sha, changed
+        for root in first["roots"]:
+            if root not in candidate["roots"]:
+                candidate["roots"][root] = {"legacy_key":None,"legacy_value":None,
+                    "legacy_sha256":None,"legacy_updated_at":None,"unknown":True,
+                    "due_at":0,"sources":{"external_sources":{}},"receipt":None}
+        affected = {key.removeprefix("recovery_root_") for key in changed
+                    if key.startswith("recovery_root_t_")}
+        if any(key in changed for key in ("recovery_index", "recovery_cursor")):
+            affected.update(candidate["roots"])
+        for root in affected:
+            item = candidate["roots"][root]
+            changes = []
+            for field, value in (("unknown", True), ("due_at", 0)):
+                if item.get(field) != value:
+                    changes.append({"field":field,"previous":item.get(field),"new":value})
+                    item[field] = value
+            if changes and root in old["roots"]:
+                item.setdefault("mutation_history", []).append({"changes":changes,
+                    "actor":"native-observer","evidence_locator":"notepad revisions: " + ",".join(changed)})
+        if read_legacy(native_db) != first:
+            raise StaleAck("native changed during revision snapshot")
+        next_sha = commit_ledger(directory, candidate, sha, _lock_held=True)
+        if read_legacy(native_db) != first:
+            raise StaleAck("native changed after revision commit; keep UNKNOWN and retry")
+        return next_sha, changed
+
+
+def commit_cutover_marker(directory, ledger_sha, legacy_count, ack_sha, _resume=False):
+    directory = pathlib.Path(directory)
+    _reject_symlink_ancestors(directory)
+    ledger, actual = read_ledger(directory)
+    if ledger is None or actual != ledger_sha or len(ledger["legacy_raw"]) != legacy_count:
+        raise StaleAck("cutover ledger no longer matches reviewed snapshot")
+    previous_path = _reject_symlink_ancestors(directory / "cutover.json")
+    path = previous_path
+    prior_marker_sha = None
+    if previous_path.exists() and ledger["version"] == 2 and ledger.get("legacy_v1_sha"):
+        prior_bytes = previous_path.read_bytes()
+        prior_marker = json.loads(prior_bytes)
+        if prior_marker.get("ledger_sha") != ledger["legacy_v1_sha"]:
+            raise StaleAck("previous cutover marker does not bind archived v1 ledger")
+        prior_marker_sha = hashlib.sha256(prior_bytes).hexdigest()
+        path = _reject_symlink_ancestors(directory / "cutover-v2.json")
+    if path.exists() and not _resume:
+        raise StaleAck("cutover marker already exists; inspect before retry")
+    marker = {"version": 2 if ledger["version"] == 2 else 1, "job": JOB_ID, "board": BOARD,
+              "ledger_sha": ledger_sha, "legacy_count": legacy_count,
+              "ack_sha_at_migration": ack_sha}
+    if ledger["version"] == 2:
+        marker["native_snapshot_sha"] = _digest(ledger["legacy_raw"])
+    if prior_marker_sha:
+        marker["previous_cutover_sha"] = prior_marker_sha
+    if path.exists():
+        if path.read_bytes() != _bytes(marker):
+            raise StaleAck("interrupted cutover marker differs from bound ledger")
+    else:
+        fd, temp = tempfile.mkstemp(prefix=".cutover-", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(_bytes(marker))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, path)
+            dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+    if json.loads(path.read_bytes()) != marker:
+        raise RuntimeError("cutover marker readback mismatch")
+    if ledger["version"] == 2:
+        anchor = _reject_symlink_ancestors(directory / "cutover-v2-anchor.json")
+        if anchor.exists():
+            if not _resume:
+                raise StaleAck("cutover anchor already exists")
+            _verify_cutover(directory, ledger, path, marker)
+            return marker
+        fd, temp = tempfile.mkstemp(prefix=".cutover-anchor-", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(_bytes({"marker_sha": hashlib.sha256(path.read_bytes()).hexdigest()}))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, anchor)
+            dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        if json.loads(anchor.read_bytes())["marker_sha"] != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise StaleAck("cutover marker anchor readback mismatch")
+    return marker
+
+
+def _cutover_path(directory, ledger):
+    name = "cutover-v2.json" if ledger is not None and ledger.get("legacy_v1_sha") and \
+        (pathlib.Path(directory) / "cutover.json").exists() else "cutover.json"
+    return _reject_symlink_ancestors(pathlib.Path(directory) / name)
+
+
+def _verify_cutover(directory, ledger, marker_path, marker):
+    if marker.get("job") != JOB_ID or marker.get("board") != BOARD or \
+       marker.get("legacy_count") != len(ledger["legacy_raw"]):
+        raise ValueError("invalid cutover identity/count")
+    if ledger["version"] == 1:
+        if marker.get("version") != 1:
+            raise ValueError("invalid v1 cutover")
+        return
+    anchor_path = _reject_symlink_ancestors(pathlib.Path(directory) / "cutover-v2-anchor.json")
+    anchor = json.loads(anchor_path.read_bytes())
+    if marker.get("version") != 2 or not re.fullmatch(r"[0-9a-f]{64}", str(marker.get("ledger_sha"))) or \
+       not isinstance(marker.get("ack_sha_at_migration"), str) or \
+       marker.get("native_snapshot_sha") != _digest(ledger["legacy_raw"]) or \
+       anchor.get("marker_sha") != hashlib.sha256(marker_path.read_bytes()).hexdigest():
+        raise ValueError("invalid v2 cutover chain")
+    if marker_path.name == "cutover-v2.json":
+        if not ledger.get("legacy_v1_sha") or not isinstance(marker.get("previous_cutover_sha"), str):
+            raise ValueError("missing predecessor cutover binding")
+        predecessor = _reject_symlink_ancestors(pathlib.Path(directory) / "cutover.json").read_bytes()
+        if marker["previous_cutover_sha"] != hashlib.sha256(predecessor).hexdigest() or \
+           json.loads(predecessor).get("ledger_sha") != ledger["legacy_v1_sha"]:
+            raise ValueError("invalid predecessor cutover binding")
+    elif marker.get("previous_cutover_sha") is not None:
+        raise ValueError("unexpected predecessor cutover binding")
+
+
+@contextmanager
+def _cutover_source_lock(directory, native_db):
+    """Hold the existing ack lock and SQLite RESERVED writer slot; write no DB rows."""
+    directory = pathlib.Path(directory)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = _reject_symlink_ancestors(directory / "ack.lock")
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        uri = "file:" + quote(str(_reject_symlink_ancestors(native_db))) + "?mode=rw"
+        with closing(sqlite3.connect(uri, uri=True, timeout=15)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            finally:
+                conn.rollback()
+
+
+def resume_cutover(directory, native_db, board, expected_sha):
+    """Resume only a frozen, still-current native/ack/board migration snapshot."""
+    ledger, sha = read_ledger(directory)
+    if sha != expected_sha or ledger is None or ledger["version"] != 2 or \
+       not isinstance(ledger.get("legacy_ack_sha"), str):
+        raise StaleAck("no bound v2 migration snapshot at requested SHA")
+    with _cutover_source_lock(directory, native_db):
+        if read_legacy(native_db)["raw"] != ledger["legacy_raw"] or \
+           read_ack(directory)[1] != ledger["legacy_ack_sha"]:
+            raise StaleAck("native or old ack changed before cutover resume")
+        retained = set(ledger["roots"])
+        local, _, missing = board_snapshot(board, retained, include_hints=True, allow_missing=True)
+        if sorted(missing) != ledger.get("missing_retained") or any(
+                ledger["roots"][root].get("observed_local_fingerprint") != fingerprint
+                for root, fingerprint in local.items()):
+            raise StaleAck("board changed before cutover resume")
+        if read_legacy(native_db)["raw"] != ledger["legacy_raw"] or \
+           read_ack(directory)[1] != ledger["legacy_ack_sha"]:
+            raise StaleAck("migration inputs changed at cutover activation")
+        marker = commit_cutover_marker(directory, sha, len(ledger["legacy_raw"]),
+                                       ledger["legacy_ack_sha"], _resume=True)
+    _verify_cutover(directory, ledger, _cutover_path(directory, ledger), marker)
+    return sha
+
+
+def ledger_due(ledger, ledger_sha, ack, now, local_cursor=None):
+    """A ledger-only change or due root cannot be hidden by unchanged board ack."""
+    if ledger is None:
+        return []
+    if ledger.get("version") == 2:
+        result = []
+        local_roots = (local_cursor or {}).get("roots", {})
+        for root, item in sorted(ledger["roots"].items()):
+            if root not in local_roots or root in (local_cursor or {}).get("pending", {}):
+                result.append(f"{root}:local-unchecked")
+            if item.get("unknown"):
+                result.append(f"{root}:ledger-unknown")
+            due = item.get("due_at")
+            if isinstance(due, (int, float)) and not isinstance(due, bool) and due <= now:
+                result.append(f"{root}:ledger-due")
+            for ident, source in sorted(item.get("sources", {}).get("external_sources", {}).items()):
+                if source["state"] != "checked":
+                    result.append(f"{root}:{ident}:external-{source['state']}")
+                elif source.get("next_due") is None or source["next_due"] <= now:
+                    result.append(f"{root}:{ident}:external-due")
+            if not item.get("sources", {}).get("external_sources"):
+                result.append(f"{root}:external-inventory-UNKNOWN")
+        return result
+    if not isinstance(ack, dict) or ack.get("ledger_sha") != ledger_sha:
+        return ["ledger-unacknowledged"]
+    result = []
+    for root, item in sorted(ledger["roots"].items()):
+        if item.get("unknown"):
+            result.append(f"{root}:ledger-unknown")
+        due = item.get("due_at")
+        if isinstance(due, (int, float)) and not isinstance(due, bool) and due <= now:
+            result.append(f"{root}:ledger-due")
+    return result
+
+
+def discover_roots(local, legacy, ack, ledger, index_roots=()):
+    """Union authority; missing retained evidence stays due, never disappears."""
+    roots = (set(local) | set((legacy or {}).get("roots", ())) |
+             set((ack or {}).get("local", ())) |
+             set((ack or {}).get("sources", ())) |
+             set((ledger or {}).get("roots", ())) | set(index_roots))
+    return roots, roots - set(local)
+
+
+def read_index(path):
+    """Read only the compact active index; never create or migrate the notepad."""
+    uri = "file:" + quote(str(_reject_symlink_ancestors(path))) + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=15)) as conn:
+        row = conn.execute("SELECT value FROM cron_notepad WHERE job_id=? AND key='recovery_index'",
+                           (JOB_ID,)).fetchone()
+    if not row:
+        raise RuntimeError("recovery_index missing")
+    data = json.loads(row[0])
+    keys = data.get("active")
+    if data.get("version") != 1 or not isinstance(keys, list) or not all(
+            isinstance(key, str) and key.startswith("recovery_root_t_") for key in keys):
+        raise ValueError("invalid recovery_index")
+    return {key.removeprefix("recovery_root_") for key in keys}
+
+
+def board_snapshot(path, retained=(), include_hints=False, allow_missing=False,
+                   include_events=False, return_missing=False):
+    """Native SELECT-only Kanban API on an explicit read-only WAL snapshot."""
+    from hermes_cli import kanban_db as kb
+    uri = "file:" + quote(str(_reject_symlink_ancestors(path))) + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN")
+        tasks = kb.list_tasks(conn, include_archived=True)
+        ids = {task.id for task in tasks}
+        if len(ids) != len(tasks):
+            raise RuntimeError("incomplete board inventory")
+        missing = set(retained) - ids
+        if missing and not allow_missing:
+            raise RuntimeError("missing monitored task")
+        result, hints, identities, attachment_roots = {}, {}, {}, set()
+        for task in tasks:
+            if task.status not in NONTERMINAL and task.id not in retained:
+                continue
+            comments = kb.list_comments(conn, task.id)
+            events = kb.list_events(conn, task.id)
+            runs = kb.list_runs(conn, task.id)
+            attachments = kb.list_attachments(conn, task.id)
+            if attachments:
+                attachment_roots.add(task.id)
+            semantic = [task.status, task.assignee, task.title, task.body, task.result,
+                        task.last_failure_error,
+                        [(c.id, c.body) for c in comments],
+                        [(e.id, e.kind, e.payload) for e in events if e.kind != "heartbeat"],
+                        [(r.id, r.status, r.outcome, r.summary, r.error, r.metadata) for r in runs],
+                        [(a.id, a.filename, a.size, a.stored_path,
+                          attachment_digest(a.stored_path, a.size,
+                                            expected_dir=kb.task_attachments_dir(task.id, board=BOARD)))
+                         for a in attachments]]
+            result[task.id] = _digest(semantic)
+            if include_events:
+                identities[task.id] = [e.id for e in events if e.kind != "heartbeat"]
+            if include_hints:
+                hints[task.id] = source_hints(task.title, task.body, [c.body for c in comments])
+        conn.rollback()
+        if include_events:
+            if missing and not return_missing:
+                raise StaleAck("missing monitored local observation")
+            if return_missing:
+                return result, identities, attachment_roots, missing
+            return result, identities, attachment_roots
+        if allow_missing:
+            return result, hints, missing
+        return (result, hints) if include_hints else result
+    finally:
+        conn.close()
+
+
+def board_event_ids(path, roots):
+    """Read native non-heartbeat event identities on a read-only transaction."""
+    from hermes_cli import kanban_db as kb
+    uri = "file:" + quote(str(_reject_symlink_ancestors(path))) + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=15)
+    try:
+        conn.execute("BEGIN")
+        result = {root: [event.id for event in kb.list_events(conn, root)
+                         if event.kind != "heartbeat"] for root in sorted(roots)}
+        conn.rollback()
+        return result
+    finally:
+        conn.close()
+
+
+def board_observation(path, roots):
+    """Fingerprints and event IDs from the SAME pinned read-only transaction."""
+    fingerprints, identities, attachment_roots = board_snapshot(path, roots, include_events=True)
+    if not set(roots).issubset(fingerprints):
+        raise StaleAck("missing local observation root")
+    return ({root: fingerprints[root] for root in roots},
+            {root: identities[root] for root in roots}, attachment_roots & set(roots))
+
+def parse_selection(raw):
+    """Reject ambiguous JSON before turning it into a root/id map."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate selection key")
+            result[key] = value
+        return result
+    value = json.loads(raw, object_pairs_hook=pairs)
+    if not isinstance(value, dict) or not value or len(value) > 10000 or any(
+            not re.fullmatch(r"t_[0-9a-f]{8}", root) or
+            not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{64}", ident)
+            for root, ident in value.items()):
+        raise ValueError("invalid current selection")
+    return value
+
+
+def _home():
+    from hermes_constants import get_hermes_home
+    return pathlib.Path(get_hermes_home())
+
+def _checked_home():
+    home = _home().absolute()
+    if home != PROFILE_HOME:
+        raise ValueError("wrong profile for recovery observer")
+    for part in (home, *home.parents):
+        if part.is_symlink():
+            raise ValueError("symlinked profile ancestor")
+    return home
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    directory = _checked_home() / "cron" / f"recovery-{JOB_ID}"
+    if argv and argv[0] == 'reconcile-status':
+        if len(argv) != 2:
+            raise ValueError('usage: observer.py reconcile-status <expected-ledger-sha>')
+        print(json.dumps(reconcile_native_status(directory,
+            pathlib.Path('/home/macpro/.hermes/kanban.db'), argv[1]), sort_keys=True))
+        return
+    if argv and argv[0] == "resume-cutover":
+        if len(argv) != 2:
+            raise ValueError("usage: observer.py resume-cutover <expected-v2-ledger-sha>")
+        print(resume_cutover(directory, _checked_home() / "cron" / "notepad.db",
+                             pathlib.Path("/home/macpro/.hermes/kanban.db"), argv[1]))
+        return
+    if argv and argv[0] == "migrate":
+        if len(argv) != 2:
+            raise ValueError("usage: observer.py migrate <expected-ledger-sha>")
+        source = _checked_home() / "cron" / "notepad.db"
+        board = pathlib.Path("/home/macpro/.hermes/kanban.db")
+        first = read_legacy(source)
+        predecessor, predecessor_sha = read_ledger(directory)
+        if predecessor_sha != argv[1] or predecessor is not None and predecessor["version"] != 1:
+            raise StaleAck("migrate requires missing or current v1 ledger SHA")
+        previous_ack, ack_sha = read_ack(directory)
+        retained = (set(first["roots"]) | set((previous_ack or {}).get("local", {})) |
+                    set((previous_ack or {}).get("sources", {})) | set((predecessor or {}).get("roots", {})))
+        local, _, missing = board_snapshot(board, retained, include_hints=True, allow_missing=True)
+        candidate = migration_candidate(first, local, previous_ack, predecessor,
+                                        predecessor_sha if predecessor else None, ack_sha=ack_sha)
+        candidate["missing_retained"] = sorted(missing)
+        if read_legacy(source) != first or read_ack(directory)[1] != ack_sha:
+            raise StaleAck("legacy or ack changed during migration preflight")
+        digest = commit_ledger(directory, candidate, argv[1], _migration=True)
+        with _cutover_source_lock(directory, source):
+            if (read_legacy(source) != first or read_ack(directory)[1] != ack_sha or
+                    board_snapshot(board, retained, include_hints=True, allow_missing=True)[0] != local):
+                raise StaleAck("migration source changed after ledger commit; do not cut over")
+            reread, actual = read_ledger(directory)
+            if reread != candidate or actual != digest or reread["legacy_raw"] != read_legacy(source)["raw"]:
+                raise RuntimeError("migration readback mismatch")
+            if read_legacy(source) != first or read_ack(directory)[1] != ack_sha:
+                raise StaleAck("migration inputs changed at cutover activation")
+            commit_cutover_marker(directory, digest, len(first["raw"]), ack_sha)
+        print(digest)
+        return
+    if argv and argv[0] == "ledger":
+        if len(argv) != 3:
+            raise ValueError("usage: observer.py ledger <candidate-json-path> <expected-prior-sha>")
+        candidate_path = _reject_symlink_ancestors(argv[1])
+        if not candidate_path.is_file():
+            raise ValueError("invalid ledger candidate path")
+        fd = os.open(candidate_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as stream:
+            raw = stream.read(MAX_LEDGER_BYTES + 1)
+        if len(raw) > MAX_LEDGER_BYTES:
+            raise ValueError("ledger candidate too large")
+        print(commit_ledger(directory, json.loads(raw), argv[2]))
+        return
+    if argv and argv[0] in ("observe-local", "local-check", "local-select"):
+        command = argv[0]
+        if command == "local-select":
+            if len(argv) < 3:
+                raise ValueError("usage: local-select <expected-ledger-sha> <expected-sidecar-sha> [root-id ...]")
+        elif len(argv) != (3 if command == "observe-local" else 4):
+            raise ValueError(f"usage: {command} <selection-json-path> <expected-ledger-sha>" +
+                             (" <expected-sidecar-sha>" if command == "local-check" else ""))
+        active_ledger, _ = read_ledger(directory)
+        if active_ledger is None or active_ledger["version"] != 2 or not _cutover_path(directory, active_ledger).is_file():
+            raise RuntimeError("v2 ledger and reviewed cutover marker required for local observation")
+        active_marker_path = _cutover_path(directory, active_ledger)
+        _verify_cutover(directory, active_ledger, active_marker_path, json.loads(active_marker_path.read_bytes()))
+        board = pathlib.Path("/home/macpro/.hermes/kanban.db")
+        if command == "local-select":
+            print(json.dumps(select_local(directory, board, argv[2], argv[1],
+                targets=argv[3:] or None), sort_keys=True))
+            return
+        selection_path = _reject_symlink_ancestors(argv[1])
+        fd = os.open(selection_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as stream:
+            raw = stream.read(MAX_ACK_BYTES + 1)
+        if len(raw) > MAX_ACK_BYTES:
+            raise ValueError("selection too large")
+        selection = json.loads(raw) if command == "observe-local" else parse_selection(raw)
+        snapshot = lambda roots: board_observation(board, roots)
+        if command == "observe-local":
+            if not isinstance(selection, list) or not selection or any(
+                not isinstance(root, str) or not re.fullmatch(r"t_[0-9a-f]{8}", root)
+                for root in selection) or len(set(selection)) != len(selection):
+                raise ValueError("invalid local root selection")
+            digest, issued = observe_local(directory, argv[2], snapshot, set(selection))
+            print(json.dumps({"sidecar_sha":digest,"pending":issued},sort_keys=True))
+        else:
+            print(local_check(directory, selection, argv[3], argv[2], snapshot))
+        return
+    if argv and argv[0] == "ack":
+        raise RuntimeError("legacy global ack is read-only evidence in successor; no CLI write route")
+    if argv:
+        raise ValueError("unexpected args")
+    native_db = _checked_home() / "cron" / "notepad.db"
+    board = pathlib.Path(os.environ.get("HERMES_KANBAN_DB") or _checked_home().parents[1] / "kanban.db")
+    outcome = native_prerun(directory, native_db, board, enforce_board=True)
+    if outcome["wakeAgent"]:
+        print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
+    else:
+        print('{"wakeAgent":false}')
+
+def native_prerun(directory, native_db, board, enforce_board=False):
+    """The native decision path used by installed main and isolated fixtures."""
+    begin_native_prerun(directory)
+    if enforce_board and pathlib.Path(board).resolve() != pathlib.Path("/home/macpro/.hermes/kanban.db"):
+        raise ValueError("unexpected default board path")
+    ack, prior = read_ack(directory)
+    ledger, ledger_sha = read_ledger(directory)
+    cutover = _cutover_path(directory, ledger)
+    if cutover.is_symlink():
+        raise ValueError("symlinked cutover marker")
+    if cutover.exists() and ledger is None:
+        raise RuntimeError("ledger missing after cutover; UNKNOWN, do not fall back to notepad")
+    if ledger is not None:
+        if not cutover.exists():
+            raise RuntimeError("ledger has no cutover marker; UNKNOWN staging")
+        marker = json.loads(cutover.read_bytes())
+        _verify_cutover(directory, ledger, cutover, marker)
+    legacy = read_legacy(native_db)
+    if ledger is not None and ledger["version"] == 1 and legacy["raw"] != ledger["legacy_raw"]:
+        raise RuntimeError("native legacy changed after cutover; UNKNOWN until reconciled")
+    native_changes = []
+    if ledger is not None and ledger["version"] == 2:
+        ledger_sha, native_changes = reconcile_native(directory, native_db, ledger_sha)
+        ledger, observed_sha = read_ledger(directory)
+        if observed_sha != ledger_sha:
+            raise StaleAck("native revision readback changed")
+        legacy = read_legacy(native_db)
+    if ledger is None:
+        index_roots = read_index(native_db)
+        retained = index_roots | (set(ack["local"]) if ack else set())
+    else:
+        index_roots = set()
+        retained, _ = discover_roots({}, legacy, ack, ledger)
+    if ledger is None:
+        local, hints = board_snapshot(board, retained, include_hints=True)
+        monitored = index_roots
+        missing = set()
+    else:
+        local, hints, missing = board_snapshot(board, retained, include_hints=True, allow_missing=True)
+        monitored, _ = discover_roots(local, legacy, ack, ledger)
+    for root in monitored:
+        hints.setdefault(root, {"linear": [], "remote": []})
+    local_cursor = None
+    if ledger is not None and ledger["version"] == 2:
+        local_cursor, local_sha = read_local_observation(directory)
+        # The old global ack is historical. It never proves a v2 local check.
+        checked = {root:item["local_fingerprint"] for root,item in
+                   (local_cursor or {}).get("roots", {}).items()}
+        changed = sorted(root for root in monitored if local.get(root) != checked.get(root))
+        outcome = {"wakeAgent":bool(changed),"context":{
+            "changed":changed[:100],"fingerprints":{root:local[root] for root in changed[:100] if root in local},
+            "due":[],"unknown":[]}}
+        if len(changed) > 100:
+            outcome["context"]["unknown"].append("observer-output-overflow")
+        outcome["context"]["local_cursor_sha"] = local_sha
+    else:
+        outcome = decide(local, ack, time.time(), required=hints, monitored=monitored)
+    ledger_flags = ledger_due(ledger, ledger_sha, ack, time.time(), local_cursor=local_cursor)
+    if ledger_flags:
+        outcome["wakeAgent"] = True
+        outcome["context"]["unknown"].extend(ledger_flags)
+    if native_changes:
+        outcome["wakeAgent"] = True
+        outcome["context"]["unknown"].extend("native-change:" + key for key in native_changes)
+    if missing:
+        outcome["wakeAgent"] = True
+        outcome["context"]["unknown"].extend(f"{root}:missing-retained-board-card" for root in sorted(missing))
+    outcome["context"]["ack_sha"] = prior
+    outcome["context"]["ledger_sha"] = ledger_sha
+    outcome["context"]["local_count"] = len(local)
+    if ledger is not None and ledger["version"] == 2:
+        # Idle and zero-selectable wakes must publish an explicit empty map.
+        selectable = set(local) & monitored if outcome["wakeAgent"] else set()
+        sidecar_sha, issued = commit_native_prerun(directory, ledger_sha,
+            lambda roots: board_observation(board, roots), selectable)
+        outcome["context"]["local_cursor_sha"] = sidecar_sha
+        if outcome["wakeAgent"]:
+            outcome["context"]["pending"] = issued
+            sidecar, _ = read_local_observation(directory)
+            outcome["context"]["attachment_roots"] = sorted(
+                root for root in issued if sidecar["pending"][root].get("attachment_bearing"))
+    return outcome
+
+
+if __name__ == "__main__":
+    command = sys.argv[1] if len(sys.argv) > 1 else None
+    try:
+        main()
+    except Exception as exc:
+        # Native pre-run failures must reach the scheduler's failure lane; a
+        # stderr-only UNKNOWN can leave a failed observer looking healthy.
+        print("[CRON_FAILURE]", flush=True)
+        if command in {"reconcile-status", "migrate", "ledger", "ack", "cutover", "observe-local", "local-check", "local-select"}:
+            print(f"{command} rejected: {type(exc).__name__}: {exc}; keep ledger/ack due and inspect readback", flush=True)
+        else:
+            print(f"observer UNKNOWN: {type(exc).__name__}: {exc}; do not acknowledge", flush=True)
+        raise SystemExit(1)

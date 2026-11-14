@@ -84,9 +84,15 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    from cron import scheduler_local_observation as local_observation
+    # A recovered completion has no original parent (no fire owner): it never mints observer proof.
+    captured = None if recovered and local_observation.is_target(job) else local_observation.prepare_terminal(
+        job, execution_id, fire_owner, success=d.success, delivery_error=d.delivery_error,
+        status=mark_kwargs.get("status"), mark_kwargs=mark_kwargs)
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
-    marked = scheduler.self_removal_delivery_allowed(job["id"]) or scheduler.mark_job_run(
-        job["id"], d.success, d.error, **mark_kwargs)
+    # The observation target never takes this shortcut: its terminal always goes through mark_job_run.
+    marked = (not local_observation.is_target(job) and scheduler.self_removal_delivery_allowed(job["id"])
+              ) or scheduler.mark_job_run(job["id"], d.success, d.error, **mark_kwargs)
     if fire_owner is not None and not marked:
         scheduler.finish_execution(
             execution_id, success=False,
@@ -116,6 +122,7 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     finish = partial(recover_receipted_execution, job_id=job['id']) if recovered else scheduler.finish_execution
     finished = finish(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    local_observation.settle_terminal(job, execution_id, captured, finished)
     if recovered and finished is None:
         current = get_execution(execution_id)
         # A live foreign firer still owns this row. Keep its only recovery link until settlement.
