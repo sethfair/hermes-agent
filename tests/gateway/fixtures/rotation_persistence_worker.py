@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 import psutil
 
@@ -26,11 +27,14 @@ def main():
     sys.addaudithook(lambda event, args: opens.append({'path': str(args[0]), 'stack': traceback.format_stack(limit=18)})
                      if event == 'sqlite3.connect' and 'state.db' in str(args[0]) else None)
     rpc = WorkerRPC(home)
+    cancel = threading.Event()
+    rpc.cancel = cancel
     scope = dict(profile_id=str(home), session_id=command['session_id'], execution_id='compression-worker',
                  generation=0, pid=os.getpid(), birth=worker_birth(psutil.Process()), secret='private-compression-worker')
     registered = rpc('worker.register', **scope, kind='compute')
     scope['epoch'] = registered['owner_epoch']
     store = RuntimeSessionStore(rpc, scope, home / 'worker-outboxes' / 'compression-worker')
+    store.cancel = cancel
     from run_agent import AIAgent
     agent = AIAgent(model='worker-model', provider='custom', base_url=command['url'], api_key='loopback-only',
         session_db=store, session_id=scope['session_id'], enabled_toolsets=[], skip_context_files=True,
@@ -59,6 +63,7 @@ def main():
         if command.get('restart'):
             _publish(command['ready'], json.dumps(dict(session_id=agent.session_id, epoch=store.scope['epoch'])))
             assert sys.stdin.readline().strip() == 'outage'
+            cancel.set()
             try:
                 store.touch_session_activity(agent.session_id, description='surviving rotated worker')
                 raise AssertionError('owner outage accepted a mutation')
@@ -66,6 +71,7 @@ def main():
                 assert len(store.journal['pending']) == 1
             _publish(command['outage'], 'pending')
             assert sys.stdin.readline().strip() == 'adopt'
+            cancel.clear()
             try:
                 store.retry_pending()
                 raise AssertionError('new owner accepted old epoch')

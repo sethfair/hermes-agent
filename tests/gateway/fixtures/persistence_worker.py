@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 import psutil
 
@@ -45,6 +46,8 @@ for line in sys.stdin:
             from agent import runtime_session_store as module
             home = Path(command['home'])
             transport = module.WorkerRPC(home)
+            cancel = threading.Event()
+            transport.cancel = cancel
             scope = {'profile_id': str(home), 'session_id': command['session_id'],
                      'execution_id': 'owned-worker', 'generation': 0,
                      'pid': os.getpid(), 'birth': worker_birth(psutil.Process()), 'secret': 'private-worker-secret'}
@@ -52,6 +55,7 @@ for line in sys.stdin:
             assert reason(lambda: transport('session.create', request_id='forbidden-worker-create', source='cli')) == 'permission_denied'
             scope['epoch'] = registration['owner_epoch']
             store = module.RuntimeSessionStore(transport, scope, home / 'worker-outboxes' / 'owned-worker', max_bytes=20000)
+            store.cancel = cancel
             sid = scope['session_id']
             store.try_acquire_session_turn_lease(sid, 'owned-worker-lease')
             (home / 'tool-marker').write_text('once')
@@ -60,6 +64,8 @@ for line in sys.stdin:
                          'function': {'name': 'inert', 'arguments': '{}'}}]},
                         {'role': 'tool', 'content': 'tool-marker', 'tool_call_id': 'call', 'tool_name': 'inert'}]
             original = store.rpc
+            old_budget = module.OWNER_SILENCE_BUDGET_S
+            module.OWNER_SILENCE_BUDGET_S = 0.0
             lost = []
             def lose_ack(method, **params):
                 original(method, **params)  # commit for real; only the acknowledgement is lost
@@ -68,6 +74,7 @@ for line in sys.stdin:
             store.rpc = lose_ack
             assert reason(lambda: store.append_messages_batch(sid, messages, turn_lease_holder='owned-worker-lease')) == 'lost_ack'
             store.rpc = original
+            module.OWNER_SILENCE_BUDGET_S = old_budget
             recovered = store.retry_pending()
             assert recovered[0]['count'] == 3
             saved = lost[0]
@@ -83,6 +90,7 @@ for line in sys.stdin:
                 'outbox_full': reason(lambda: store.append_messages_batch(sid, [{'role': 'user', 'content': 'x' * 30000}])),
                 'writable_canonical_fds': writable_fds(home), 'canonical_opens': list(canonical_opens)}
         elif command['op'] == 'outage':
+            cancel.set()
             store.retry_pending()  # clear the deliberate full-entry rejection
             failure = reason(lambda: store.record_auxiliary_usage(sid, 'compression', input_tokens=5, model='aux'))
             assert store.failure and store.journal['pending']
