@@ -193,6 +193,41 @@ def test_loop_stops_on_worker_failed_flag_default_reason(monkeypatch):
     assert res["reason"] == "worker failed: unknown"
 
 
+def test_loop_budget_fallback_carries_stable_nonsecret_identity(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"])
+    blocks = []
+
+    result = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda _prompt: pytest.fail("budget must stop before another turn"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason, **identity: blocks.append((reason, identity)),
+        max_turns=1,
+        first_response="not done",
+    )
+
+    assert result["outcome"] == "blocked_budget"
+    assert blocks[0][1] == {"kind": "transient", "subject": "goal-loop-budget"}
+
+
+def test_loop_unachievable_fallback_has_distinct_stable_identity(monkeypatch):
+    _patch_judge(monkeypatch, ["blocked"])
+    blocks = []
+
+    result = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda _prompt: pytest.fail("blocked verdict must not continue"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason, **identity: blocks.append((reason, identity)),
+        first_response="cannot do it",
+    )
+
+    assert result["outcome"] == "blocked_unachievable"
+    assert blocks[0][1] == {"kind": "capability", "subject": "goal-loop-unachievable"}
+
+
 
 
 

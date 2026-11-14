@@ -473,9 +473,18 @@ def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
     blocked = kb.get_task(conn, task_id)
     assert blocked is not None
     assert blocked.status == "blocked"
+    assert blocked.block_identity_state == "unknown"
     gave_up = _event(kb.list_events(conn, task_id), "gave_up")
     assert gave_up.payload is not None
     assert gave_up.payload["retry_status"] == "review"
+    assert kb.unblock_task(conn, task_id) is False
+    assert kb.classify_block(
+        conn,
+        task_id,
+        kind="transient",
+        subject="review-spawn-failure",
+        actor="operator",
+    )
     assert kb.unblock_task(conn, task_id)
     unblocked = kb.get_task(conn, task_id)
     assert unblocked is not None
@@ -489,6 +498,7 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
         task_id,
         reason="needs_input: maintainer decision required",
         kind="needs_input",
+        subject="maintainer/decision",
         expected_run_id=review.current_run_id,
     )
     blocked_event = _event(kb.list_events(conn, task_id), "blocked")
@@ -527,6 +537,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
         task_id,
         reason="dependency: parent contract is being refreshed",
         kind="dependency",
+        subject=parent_id,
         expected_run_id=review.current_run_id,
     )
     waiting = kb.get_task(conn, task_id)

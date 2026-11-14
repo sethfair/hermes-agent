@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_graph as kbg
 
 
@@ -264,6 +265,37 @@ def test_unknown_todo_cannot_recompute_promote_or_claim(home):
         assert kb.promote_task(conn, tid, actor="operator", dry_run=True)[0] is False
         assert kb.promote_task(conn, tid, actor="operator")[0] is False
         assert kb.claim_task(conn, tid, claimer="worker") is None
+
+
+def test_failure_breaker_replaces_stale_known_identity_with_unknown(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn, "failure breaker identity")
+        assert kb.block_task(
+            conn,
+            tid,
+            kind="needs_input",
+            subject="owner/decision",
+            reason="first hold",
+        )
+        assert kb.unblock_task(conn, tid)
+
+        assert kbd._record_task_failure(
+            conn,
+            tid,
+            "unrelated crash",
+            outcome="crashed",
+            force_trip=True,
+        )
+
+        blocked = kb.get_task(conn, tid)
+        assert blocked.status == "blocked"
+        assert blocked.block_identity_state == "unknown"
+        assert blocked.block_identity is None
+        assert blocked.block_kind is None
+        assert blocked.block_recurrences == 0
+        assert kb.unblock_task(conn, tid) is False
+        unknown = [event for event in kb.list_events(conn, tid) if event.kind == "block_identity_unknown"]
+        assert unknown[-1].payload["unknown_cause"] == "failure_breaker"
 
 
 def test_completion_clears_block_identity(home):

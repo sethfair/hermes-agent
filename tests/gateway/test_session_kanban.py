@@ -90,7 +90,10 @@ def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):
     with closing(connect(board='owned')) as conn:
         tid = kb.create_task(conn, title='Owned race', assignee='default')
         old = kb.claim_task(conn, tid)
-        kb.block_task(conn, tid, reason='replace claim', expected_run_id=old.current_run_id)
+        kb.block_task(
+            conn, tid, reason='replace claim', kind='transient', subject='claim-replacement',
+            expected_run_id=old.current_run_id,
+        )
         kb.unblock_task(conn, tid)
         new = kb.claim_task(conn, tid)
         dispatch._set_worker_pid(conn, tid, 424242, run_id=old.current_run_id, claim_lock=old.claim_lock)
@@ -126,7 +129,10 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     def create_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None):
         # Another process reclaims the task while the owner session is being created.
         with closing(connect(board='owned')) as conn:
-            kb.block_task(conn, task_id, reason='replace claim', expected_run_id=old.current_run_id)
+            kb.block_task(
+                conn, task_id, reason='replace claim', kind='transient', subject='claim-replacement',
+                expected_run_id=old.current_run_id,
+            )
             kb.unblock_task(conn, task_id)
             kb.claim_task(conn, task_id)
         return SimpleNamespace(session_id='owner-session', profile_id=str(tmp_path))

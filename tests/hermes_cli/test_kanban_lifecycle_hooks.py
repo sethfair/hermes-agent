@@ -100,10 +100,12 @@ def test_block_hook_runs_after_commit_with_write_lock_free(
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="child", assignee="worker")
-        kb.link_tasks(conn, parent_id=kb.create_task(conn, title="parent"), child_id=tid)
+        parent_id = kb.create_task(conn, title="parent")
+        kb.link_tasks(conn, parent_id=parent_id, child_id=tid)
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
-        assert kb.block_task(conn, tid, reason="waiting", kind=kind)
+        subject = parent_id if kind == "dependency" else "owner/decision"
+        assert kb.block_task(conn, tid, reason="waiting", kind=kind, subject=subject)
     finally:
         conn.close()
     assert seen == [(status, event, "free")]

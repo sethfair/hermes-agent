@@ -805,7 +805,9 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
-        kb.block_task(conn, tid, reason="waiting")
+        kb.block_task(
+            conn, tid, reason="waiting", kind="transient", subject="tool-unblock-test"
+        )
     finally:
         conn.close()
 
