@@ -89,3 +89,6 @@ Final-head evidence commands (run after the final commit):
 - `python scripts/check` → exit 0 (17 checks)
 - `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/hermes_cli/test_kanban_per_profile_cap.py tests/hermes_cli/test_kanban_host_cap.py tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_dispatch_tick_hook.py` → exit 0 (54 passed)
 - `scripts/run_tests.sh -j 1 tests/plugins/test_kanban_dashboard_plugin.py` → exit 0 (38 passed)
+
+Recorded final output: `git rev-parse HEAD` → `410396ddebbde4ce0d38ba5fad930eb72141759a`;
+the exact `main...HEAD` count command → `2133` changed lines.
