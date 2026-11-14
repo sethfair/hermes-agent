@@ -301,17 +301,13 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     return _env_int("HERMES_KANBAN_CLAIM_TTL_SECONDS", DEFAULT_CLAIM_TTL_SECONDS, minimum=1)
 
 
-# ``detect_crashed_workers`` skips ``_pid_alive`` this long after start: the
-# fork -> /proc window can report a fresh worker dead.
+# Grace period for the fork -> /proc window.
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
-# Worker exit "provider rate-limited": released WITHOUT counting a failure (the
-# breaker must never trip on a throttle). 75 == BSD EX_TEMPFAIL.
+# Worker exit "provider rate-limited": released without counting a failure. 75 == BSD EX_TEMPFAIL.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
-# Worker exit "provider rejected the configuration": credential revoked (401/403), model gone
-# (404), TLS chain broken — a retry cannot fix it, so the dispatcher parks the card blocked on
-# the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
+# Worker exit "provider rejected configuration": retry cannot fix it; 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
 
@@ -325,17 +321,12 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
-DEFAULT_HOST_LOSS_COOLDOWN_SECONDS = 120
-
-
 # --- Paths ---
-
 DEFAULT_BOARD = "default"
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override", default=None,
 )
-# Machine flows that enumerate boards (gateway notifier / watcher / dispatcher
-# ticks) resolve board paths env-pin-first — see pin_first_board_resolution().
+# Machine board enumeration resolves paths env-pin-first; see pin_first_board_resolution().
 _PIN_FIRST_BOARD_RESOLUTION: ContextVar[bool] = ContextVar(
     "hermes_kanban_pin_first_board_resolution", default=False,
 )
@@ -372,8 +363,7 @@ def scoped_current_board(slug: str):
         _CURRENT_BOARD_OVERRIDE.reset(token)
 
 
-# Slug = directory name: strict enough to stop traversal / separators, loose
-# enough for kebab-case. Display names (spaces, emoji) live in board.json.
+# Slugs are directory names; display names live in board.json.
 _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 
 

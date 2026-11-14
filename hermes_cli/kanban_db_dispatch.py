@@ -1527,7 +1527,7 @@ def check_respawn_guard(
     if latest_run is not None and latest_run["outcome"] in ("crashed", "reclaimed"):
         # A worker lost to its host (a stalled gateway): retried forever but spaced, so every
         # card respawning at once does not hammer the stall.
-        host_cooldown = _kb.DEFAULT_HOST_LOSS_COOLDOWN_SECONDS
+        host_cooldown = DEFAULT_HOST_LOSS_COOLDOWN_SECONDS
         if host_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < host_cooldown:
@@ -2872,5 +2872,7 @@ def run_daemon(
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
+
+DEFAULT_HOST_LOSS_COOLDOWN_SECONDS = 120
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw

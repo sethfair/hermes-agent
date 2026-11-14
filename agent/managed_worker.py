@@ -468,10 +468,11 @@ def main():
         channel.send('hello', **hello())
         frame = validate_bootstrap(read_frame(sys.stdin.buffer))
         execute(frame, channel)
-    except Exception:
+    except Exception as exc:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')
-        channel.send('error', reason='managed_worker_failed')
+        from agent.worker_errors import failure_reason
+        channel.send('error', reason=failure_reason(exc))
         return 1
     finally:
         channel.stream.close()
