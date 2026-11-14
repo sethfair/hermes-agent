@@ -39,6 +39,7 @@ def _claim_lane_task(
             conn, attempt_id=monitor_attempt_id, task_id=task_id,
             ready_generation=generation[0] if generation else 0, run_generation=int(run_generation),
         )
+        conn.commit()
     if lane == "ready":
         return claim(conn, task_id, ttl_seconds=ttl_seconds, admission_id=admission_id)
     return claim(conn, task_id, ttl_seconds=ttl_seconds)
@@ -114,6 +115,7 @@ def _dispatch_lane_task(
         return False
     workspace, branch_name, workspace_error = _dispatch._resolve_lane_workspace(claimed, board)
     if workspace_error is not None:
+        _decision(result, task_id, "workspace_failed", str(workspace_error))
         if _dispatch._record_task_failure(
             conn, claimed.id, f"workspace: {workspace_error}", outcome="spawn_failed",
             failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -142,4 +144,5 @@ def _dispatch_lane_task(
         release_claim=True, end_run=True, infrastructure=infrastructure,
     ):
         result.auto_blocked.append(claimed.id)
+    _decision(result, task_id, "spawn_failed", str(spawn_error))
     return False

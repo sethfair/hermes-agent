@@ -2072,9 +2072,21 @@ def dispatch_once(
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
-        # A protected scope cannot be established safely without the DB path
-        # and its lock. Refuse closed rather than bypassing the fence.
-        result = DispatchResult(monitor_scope_refused=True)
+        # An unprotected in-memory/legacy connection still has a valid
+        # dispatcher fallback.  Protected boards must never bypass their lock
+        # and admission fence when the path cannot be resolved.
+        from hermes_cli import kanban_ready_monitor as monitor
+        if monitor.has_protected_scope(conn):
+            result = DispatchResult(monitor_scope_refused=True)
+        else:
+            result = _dispatch_once_locked(
+                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+                max_spawn=max_spawn, max_in_progress=max_in_progress,
+                failure_limit=failure_limit, stale_timeout_seconds=stale_timeout_seconds,
+                board=board, default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconcile_orphans=reconcile_orphans,
+            )
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
@@ -2318,9 +2330,6 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
-# The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
-# critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
-# lock hold and stall a sibling dispatcher's tick.
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -2352,7 +2361,11 @@ def _dispatch_once_locked(
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
+    if conn.in_transaction:
+        conn.commit()
     if not may_spawn:
+        for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'"):
+            monitor.reconcile_truthful_hold(conn, episode["task_id"])
         monitor.ensure_ready_decisions(
             conn, result, "memory_pressure" if result.memory_pressure else "board_cap",
         )
@@ -2396,6 +2409,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        monitor_attempt_id=monitor_attempt_id, monitor_context=monitor_context,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2418,10 +2432,6 @@ def _dispatch_once_locked(
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
 
-    # A review agent (sdlc-review) approves (→ done) or requests changes
-    # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
-    # checks the FULL shared ``spawn_budget`` — the reservation above caps the
-    # ready lane, it grants no extra capacity here.
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             continue
@@ -2430,6 +2440,8 @@ def _dispatch_once_locked(
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+    for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'"):
+        monitor.reconcile_truthful_hold(conn, episode["task_id"])
     monitor.ensure_ready_decisions(conn, result, "shared_budget_exhausted")
     return result
 

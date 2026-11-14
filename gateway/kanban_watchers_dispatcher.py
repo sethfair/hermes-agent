@@ -161,12 +161,24 @@ class _KanbanDispatcher:
         revision = info.commit or info.base_version
         profile = scope["profile"]
         aged = (cfg.get("aged_ready") or {}) if isinstance(cfg, dict) else {}
+        aged_profiles = aged.get("dispatch_profiles", cfg.get("dispatch_profiles", ()))
+        dispatch_profiles = tuple(sorted({str(item).strip() for item in aged_profiles or () if str(item).strip()}))
+        if not dispatch_profiles:
+            dispatch_profiles = (profile,)
+        # Multi-writer rosters identify the writer by partition, not by one
+        # board-global controller id.
+        if not configured_id:
+            for member in ((aged.get("expected_writer_scopes", {}).get(scope["board_scope_id"], {}) or {}).get("members", ())):
+                if profile in (member.get("profiles") or ()):
+                    configured_id = str(member.get("writer_ref") or "")
+                    dispatch_profiles = tuple(sorted(str(p) for p in member.get("profiles", ()) if str(p).strip()))
+                    break
         return monitor.MonitorWriterContext(
             board_scope_id=scope["board_scope_id"], profile=profile,
             writer_ref=configured_id or self.writer_ref,
             controller_generation=self.controller_generation, activation_epoch=scope["activation_epoch"],
             roster_generation=scope["roster_generation"], roster_digest=scope["roster_digest"],
-            installed_revision=revision, dispatch_profiles=(profile,),
+            installed_revision=revision, dispatch_profiles=dispatch_profiles,
             min_age_seconds=int(aged.get("min_age_seconds", 1800)),
             min_eligible_misses=int(aged.get("min_eligible_misses", 3)),
         )

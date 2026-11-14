@@ -101,6 +101,49 @@ def test_matching_admission_is_single_use_and_replay_is_refused():
     ).fetchone()[0] == "consumed"
 
 
+def test_invalid_admission_latches_a_durable_unknown_fault():
+    conn = _db()
+    task_id = "task-invalid-admission"
+    conn.execute("INSERT INTO tasks(id,title,status,created_at,assignee) VALUES(?,?,?,?,?)",
+                 (task_id, "Ready", "ready", 100, "p1"))
+    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                 (task_id, "created", '{"status":"ready"}', 100))
+    scope = monitor.activate_scope(conn, profile="p1", state="active", legacy_exclusion_proof_state="proven")
+    conn.commit()
+    with kb.write_txn(conn):
+        assert kb._claim_and_open_run(conn, task_id, "ready", "bad", 200, 150,
+                                      admission_id="not-a-token") is None
+    assert conn.execute("SELECT COUNT(*) FROM kanban_writer_faults WHERE diagnostic_code='invalid_claim_admission'").fetchone()[0] == 1
+    health = monitor.ready_health_snapshot(conn)
+    assert health["profiles"][0]["state"] == "UNKNOWN"
+    assert scope["activation_epoch"]
+
+
+def test_begin_attempt_commits_before_real_claim_transaction():
+    conn = _db()
+    task_id = "task-durable-attempt"
+    conn.execute("INSERT INTO tasks(id,title,status,created_at,assignee) VALUES(?,?,?,?,?)",
+                 (task_id, "Ready", "ready", 100, "p1"))
+    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                 (task_id, "created", '{"status":"ready"}', 100))
+    scope = monitor.activate_scope(conn, profile="p1", state="active", legacy_exclusion_proof_state="proven")
+    ctx = monitor.MonitorWriterContext(
+        board_scope_id=scope["board_scope_id"], profile="p1", writer_ref="w1",
+        controller_generation="g1", activation_epoch=scope["activation_epoch"],
+        roster_generation=scope["roster_generation"], roster_digest=scope["roster_digest"],
+        installed_revision="rev",
+    )
+    monitor.publish_controller_observation(conn, controller=ctx)
+    attempt = monitor.begin_dispatch_attempt(conn, controller=ctx, surface="standalone", now=150)
+    assert attempt and not conn.in_transaction
+    token = monitor.arm_claim_admission(conn, attempt_id=attempt["id"], task_id=task_id,
+                                        ready_generation=1, run_generation=0)
+    conn.commit()
+    with kb.write_txn(conn):
+        assert kb._claim_and_open_run(conn, task_id, "ready", "new", 200, 150,
+                                      admission_id=token) is not None
+
+
 def test_tick_ledger_replay_does_not_increment_or_duplicate_episode():
     conn = _db()
     task_id = "task-replay"

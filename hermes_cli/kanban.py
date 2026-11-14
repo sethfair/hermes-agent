@@ -629,8 +629,14 @@ def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
 def _cmd_ready_health(args: argparse.Namespace) -> int:
     """Render the monitor projection without exposing task content or mutation controls."""
     from hermes_cli import kanban_ready_monitor as monitor
+    from hermes_cli.config import load_config
+    try:
+        loaded = load_config()
+        config = loaded.get("kanban", {}) if isinstance(loaded, dict) else {}
+    except Exception:  # health: allow BLE001 -- unreadable config leaves the projection fail-closed
+        config = None
     with kbc.connect_closing() as conn:
-        payload = monitor.ready_health_snapshot(conn)
+        payload = monitor.ready_health_snapshot(conn, config=config)
     if getattr(args, "task", None):
         payload["cards"] = [card for card in payload["cards"] if card["task_id"] == args.task]
     if getattr(args, "json", False):

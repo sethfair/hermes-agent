@@ -1248,8 +1248,14 @@ def get_stats(board: Optional[str] = Query(None)):
 def ready_health(board: Optional[str] = Query(None), task: Optional[str] = Query(None)):
     """Read-only aged-Ready projection; UNKNOWN is preserved as a state."""
     from hermes_cli import kanban_ready_monitor as monitor
+    try:
+        from hermes_cli.config import load_config
+        loaded = load_config()
+        config = loaded.get("kanban", {}) if isinstance(loaded, dict) else {}
+    except Exception:  # health: allow BLE001 -- unreadable config leaves the projection fail-closed
+        config = None
     with _board_conn(board) as (board, conn):
-        payload = monitor.ready_health_snapshot(conn)
+        payload = monitor.ready_health_snapshot(conn, config=config)
     if task:
         payload["cards"] = [card for card in payload["cards"] if card["task_id"] == task]
     return payload
