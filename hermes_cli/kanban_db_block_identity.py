@@ -342,6 +342,16 @@ def append_unknown_event(
     )
 
 
+def establish_unknown_hold(conn: sqlite3.Connection, task_id: str, cause: str) -> None:
+    """Replace stale identity when a direct writer creates a different hold."""
+    conn.execute(
+        "UPDATE tasks SET block_kind = NULL, block_recurrences = 0, "
+        "block_identity = NULL, block_identity_state = 'unknown' WHERE id = ?",
+        (task_id,),
+    )
+    append_unknown_event(conn, task_id, cause)
+
+
 def migrate_legacy_block_identities(conn: sqlite3.Connection) -> None:
     """Classify pre-identity rows once from complete, corroborated event evidence."""
     pending = conn.execute(

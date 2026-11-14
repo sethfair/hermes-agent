@@ -228,6 +228,57 @@ def test_loop_unachievable_fallback_has_distinct_stable_identity(monkeypatch):
     assert blocks[0][1] == {"kind": "capability", "subject": "goal-loop-unachievable"}
 
 
+@pytest.mark.parametrize(
+    ("kind", "subject"),
+    [
+        ("transient", "goal-loop-budget"),
+        ("capability", "goal-loop-unachievable"),
+        ("transient", "goal-loop-finalization"),
+    ],
+)
+def test_cli_goal_fallback_persists_identity_through_real_database(
+    tmp_path, monkeypatch, kind, subject,
+):
+    """The command-line producer must cross its public DB boundary, including finalization."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from hermes_cli.cli_single_query import _run_kanban_goal_loop_q
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(
+            conn, title="goal", body="finish", assignee="worker", goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    def exercise(**kwargs):
+        kwargs["block_fn"]("fallback", kind=kind, subject=subject)
+
+    monkeypatch.setattr("hermes_cli.goals.run_kanban_goal_loop", exercise)
+    cli_facade = ModuleType("cli")
+    cli_facade.__dict__.update(
+        _int_or=lambda value, default: int(value) if str(value).isdigit() else default,
+        _sync_cli_session_id_from_agent=lambda _cli: None,
+    )
+    monkeypatch.setitem(sys.modules, "cli", cli_facade)
+    cli = SimpleNamespace(agent=SimpleNamespace(), conversation_history=[])
+    _run_kanban_goal_loop_q(cli, "not done", run_turn=lambda _prompt: "still not done")  # type: ignore[arg-type]
+
+    with connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == kind
+        assert task.block_identity_state == "known"
+        assert subject in task.block_identity
+
+
 
 
 

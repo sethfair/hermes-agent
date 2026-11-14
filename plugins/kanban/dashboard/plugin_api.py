@@ -580,6 +580,34 @@ class _StatusRejected(Exception):
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
 
 
+def _unknown_release_refused(conn, task_id: str, status: Optional[str]) -> bool:
+    """Fail closed before a compound dashboard request mutates any task field."""
+    if status not in {"ready", "todo", "triage"}:
+        return False
+    row = conn.execute(
+        "SELECT status, block_kind, block_recurrences, block_identity, block_identity_state "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return bool(
+        row and row["status"] in {"blocked", "todo", "triage"}
+        and kanban_db.effective_block_identity(row).state == "unknown"
+    )
+
+
+def _dashboard_block(conn, task_id: str, payload) -> bool:
+    """A typed block request against an existing UNKNOWN hold is classification."""
+    kind = getattr(payload, "block_kind", None)
+    subject = getattr(payload, "block_subject", None)
+    current = kanban_db.get_task(conn, task_id)
+    if current is not None and current.status == "blocked" and kind is not None and subject is not None:
+        return kanban_db.classify_block(
+            conn, task_id, kind=kind, subject=subject, actor="dashboard",
+        )
+    return kanban_db.block_task(
+        conn, task_id, reason=getattr(payload, "block_reason", None), kind=kind, subject=subject,
+    )
+
+
 def _drag_to(conn, task_id: str, s: str) -> bool:
     """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``;
     leaving ``review`` goes through ``reopen_review_task`` (stale-run recovery, parent re-gate,
@@ -598,13 +626,7 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(
-        conn,
-        tid,
-        reason=getattr(p, "block_reason", None),
-        kind=getattr(p, "block_kind", None),
-        subject=getattr(p, "block_subject", None),
-    ),
+    "blocked": _dashboard_block,
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
@@ -725,6 +747,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
             if not classified:
                 raise _conflict("block classification refused")
+        if _unknown_release_refused(conn, task_id, payload.status):
+            raise _conflict(f"status transition to {payload.status!r} not valid from current state")
         if payload.assignee is not None and not review_assignee_deferred:
             with _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
@@ -870,6 +894,9 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         raise ValueError("block_kind and block_subject must be provided together")
     if has_block_identity and payload.status not in (None, "blocked"):
         raise ValueError("block classification and release must be separate requests")
+    if _unknown_release_refused(conn, tid, payload.status):
+        entry.update(ok=False, error=f"transition to {payload.status!r} refused")
+        return
     if has_block_identity and payload.status is None and not kanban_db.classify_block(
         conn,
         tid,
