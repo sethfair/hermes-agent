@@ -46,7 +46,8 @@ def test_owner_progress_reaches_the_firers_ledger_row(tmp_path, monkeypatch):
         with _transaction() as conn:
             return conn.execute('SELECT progress_at FROM executions WHERE id=?', (execution['id'],)).fetchone()[0]
 
-    def run_job(job, *, extra_prompt, execution_id, cancel_event):
+    def run_job(job, *, extra_prompt, execution_id, cancel_event, prepared_script):
+        assert prepared_script is None
         stamper = scheduler_liveness.ExecutionProgressStamper(
             str(job.get('execution_id') or ''), 'job', idle_seconds=lambda: 0.0, every_seconds=0.001)
         stamper._last -= 1  # its stamp cadence has elapsed
@@ -114,7 +115,8 @@ def test_owner_cron_run_binds_its_claim_fence(tmp_path, monkeypatch):
     monkeypatch.setattr(authority, '_schedule', lambda ref: admitted.set())
     seen = []
 
-    def run_job(job, *, extra_prompt, execution_id, cancel_event):
+    def run_job(job, *, extra_prompt, execution_id, cancel_event, prepared_script):
+        assert prepared_script is None
         seen.append(current_scope())
         return (True, 'doc', 'answer', None)
     monkeypatch.setattr(scheduler, 'run_job', run_job)

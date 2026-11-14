@@ -20,9 +20,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from hermes_cli._startup_fast import project_root_str
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
-
 TARGET_JOB_ID = "61a6b39fba27"
 TARGET_PROFILE_NAME = "rowan"
 _REFERENCE_SHA = {
@@ -40,7 +40,7 @@ _TEST_AFTER_COMMIT = None
 
 
 def _runtime_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(project_root_str())
 
 
 def is_target(job: dict) -> bool:
@@ -480,7 +480,7 @@ def _read_proposal(source: Path, directory: Path, execution_id: str, epoch_id: s
     env["HERMES_HOME"] = str(get_hermes_home().resolve())
     source_text = (
         "import pathlib,sys; "
-        f"sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r}); "
+        f"sys.path.insert(0,{str(_runtime_root())!r}); "
         "from cron.scheduler_local_observation import load_private_package; "
         f"modules=load_private_package(pathlib.Path({str(source)!r})); "
         "v2=modules['local_observation_v2'];proposal=modules['observer_proposal_v2']; "
