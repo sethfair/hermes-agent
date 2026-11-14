@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
@@ -929,6 +930,13 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _trusted_board_for_path(path: Path, board: Optional[str]) -> Optional[str]:
     """Derive board identity from the resolved physical database when possible."""
     resolved = path.expanduser().resolve()
+    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if (
+        pinned
+        and resolved == Path(pinned).expanduser().resolve()
+        and _kb._explicit_board_intent_pinned()
+    ):
+        return None
     if resolved == (_kb.kanban_home() / "kanban.db").resolve():
         return _kb.DEFAULT_BOARD
     try:
