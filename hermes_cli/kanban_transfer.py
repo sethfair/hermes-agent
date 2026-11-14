@@ -28,6 +28,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -101,6 +102,17 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
         (int(time.time()),),
     )
     conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
+    # Monitor observations are controller-local evidence.  Never export a
+    # lease, admission, episode, intent, or fault into another installation.
+    for table in (
+        "kanban_controller_observations", "kanban_dispatch_attempts",
+        "kanban_claim_admissions", "kanban_writer_faults",
+        "kanban_ready_tick_observations", "kanban_ready_state",
+        "kanban_ready_episodes", "kanban_ready_escalation_intents",
+        "kanban_monitor_scope_activation",
+    ):
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            conn.execute(f"DELETE FROM {table}")
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -245,6 +257,11 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
 
     with kb.write_txn(conn):
         _scrub_local_state(conn)
+        conn.execute("DELETE FROM kanban_board_identity")
+        conn.execute(
+            "INSERT INTO kanban_board_identity(singleton,board_scope_id,created_at,identity_version) VALUES(1,?,?,1)",
+            (str(uuid.uuid4()), now),
+        )
 
         dropped = rehomed = 0
         for row in conn.execute("SELECT id, task_id, stored_path FROM task_attachments").fetchall():

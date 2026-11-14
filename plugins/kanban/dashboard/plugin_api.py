@@ -1271,6 +1271,8 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
     with _board_conn(board) as (board, conn):
         result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        if result.monitor_scope_refused:
+            raise HTTPException(status_code=409, detail="monitor_scope_refused: protected scope requires an admitted writer context")
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

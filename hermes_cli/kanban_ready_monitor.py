@@ -10,6 +10,8 @@ import json
 import secrets
 import sqlite3
 import time
+import uuid
+import dataclasses
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping
@@ -22,6 +24,24 @@ class ReadyDecision(str, Enum):
     ELIGIBLE_MISSED = "eligible_missed"
     CLAIMED = "claimed"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class MonitorWriterContext:
+    board_scope_id: str
+    profile: str
+    writer_ref: str
+    controller_generation: str
+    activation_epoch: str
+    roster_generation: str
+    roster_digest: str
+    installed_revision: str
+    protocol_version: int = PROTOCOL_VERSION
+    compatibility_identity: str = COMPATIBILITY_IDENTITY
+    tick_id: str = ""
+
+    def for_tick(self) -> "MonitorWriterContext":
+        return dataclasses.replace(self, tick_id=str(uuid.uuid4()))
 
 
 SUPPRESSION_REASONS = (
@@ -128,6 +148,36 @@ MONITOR_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kanban_board_identity (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), board_scope_id TEXT NOT NULL,
  created_at INTEGER NOT NULL, identity_version INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS kanban_monitor_scope_activation (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, board_scope_id TEXT NOT NULL, profile TEXT NOT NULL,
+ activation_epoch TEXT NOT NULL, roster_generation TEXT NOT NULL, roster_digest TEXT NOT NULL,
+ protocol_version INTEGER NOT NULL, compatibility_identity TEXT NOT NULL,
+ legacy_exclusion_control_digest TEXT, legacy_exclusion_proof_state TEXT NOT NULL DEFAULT 'unproven',
+ state TEXT NOT NULL DEFAULT 'pending', activated_at INTEGER NOT NULL, disabled_at INTEGER,
+ UNIQUE(board_scope_id, profile, activation_epoch));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_monitor_scope_current
+ ON kanban_monitor_scope_activation(board_scope_id, profile) WHERE disabled_at IS NULL;
+CREATE TABLE IF NOT EXISTS kanban_dispatch_attempts (
+ id TEXT PRIMARY KEY, board_scope_id TEXT NOT NULL, profile TEXT NOT NULL,
+ activation_epoch TEXT NOT NULL, writer_ref_digest TEXT NOT NULL, controller_generation TEXT NOT NULL,
+ tick_id TEXT NOT NULL, surface TEXT NOT NULL, protocol_version INTEGER NOT NULL,
+ compatibility_identity TEXT NOT NULL, installed_revision TEXT NOT NULL,
+ roster_generation TEXT NOT NULL, roster_digest TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'open',
+ started_at INTEGER NOT NULL, completed_at INTEGER, decision_count INTEGER NOT NULL DEFAULT 0,
+ diagnostic_code TEXT, UNIQUE(activation_epoch, writer_ref_digest, controller_generation, tick_id, board_scope_id));
+CREATE TABLE IF NOT EXISTS kanban_claim_admissions (
+ token TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, board_scope_id TEXT NOT NULL, profile TEXT NOT NULL,
+ activation_epoch TEXT NOT NULL, writer_ref_digest TEXT NOT NULL, controller_generation TEXT NOT NULL,
+ task_id TEXT NOT NULL, ready_generation INTEGER NOT NULL, run_generation INTEGER NOT NULL,
+ state TEXT NOT NULL DEFAULT 'armed', created_at INTEGER NOT NULL, consumed_at INTEGER);
+CREATE TABLE IF NOT EXISTS kanban_writer_faults (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, board_scope_id TEXT NOT NULL, profile TEXT,
+ activation_epoch TEXT, diagnostic_code TEXT NOT NULL, writer_ref_digest TEXT,
+ created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS kanban_controller_observations (
+ board_scope_id TEXT NOT NULL, profile TEXT NOT NULL, writer_ref_digest TEXT NOT NULL,
+ controller_generation TEXT NOT NULL, activation_epoch TEXT, last_seen_at INTEGER NOT NULL,
+ state TEXT NOT NULL, diagnostic_code TEXT, PRIMARY KEY(board_scope_id, writer_ref_digest, controller_generation, profile));
 CREATE TABLE IF NOT EXISTS kanban_ready_state (
  task_id TEXT PRIMARY KEY, ready_generation INTEGER, ready_since INTEGER,
  run_generation INTEGER NOT NULL DEFAULT 0, first_observed_at INTEGER NOT NULL,
@@ -156,6 +206,36 @@ CREATE TABLE IF NOT EXISTS kanban_ready_tick_observations (
  created_at INTEGER NOT NULL, UNIQUE(activation_epoch, controller_ref_digest,
  controller_generation, tick_id, task_id));
 CREATE INDEX IF NOT EXISTS idx_ready_episode_task ON kanban_ready_episodes(task_id);
+CREATE INDEX IF NOT EXISTS idx_monitor_fault_scope ON kanban_writer_faults(board_scope_id, profile, activation_epoch);
+CREATE INDEX IF NOT EXISTS idx_monitor_admission_attempt ON kanban_claim_admissions(attempt_id, state);
+CREATE TRIGGER IF NOT EXISTS kanban_ready_claim_admission
+BEFORE UPDATE OF status ON tasks
+WHEN OLD.status = 'ready' AND NEW.status = 'running'
+ AND EXISTS (SELECT 1 FROM kanban_monitor_scope_activation s
+             WHERE s.profile = COALESCE(OLD.assignee, '') AND s.disabled_at IS NULL
+               AND s.state IN ('pending','active','faulted'))
+BEGIN
+ INSERT INTO kanban_writer_faults(board_scope_id, profile, activation_epoch, diagnostic_code, created_at)
+ SELECT s.board_scope_id, s.profile, s.activation_epoch, 'unadmitted_ready_claim_refused', strftime('%s','now')
+ FROM kanban_monitor_scope_activation s
+ WHERE s.profile = COALESCE(OLD.assignee, '') AND s.disabled_at IS NULL
+   AND s.state IN ('pending','active','faulted')
+   AND NOT EXISTS (SELECT 1 FROM kanban_claim_admissions a
+                   WHERE a.token = NEW.dispatch_admission_id AND a.state = 'armed'
+                     AND a.task_id = OLD.id AND a.profile = OLD.assignee
+                     AND a.activation_epoch = s.activation_epoch
+                     AND a.attempt_id IN (SELECT id FROM kanban_dispatch_attempts WHERE state = 'open'));
+ SELECT RAISE(IGNORE)
+ WHERE NOT EXISTS (SELECT 1 FROM kanban_claim_admissions a
+                   WHERE a.token = NEW.dispatch_admission_id AND a.state = 'armed'
+                     AND a.task_id = OLD.id AND a.profile = OLD.assignee
+                     AND a.activation_epoch = (SELECT activation_epoch FROM kanban_monitor_scope_activation
+                                               WHERE profile=OLD.assignee AND disabled_at IS NULL
+                                               ORDER BY id DESC LIMIT 1)
+                     AND a.attempt_id IN (SELECT id FROM kanban_dispatch_attempts WHERE state = 'open'));
+ UPDATE kanban_claim_admissions SET state='consumed', consumed_at=strftime('%s','now')
+ WHERE token = NEW.dispatch_admission_id AND state='armed';
+END;
 """
 
 
@@ -165,9 +245,129 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if row is None:
         conn.execute(
             "INSERT INTO kanban_board_identity VALUES (1, ?, ?, 1)",
-            (secrets.token_hex(16), int(time.time())),
+            (str(uuid.uuid4()), int(time.time())),
         )
     conn.commit()
+
+
+def _scope(conn: sqlite3.Connection, profile: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM kanban_monitor_scope_activation WHERE profile=? AND disabled_at IS NULL "
+        "ORDER BY id DESC LIMIT 1", (profile,)
+    ).fetchone()
+
+
+def activate_scope(conn: sqlite3.Connection, *, profile: str, state: str = "pending",
+                   board_scope_id: str | None = None, roster_generation: str = "roster",
+                   roster_digest: str = "roster-digest", legacy_exclusion_proof_state: str = "unproven",
+                   now: int | None = None) -> dict[str, Any]:
+    """Create a protected epoch. Activation never infers legacy exclusion."""
+    ensure_schema(conn)
+    now = int(time.time()) if now is None else int(now)
+    board_scope_id = board_scope_id or conn.execute(
+        "SELECT board_scope_id FROM kanban_board_identity WHERE singleton=1"
+    ).fetchone()[0]
+    prior = _scope(conn, profile)
+    if prior:
+        conn.execute("UPDATE kanban_monitor_scope_activation SET disabled_at=? WHERE id=?", (now, prior["id"]))
+    epoch = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO kanban_monitor_scope_activation "
+        "(board_scope_id,profile,activation_epoch,roster_generation,roster_digest,protocol_version,"
+        "compatibility_identity,legacy_exclusion_proof_state,state,activated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (board_scope_id, profile, epoch, roster_generation, roster_digest, PROTOCOL_VERSION,
+         COMPATIBILITY_IDENTITY, legacy_exclusion_proof_state, state, now),
+    )
+    return dict(conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE activation_epoch=?", (epoch,)).fetchone())
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def begin_dispatch_attempt(conn: sqlite3.Connection, *, controller: MonitorWriterContext,
+                           surface: str, now: int | None = None) -> dict[str, Any] | None:
+    ensure_schema(conn)
+    now = int(time.time()) if now is None else int(now)
+    scope = _scope(conn, controller.profile)
+    if not scope or scope["board_scope_id"] != controller.board_scope_id:
+        return None
+    if (scope["activation_epoch"] != controller.activation_epoch or
+            scope["roster_generation"] != controller.roster_generation or
+            scope["roster_digest"] != controller.roster_digest or
+            scope["protocol_version"] != controller.protocol_version or
+            scope["compatibility_identity"] != controller.compatibility_identity or
+            not controller.installed_revision):
+        conn.execute("INSERT INTO kanban_writer_faults(board_scope_id,profile,activation_epoch,diagnostic_code,created_at) VALUES(?,?,?,?,?)",
+                     (scope["board_scope_id"], controller.profile, scope["activation_epoch"], "incompatible_writer_context", now))
+        return None
+    attempt_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO kanban_dispatch_attempts(id,board_scope_id,profile,activation_epoch,writer_ref_digest,controller_generation,tick_id,surface,protocol_version,compatibility_identity,installed_revision,roster_generation,roster_digest,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (attempt_id, controller.board_scope_id, controller.profile, controller.activation_epoch,
+                  _digest(controller.writer_ref), controller.controller_generation, controller.tick_id or str(uuid.uuid4()), surface,
+                  controller.protocol_version, controller.compatibility_identity, controller.installed_revision,
+                  controller.roster_generation, controller.roster_digest, now))
+    return dict(conn.execute("SELECT * FROM kanban_dispatch_attempts WHERE id=?", (attempt_id,)).fetchone())
+
+
+def arm_claim_admission(conn: sqlite3.Connection, *, attempt_id: str, task_id: str,
+                        ready_generation: int, run_generation: int) -> str:
+    attempt = conn.execute("SELECT * FROM kanban_dispatch_attempts WHERE id=? AND state='open'", (attempt_id,)).fetchone()
+    if not attempt:
+        raise ValueError("dispatch attempt is not open")
+    token = str(uuid.uuid4())
+    conn.execute("INSERT INTO kanban_claim_admissions(token,attempt_id,board_scope_id,profile,activation_epoch,writer_ref_digest,controller_generation,task_id,ready_generation,run_generation,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                 (token, attempt_id, attempt["board_scope_id"], attempt["profile"], attempt["activation_epoch"],
+                  attempt["writer_ref_digest"], attempt["controller_generation"], task_id, ready_generation, run_generation, int(time.time())))
+    return token
+
+
+def has_protected_scope(conn: sqlite3.Connection) -> bool:
+    ensure_schema(conn)
+    return conn.execute(
+        "SELECT 1 FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
+        "AND state IN ('pending','active','faulted') LIMIT 1"
+    ).fetchone() is not None
+
+
+def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterContext,
+                         attempt_id: str, decisions: list[Mapping[str, Any]], now: int | None = None) -> bool:
+    """Persist a tick exactly once; replayed task decisions do not increment."""
+    ensure_schema(conn)
+    now = int(time.time()) if now is None else int(now)
+    attempt = conn.execute("SELECT * FROM kanban_dispatch_attempts WHERE id=?", (attempt_id,)).fetchone()
+    if not attempt or attempt["state"] != "open":
+        return False
+    scope = _scope(conn, controller.profile)
+    projection_allowed = bool(scope and scope["state"] == "active" and
+                              scope["legacy_exclusion_proof_state"] == "proven")
+    for decision in decisions:
+        task_id = str(decision["task_id"])
+        duplicate = conn.execute(
+            "SELECT 1 FROM kanban_ready_tick_observations WHERE activation_epoch=? AND controller_ref_digest=? "
+            "AND controller_generation=? AND tick_id=? AND task_id=?",
+            (controller.activation_epoch, _digest(controller.writer_ref), controller.controller_generation,
+             attempt["tick_id"], task_id),
+        ).fetchone()
+        if duplicate:
+            continue
+        conn.execute(
+            "INSERT INTO kanban_ready_tick_observations VALUES(?,?,?,?,?,?)",
+            (controller.activation_epoch, _digest(controller.writer_ref), controller.controller_generation,
+             attempt["tick_id"], task_id, now),
+        )
+        observe_ready(conn, task_id, now=now, decision=(str(decision.get("decision", "unknown"))
+                      if projection_allowed else "unknown"),
+                      guard_reason=decision.get("guard_reason"), profile=controller.profile,
+                      controller_ref_digest=_digest(controller.writer_ref),
+                      controller_generation=controller.controller_generation,
+                      activation_epoch=controller.activation_epoch, tick_id=attempt["tick_id"],
+                      min_age_seconds=int(decision.get("min_age_seconds", 1800)),
+                      min_eligible_misses=int(decision.get("min_eligible_misses", 3)))
+    conn.execute("UPDATE kanban_dispatch_attempts SET state='complete', completed_at=?, decision_count=? WHERE id=?",
+                 (now, len(decisions), attempt_id))
+    conn.commit()
+    return True
 
 
 def observe_ready(conn: sqlite3.Connection, task_id: str, *, now: int | None = None,
