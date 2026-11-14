@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
 import random
 import re
 import secrets
@@ -930,13 +929,6 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _trusted_board_for_path(path: Path, board: Optional[str]) -> Optional[str]:
     """Derive board identity from the resolved physical database when possible."""
     resolved = path.expanduser().resolve()
-    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if (
-        pinned
-        and resolved == Path(pinned).expanduser().resolve()
-        and _kb._explicit_board_intent_pinned()
-    ):
-        return None
     if resolved == (_kb.kanban_home() / "kanban.db").resolve():
         return _kb.DEFAULT_BOARD
     try:
@@ -962,6 +954,12 @@ def _bind_action_receipt_board(
             (trusted or _kb.DEFAULT_BOARD,),
         )
     elif trusted is not None and row["board"] != trusted:
+        # A fenced worker may be routed through a pinned DB whose physical path
+        # is not the worker's logical board. Preserve the durable identity in
+        # that case; only a missing identity is allowed to be derived from the
+        # physical named-board path above.
+        if _kb._explicit_board_intent_pinned():
+            return
         raise ValueError(
             f"kanban database is bound to board {row['board']!r}, not {trusted!r}"
         )
