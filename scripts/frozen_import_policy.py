@@ -40,7 +40,8 @@ def _edit(row, column, end_row, end_column, content):
 
 
 def _ruff(path, rule, row, column, end_column, message, slug, fix):
-    return {"filename": path, "code": rule, "location": _point(row, column),
+    return {"filename": path, "code": rule, "name": slug,
+            "location": _point(row, column),
             "end_location": _point(row, end_column), "message": message,
             "cell": None, "noqa_row": row, "severity": "error", "fix": fix,
             "url": "https://docs.astral.sh/ruff/rules/" + slug}
@@ -213,7 +214,8 @@ def partition_findings(repo, checker, findings, *, source_reader=None, before=No
         return normal, []
     if not current:
         raise PolicyError("scoped diagnostics without frozen sources")
-    if checker == "health" and base != BASE:
+    # The pin only binds the census that excuses findings; with none to excuse, any base is fine.
+    if scoped and checker == "health" and base != BASE:
         raise PolicyError(f"health policy base mismatch: {base}")
     if Counter(map(_signature, scoped)) != Counter(map(_signature, _EXPECTED[checker])):
         raise PolicyError(f"{checker} frozen finding census drift; expected {len(_EXPECTED[checker])}, got {len(scoped)}")
