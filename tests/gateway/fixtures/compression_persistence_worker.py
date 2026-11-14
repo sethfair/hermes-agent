@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 import psutil
 
@@ -18,11 +19,14 @@ def main():
     sys.addaudithook(lambda event, args: opens.append(str(args[0]))
                      if event == 'sqlite3.connect' and 'state.db' in str(args[0]) else None)
     rpc = WorkerRPC(home)
+    cancel = threading.Event()
+    rpc.cancel = cancel
     scope = dict(profile_id=str(home), session_id=command['session_id'], execution_id='compression-worker',
                  generation=0, pid=os.getpid(), birth=worker_birth(psutil.Process()), secret='private-compression-worker')
     registered = rpc('worker.register', **scope, kind='compute')
     scope['epoch'] = registered['owner_epoch']
     store = RuntimeSessionStore(rpc, scope, home / 'worker-outboxes' / 'compression-worker')
+    store.cancel = cancel
     from run_agent import AIAgent
     agent = AIAgent(model='worker-model', provider='custom', base_url=command['url'], api_key='loopback-only',
         session_db=store, session_id=scope['session_id'], enabled_toolsets=[], skip_context_files=True,
@@ -66,6 +70,9 @@ def main():
             rpc(method, **params)
             raise TimeoutError('lost-ack')
         store.rpc = lost_ack
+        import agent.runtime_session_store as runtime_store
+        old_budget = runtime_store.OWNER_SILENCE_BUDGET_S
+        runtime_store.OWNER_SILENCE_BUDGET_S = 0.0
         try:
             store.publish_compression_child(parent_session_id=parent, child_session_id='worker-rotated-child',
                 source='cli', messages=[{'role': 'assistant', 'content': 'ROTATED_SUMMARY'}],
@@ -74,6 +81,7 @@ def main():
         except TimeoutError:
             pass
         store.rpc = rpc
+        runtime_store.OWNER_SILENCE_BUDGET_S = old_budget
         store.retry_pending()
         assert store.scope['session_id'] == 'worker-rotated-child'
         history = store.get_messages_as_conversation('worker-rotated-child', include_row_ids=True)

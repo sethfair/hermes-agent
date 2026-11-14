@@ -15,8 +15,14 @@ from hermes_state_runtime import (RuntimeStoreError, begin_runtime_epoch, regist
 from tools.async_delegation import _initialize_schema
 
 
-def test_lost_ack_reopens_owner_and_replays_same_ledger_receipt(tmp_path):
+def test_lost_ack_reopens_owner_and_replays_same_ledger_receipt(tmp_path, monkeypatch):
     from gateway.session_worker_delegation import persist_worker_delegation
+    import sys
+    import types
+    bootstrap = types.ModuleType('hermes_bootstrap')
+    bootstrap.__dict__['_happy_eyeballs_create_connection'] = __import__('socket').create_connection
+    sys.modules.setdefault('hermes_bootstrap', bootstrap)
+    monkeypatch.setattr('agent.runtime_session_store.OWNER_SILENCE_BUDGET_S', 0.0)
     path = tmp_path / 'state.db'
     db = SessionDB(path)
     db.create_session('parent', source='cli')
