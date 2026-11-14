@@ -76,19 +76,19 @@ Activation remains OFF/pending/UNKNOWN. No install, restart, deployment, deliver
 
 ## Final bounded correction verification
 
-The correction reuses the projection's complete fail-closed predicate for tick recording, validates
-aged-Ready configuration strictly, keeps incomplete public numeric facts `UNKNOWN`, supports
-partition-specific runtime contexts, composes truthful-hold closure in the recorder transaction, and
-emits `aged_ready_resolver_changed`, `aged_ready_intent_due`, and `aged_ready_diagnostic`.
+The correction uses the matching open attempt as a transaction-local provisional completion,
+dispatches each protected profile partition with its own context/attempt, validates resolver and
+writer contracts strictly, keeps incomplete public facts `UNKNOWN`, and records pseudonymous,
+stage-explicit resolver intent events.
 
-Final-head evidence commands (run after the final commit):
+Exact head verification:
 
-- `git rev-parse HEAD`
-- `git diff main...HEAD --numstat | awk '{a+=$1; d+=$2} END {print a+d}'` (must remain <= 2400)
-- `git diff --check`
+- `git rev-parse HEAD` → `a3bffc15f424841c5459d0f680180c72aa2b6989`
+- `git diff main...HEAD --numstat | awk '{a+=$1; d+=$2} END {print a+d}'` → `2246` changed lines
+- `git diff --check` → exit 0
 - `python scripts/check` → exit 0 (17 checks)
-- `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/hermes_cli/test_kanban_per_profile_cap.py tests/hermes_cli/test_kanban_host_cap.py tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_dispatch_tick_hook.py` → exit 0 (54 passed)
-- `scripts/run_tests.sh -j 1 tests/plugins/test_kanban_dashboard_plugin.py` → exit 0 (38 passed)
+- `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/hermes_cli/test_kanban_promote.py -k 'ready_monitor or protected or resolver or parser or promote_stuck'` → exit 0 (19 passed)
 
-Final handoff identity is established by rerunning the two commands above on the pushed head;
-the final count must remain <= 2400 changed lines.
+The broader aggregate was stopped after isolated workers stalled without assertion output; no
+passing result is claimed for that aggregate or the dashboard file. The exact count remains below
+the 2,400-line cap before publication.
