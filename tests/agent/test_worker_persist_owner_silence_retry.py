@@ -230,19 +230,23 @@ def test_cancelled_retry_preserves_pending_entry(tmp_path, monkeypatch):
 def test_cancel_during_real_receive_returns_without_waiting(tmp_path):
     from agent.runtime_session_store import _OwnerLink, WorkerPersistenceError
     import time
+    release = threading.Event()
 
     class Socket:
         def recv(self):
-            threading.Event().wait(10)
+            release.wait()
 
     link = _OwnerLink(Socket())
     cancel = threading.Event()
     timer = threading.Timer(0.05, cancel.set)
     timer.start()
     started = time.monotonic()
-    with pytest.raises(WorkerPersistenceError, match="worker_cancelled"):
-        link.receive(5, cancel=cancel)
-    timer.cancel()
+    try:
+        with pytest.raises(WorkerPersistenceError, match="worker_cancelled"):
+            link.receive(5, cancel=cancel)
+    finally:
+        timer.cancel()
+        release.set()
     assert time.monotonic() - started < 1
 
 
