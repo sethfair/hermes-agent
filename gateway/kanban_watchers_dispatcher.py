@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -132,6 +133,28 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        self.writer_ref = f"gateway-{uuid.uuid4()}"
+        self.controller_generation = str(uuid.uuid4())
+
+    def _monitor_context(self, conn: sqlite3.Connection):
+        """Build one process-generation context from the opened board scope."""
+        from hermes_cli import kanban_ready_monitor as monitor
+        scope = conn.execute(
+            "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
+            "AND state IN ('pending','active','faulted') ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if scope is None:
+            return None
+        from hermes_cli.version_info import get_version_info
+        info = get_version_info()
+        revision = info.commit or info.base_version
+        profile = scope["profile"]
+        return monitor.MonitorWriterContext(
+            board_scope_id=scope["board_scope_id"], profile=profile, writer_ref=self.writer_ref,
+            controller_generation=self.controller_generation, activation_epoch=scope["activation_epoch"],
+            roster_generation=scope["roster_generation"], roster_digest=scope["roster_digest"],
+            installed_revision=revision,
+        )
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -192,7 +215,8 @@ class _KanbanDispatcher:
             from hermes_cli import kanban_db as _kb
             with _kb.pin_first_board_resolution():
                 conn = _kbc().connect(board=slug)
-                return _kbd().dispatch_once(conn, board=slug, **kwargs)
+                context = self._monitor_context(conn)
+                return _kbd().dispatch_once(conn, board=slug, monitor_context=context, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

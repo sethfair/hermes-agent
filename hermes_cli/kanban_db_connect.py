@@ -930,6 +930,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # trigger references that column.
     from hermes_cli.kanban_ready_monitor import ensure_schema as ensure_ready_monitor_schema
     ensure_ready_monitor_schema(conn)
+    if _table_exists(conn, "kanban_ready_episodes"):
+        _add_column_if_missing(conn, "kanban_ready_episodes", "authority_set_digest", "authority_set_digest TEXT")
 
     # Re-snapshot: DBs partially migrated by older releases may already carry
     # later columns (e.g. ``consecutive_failures``), keeping the legacy-column

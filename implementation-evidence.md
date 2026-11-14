@@ -38,3 +38,24 @@ Final attributable reruns:
 - `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_db_init.py tests/hermes_cli/test_kanban_db_repair.py tests/hermes_cli/test_kanban_transfer.py -k 'schema or migration or init or export or import or roundtrip'` → exit `0` (`11 passed`).
 - `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_per_profile_cap.py -k 'dispatch or cap or lock or allowlist'` → partial output before the runner orphaned its final subprocess; not claimed as a passing command. Earlier attributable result: allowlist `17 passed`, dispatch lock `2 passed`, per-profile cap `2 passed`.
 - `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/plugins/test_kanban_dashboard_plugin.py -k 'dispatch or ready_monitor or protected'` → exit `0` (`8 passed`).
+
+## Task 4–7 continuation evidence from HEAD `4715fea989`
+
+| Increment | Phase | Command | Exit | Result |
+|---|---|---|---:|---|
+| C-4 | RED | `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py -k 'native_claim or resolver or schema or claim'` | 1 | Two test-seam failures: an uncommitted review fixture transaction and a redaction assertion matching the public stage label. No production failure. |
+| C-4 | GREEN | `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py -k 'native_claim or resolver or schema or claim or replay'` | 0 | 6 passed: native Ready claim closure, review non-closure, bounded resolver scheduling, schema and replay contracts. |
+| C-5/6/7 | GREEN | `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py -k 'native_claim or resolver or schema or claim or replay'` | 0 | Final focused monitor proof: 6 passed. |
+| C-compile | GREEN | `python -m compileall -q hermes_cli/kanban_ready_monitor.py hermes_cli/kanban_db_dispatch.py gateway/kanban_watchers_dispatcher.py hermes_cli/kanban.py plugins/kanban/dashboard/plugin_api.py` | 0 | Touched production modules compile. |
+| C-diff | GREEN | `git diff --check` and changed-line count | 0 | No whitespace errors; 304 changed lines, below the 2,400-line ceiling. |
+
+Task 4–7 remains read-only at the consumer boundary: no delivery, acknowledgement, activation,
+installation, restart, or Office mutation API was added. Gateway and standalone dispatch contexts carry
+one boot writer/controller generation and exact board-scope activation metadata; CLI and dashboard
+one-shot dispatch remain refused on protected scopes without that context.
+
+Final attributable rerun:
+
+- `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/plugins/test_kanban_dashboard_plugin.py tests/hermes_cli/test_kanban_cli.py -k 'ready_health or ready_monitor or protected or dispatch or parser or native_claim or resolver'` → exit `0` (`4 files, 10 tests passed`).
+- `python scripts/check` → exit `2` before checks: environment has Ruff `0.15.10`, checkout requires `0.15.22`; no raw environment mutation performed.
+- `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py -k 'native_claim or truthful_hold or resolver or replay'` → exit `0` (`5 passed`).

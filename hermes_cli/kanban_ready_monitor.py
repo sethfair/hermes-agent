@@ -54,6 +54,15 @@ SUPPRESSION_REASONS = (
     "guard_unknown", "dry_run",
 )
 
+TRUTHFUL_HOLD_STATUSES = frozenset({
+    "todo", "blocked", "review", "scheduled", "triage", "done", "archived",
+})
+DIAGNOSTIC_CODES = frozenset({
+    "resolver_missing", "manager_missing", "ack_authority_missing",
+    "delivery_consumer_unavailable", "controller_stale", "controller_conflict",
+    "writer_scope_incomplete",
+})
+
 
 @dataclass(frozen=True)
 class ReadyEntryClassifier:
@@ -192,7 +201,7 @@ CREATE TABLE IF NOT EXISTS kanban_ready_episodes (
  first_observed_at INTEGER NOT NULL, last_observed_at INTEGER NOT NULL,
  opened_at INTEGER NOT NULL, closed_at INTEGER, eligible_miss_count INTEGER NOT NULL DEFAULT 0,
  intent_count INTEGER NOT NULL DEFAULT 0, resolver_stage TEXT NOT NULL DEFAULT 'unavailable',
- routing_generation INTEGER NOT NULL DEFAULT 0, next_intent_at INTEGER,
+ routing_generation INTEGER NOT NULL DEFAULT 0, authority_set_digest TEXT, next_intent_at INTEGER,
  state TEXT NOT NULL DEFAULT 'open', outcome TEXT,
  UNIQUE(task_id, ready_generation));
 CREATE TABLE IF NOT EXISTS kanban_ready_escalation_intents (
@@ -241,6 +250,9 @@ END;
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(MONITOR_SCHEMA_SQL)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_ready_episodes)")}
+    if "authority_set_digest" not in columns:
+        conn.execute("ALTER TABLE kanban_ready_episodes ADD COLUMN authority_set_digest TEXT")
     row = conn.execute("SELECT board_scope_id FROM kanban_board_identity WHERE singleton=1").fetchone()
     if row is None:
         conn.execute(
@@ -308,6 +320,22 @@ def begin_dispatch_attempt(conn: sqlite3.Connection, *, controller: MonitorWrite
                   controller.protocol_version, controller.compatibility_identity, controller.installed_revision,
                   controller.roster_generation, controller.roster_digest, now))
     return dict(conn.execute("SELECT * FROM kanban_dispatch_attempts WHERE id=?", (attempt_id,)).fetchone())
+
+
+def publish_controller_observation(conn: sqlite3.Connection, *, controller: MonitorWriterContext,
+                                   state: str = "fresh", diagnostic_code: str | None = None,
+                                   now: int | None = None) -> None:
+    """Publish a redacted lease heartbeat for the controller's explicit scope."""
+    ensure_schema(conn)
+    now = int(time.time()) if now is None else int(now)
+    conn.execute(
+        "INSERT INTO kanban_controller_observations "
+        "(board_scope_id,profile,writer_ref_digest,controller_generation,activation_epoch,last_seen_at,state,diagnostic_code) "
+        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(board_scope_id,writer_ref_digest,controller_generation,profile) DO UPDATE SET "
+        "activation_epoch=excluded.activation_epoch,last_seen_at=excluded.last_seen_at,state=excluded.state,diagnostic_code=excluded.diagnostic_code",
+        (controller.board_scope_id, controller.profile, _digest(controller.writer_ref), controller.controller_generation,
+         controller.activation_epoch, now, state, diagnostic_code),
+    )
 
 
 def arm_claim_admission(conn: sqlite3.Connection, *, attempt_id: str, task_id: str,
@@ -434,11 +462,129 @@ def close_episode(conn: sqlite3.Connection, task_id: str, outcome: str, *, run_i
     return True
 
 
+def _close_episode_in_txn(conn: sqlite3.Connection, task_id: str, outcome: str,
+                          *, run_id: int | None = None, final_status: str | None = None,
+                          now: int | None = None) -> bool:
+    """Close the current episode without committing; callers own the transaction."""
+    now = int(time.time()) if now is None else int(now)
+    row = conn.execute("SELECT episode_id FROM kanban_ready_state WHERE task_id=?", (task_id,)).fetchone()
+    if not row or not row["episode_id"]:
+        return False
+    changed = conn.execute(
+        "UPDATE kanban_ready_episodes SET state='closed', outcome=?, closed_at=? "
+        "WHERE id=? AND state='open'", (outcome, now, row["episode_id"]),
+    ).rowcount
+    if changed:
+        conn.execute("UPDATE kanban_ready_state SET episode_id=NULL WHERE task_id=?", (task_id,))
+        return True
+    return False
+
+
+def close_for_native_ready_claim(conn: sqlite3.Connection, task_id: str, run_id: int,
+                                 *, now: int | None = None) -> bool:
+    """Close only the implementation Ready episode, inside the claim transaction."""
+    closed = _close_episode_in_txn(conn, task_id, "native_claim", run_id=run_id, now=now)
+    if closed:
+        conn.execute("INSERT INTO task_events(task_id,kind,payload,run_id,created_at) VALUES(?,?,?,?,?)",
+                     (task_id, "aged_ready_closed", json.dumps({"outcome": "native_claim", "run_id": run_id}),
+                      run_id, int(time.time()) if now is None else int(now)))
+    return closed
+
+
+def reconcile_truthful_hold(conn: sqlite3.Connection, task_id: str, *, status: str | None = None,
+                            now: int | None = None) -> bool:
+    """Close an episode only after re-reading a genuine non-dispatchable status."""
+    row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    final = status or (row["status"] if row else None)
+    if final not in TRUTHFUL_HOLD_STATUSES:
+        return False
+    closed = _close_episode_in_txn(conn, task_id, "truthful_hold", final_status=final, now=now)
+    if closed:
+        when = int(time.time()) if now is None else int(now)
+        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                     (task_id, "aged_ready_closed", json.dumps({"outcome": "truthful_hold", "status": final}), when))
+    return closed
+
+
+def _binding_digest(binding: Mapping[str, Any] | None) -> str | None:
+    if not binding:
+        return None
+    safe = {str(k): str(v) for k, v in binding.items() if str(k).endswith(("_id", "_digest", "_alias"))}
+    return hashlib.sha256(json.dumps(safe, sort_keys=True).encode()).hexdigest()
+
+
+def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bindings: Mapping[str, Any] | None,
+                               owner_retry_seconds: tuple[int, ...] = (300, 900, 3600),
+                               manager_retry_seconds: tuple[int, ...] = (900, 3600), now: int | None = None) -> dict[str, Any]:
+    """Create bounded, metadata-only escalation facts; never sends or claims."""
+    now = int(time.time()) if now is None else int(now)
+    episode = conn.execute("SELECT * FROM kanban_ready_episodes WHERE id=?", (episode_id,)).fetchone()
+    if not episode or episode["state"] != "open":
+        return {"episode_id": episode_id, "state": "closed", "intents": []}
+    binding = dict(bindings or {})
+    missing = next((key for key in ("owner_id", "manager_id", "ack_authority_id") if not binding.get(key)), None)
+    if missing:
+        code = {"owner_id": "resolver_missing", "manager_id": "manager_missing",
+                "ack_authority_id": "ack_authority_missing"}[missing]
+        conn.execute("UPDATE kanban_ready_episodes SET resolver_stage=?, outcome=? WHERE id=?",
+                     ("unavailable", code, episode_id))
+        return {"episode_id": episode_id, "state": "unavailable", "diagnostic": code, "intents": []}
+    digest = _binding_digest(binding)
+    old = episode["authority_set_digest"] if "authority_set_digest" in episode.keys() else None
+    routing = int(episode["routing_generation"] or 0) + (1 if old and old != digest else 0)
+    if old and old != digest:
+        conn.execute("UPDATE kanban_ready_escalation_intents SET state='superseded' WHERE episode_id=? AND state IN ('due','planned')", (episode_id,))
+    conn.execute("UPDATE kanban_ready_episodes SET resolver_stage='owner', routing_generation=?, authority_set_digest=? WHERE id=?",
+                 (routing, digest, episode_id))
+    schedule = [("owner", i + 1, 0 if i == 0 else delay, "due" if i == 0 else "planned")
+                for i, delay in enumerate(owner_retry_seconds)]
+    schedule += [("manager", i + 1, delay, "planned") for i, delay in enumerate(manager_retry_seconds)]
+    for stage, ordinal, delay, state in schedule:
+        conn.execute("INSERT OR IGNORE INTO kanban_ready_escalation_intents "
+                     "(id,episode_id,routing_generation,stage,ordinal,scheduled_at,state,authority_set_digest) VALUES(?,?,?,?,?,?,?,?)",
+                     (f"intent_{secrets.token_hex(10)}", episode_id, routing, stage, ordinal, now + delay, state, digest))
+    conn.execute("UPDATE kanban_ready_episodes SET intent_count=(SELECT COUNT(*) FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=?) WHERE id=?", (episode_id, routing, episode_id))
+    rows = conn.execute("SELECT stage,ordinal,scheduled_at,state FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=? ORDER BY CASE stage WHEN 'owner' THEN 0 ELSE 1 END, ordinal", (episode_id, routing)).fetchall()
+    return {"episode_id": episode_id, "routing_generation": routing, "resolver_stage": "owner", "resolver_digest": digest,
+            "intents": [dict(row) for row in rows]}
+
+
 def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None, stale_after_seconds: int = 180) -> dict[str, Any]:
     ensure_schema(conn)
     now = int(time.time()) if now is None else int(now)
     cards = []
     for row in conn.execute("SELECT * FROM kanban_ready_state ORDER BY task_id"):
         fresh = now - int(row["last_observed_at"]) <= stale_after_seconds
-        cards.append({"task_id": row["task_id"], "ready_generation": row["ready_generation"], "ready_age_seconds": max(0, now - row["ready_since"]) if row["ready_since"] is not None else None, "decision": row["decision"], "guard_reason": row["guard_reason"], "guard_fingerprint": row["guard_fingerprint"], "eligible_miss_count": row["eligible_miss_count"], "freshness": "FRESH" if fresh else "UNKNOWN"})
-    return {"cards": cards, "activation": "OFF", "profiles": [], "owners": []}
+        episode = conn.execute("SELECT state,outcome,resolver_stage,routing_generation FROM kanban_ready_episodes WHERE id=?", (row["episode_id"],)).fetchone() if row["episode_id"] else None
+        cards.append({"task_id": row["task_id"], "ready_generation": row["ready_generation"],
+                      "ready_age_seconds": max(0, now - row["ready_since"]) if row["ready_since"] is not None else None,
+                      "decision": row["decision"], "guard_reason": row["guard_reason"],
+                      "guard_fingerprint": row["guard_fingerprint"], "eligible_miss_count": row["eligible_miss_count"],
+                      "episode_state": episode["state"] if episode else None, "episode_outcome": episode["outcome"] if episode else None,
+                      "resolver_stage": episode["resolver_stage"] if episode else None,
+                      "routing_generation": episode["routing_generation"] if episode else None,
+                      "controller_digest": row["controller_ref_digest"], "controller_generation": row["controller_generation"],
+                      "profile": row["profile"], "freshness": "FRESH" if fresh else "UNKNOWN"})
+    scopes = conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL").fetchall()
+    profiles = []
+    for scope in scopes:
+        observations = conn.execute(
+            "SELECT * FROM kanban_controller_observations WHERE board_scope_id=? AND profile=?",
+            (scope["board_scope_id"], scope["profile"]),
+        ).fetchall()
+        fresh = [row for row in observations if now - int(row["last_seen_at"]) <= stale_after_seconds]
+        states = {row["state"] for row in fresh}
+        if scope["state"] != "active" or scope["legacy_exclusion_proof_state"] != "proven":
+            state = "UNKNOWN"
+        elif len({row["controller_generation"] for row in fresh}) > 1:
+            state = "CONFLICT"
+        elif not fresh or "faulted" in states:
+            state = "STALE"
+        else:
+            state = "FRESH"
+        running = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' AND assignee=?", (scope["profile"],)).fetchone()[0]
+        ready = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='ready' AND assignee=?", (scope["profile"],)).fetchone()[0]
+        profiles.append({"profile": scope["profile"], "running_wip": running, "ready_count": ready,
+                         "controller_digests": sorted({row["writer_ref_digest"] for row in fresh}), "state": state})
+    activation = "OFF" if not scopes else ("UNKNOWN" if any(p["state"] != "FRESH" for p in profiles) else "FRESH")
+    return {"cards": cards, "activation": activation, "profiles": profiles, "owners": [], "read_only": True}

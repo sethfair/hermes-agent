@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -2970,6 +2971,8 @@ def run_daemon(
 
     if stop_event is None:
         stop_event = threading.Event()
+    writer_ref = f"standalone-{uuid.uuid4()}"
+    controller_generation = str(uuid.uuid4())
 
     def _handle(_signum, _frame):
         stop_event.set()
@@ -2989,11 +2992,27 @@ def run_daemon(
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
             with contextlib.closing(_kbc.connect()) as conn:
+                monitor_context = None
+                from hermes_cli import kanban_ready_monitor as monitor
+                scope = conn.execute(
+                    "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
+                    "AND state IN ('pending','active','faulted') ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if scope is not None:
+                    from hermes_cli.version_info import get_version_info
+                    info = get_version_info()
+                    monitor_context = monitor.MonitorWriterContext(
+                        board_scope_id=scope["board_scope_id"], profile=scope["profile"],
+                        writer_ref=writer_ref, controller_generation=controller_generation,
+                        activation_epoch=scope["activation_epoch"], roster_generation=scope["roster_generation"],
+                        roster_digest=scope["roster_digest"], installed_revision=info.commit or info.base_version,
+                    )
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    monitor_context=monitor_context,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

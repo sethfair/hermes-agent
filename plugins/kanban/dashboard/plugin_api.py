@@ -1244,6 +1244,36 @@ def get_stats(board: Optional[str] = Query(None)):
         return kanban_db.board_stats(conn)
 
 
+@router.get("/ready-health")
+def ready_health(board: Optional[str] = Query(None), task: Optional[str] = Query(None)):
+    """Read-only aged-Ready projection; UNKNOWN is preserved as a state."""
+    from hermes_cli import kanban_ready_monitor as monitor
+    with _board_conn(board) as (board, conn):
+        payload = monitor.ready_health_snapshot(conn)
+    if task:
+        payload["cards"] = [card for card in payload["cards"] if card["task_id"] == task]
+    return payload
+
+
+@router.get("/ready-episodes/{episode_id}")
+def ready_episode(episode_id: str, board: Optional[str] = Query(None)):
+    """Return one redacted episode and its bounded intent facts."""
+    from hermes_cli import kanban_ready_monitor as monitor
+    with _board_conn(board) as (board, conn):
+        row = conn.execute("SELECT * FROM kanban_ready_episodes WHERE id=?", (episode_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="episode not found")
+        intents = conn.execute(
+            "SELECT stage, ordinal, scheduled_at, state, routing_generation, authority_set_digest "
+            "FROM kanban_ready_escalation_intents WHERE episode_id=? ORDER BY id", (episode_id,)
+        ).fetchall()
+        return {"episode": {key: row[key] for key in (
+            "id", "task_id", "ready_generation", "state", "outcome", "resolver_stage",
+            "routing_generation", "intent_count", "first_observed_at", "last_observed_at")},
+                "intents": [dict(item) for item in intents], "read_only": True,
+                "compatibility": monitor.COMPATIBILITY_IDENTITY}
+
+
 @router.get("/assignees")
 def get_assignees(board: Optional[str] = Query(None)):
     """Union of on-disk profiles and assignees used on the board, so a fresh

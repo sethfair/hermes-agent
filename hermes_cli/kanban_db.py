@@ -2167,6 +2167,9 @@ def _claim_and_open_run(
         conn, task_id, "claimed",
         {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
     )
+    if source_status == "ready":
+        from hermes_cli import kanban_ready_monitor as monitor
+        monitor.close_for_native_ready_claim(conn, task_id, run_id, now=now)
     return run_id
 
 
