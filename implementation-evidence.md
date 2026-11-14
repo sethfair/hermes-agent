@@ -59,3 +59,17 @@ Final attributable rerun:
 - `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/plugins/test_kanban_dashboard_plugin.py tests/hermes_cli/test_kanban_cli.py -k 'ready_health or ready_monitor or protected or dispatch or parser or native_claim or resolver'` → exit `0` (`4 files, 10 tests passed`).
 - `python scripts/check` → exit `2` before checks: environment has Ruff `0.15.10`, checkout requires `0.15.22`; no raw environment mutation performed.
 - `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py -k 'native_claim or truthful_hold or resolver or replay'` → exit `0` (`5 passed`).
+
+## Exact-head integrator verification
+
+Exact head before publication: `ed825791e89e6db4e7380d45e94ea55d001bf726` (tree `0ee45424dc5e7cbbd858e70ae05c0f81aa6f4bf9`).
+
+- `python scripts/check` → exit `0`; all 17 checks passed, including code-health ratchets.
+- `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/hermes_cli/test_kanban_per_profile_cap.py tests/hermes_cli/test_kanban_host_cap.py tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_dispatch_tick_hook.py` → exit `0` (`46 passed`).
+- `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_workflow.py tests/hermes_cli/test_kanban_review_lifecycle.py tests/hermes_cli/test_kanban_block_kinds.py tests/hermes_cli/test_kanban_complete_live_claim_guard.py tests/hermes_cli/test_kanban_transfer.py tests/plugins/test_kanban_dashboard_plugin.py tests/hermes_cli/test_config.py tests/hermes_cli/test_kanban_cli.py` → exit `0` (`281 passed`, `4 skipped` Windows-only).
+- `scripts/run_tests.sh -j 1 tests/gateway/test_kanban_notifier_watcher_dispatch_gate.py tests/gateway/test_kanban_reconcile_orphans.py` → exit `0` (`11 passed`).
+- The broader `tests/gateway -k 'kanban and dispatcher'` invocation exceeded the 420-second tool ceiling and was terminated without a summary; no green claim is made for that aggregate command.
+- `tests/hermes_cli/test_kanban_notify.py` is blocked in this Kanban scratch location before notifier behavior: its import of `gateway.run` asks PM to probe the checkout-parent payload manifest at `/home/macpro/.hermes/kanban/workspaces/t_d7d45bf4/manifest.json`, and the suite's real-home I/O guard deliberately refuses every path under the live `.hermes` root. The other four files in that command passed (`58 tests`); the 14 notifier failures are environment-guard failures, not product assertions. No guard was bypassed and no test was marked or weakened.
+- Final non-generated diff count: `1,409` additions plus deletions, below the reviewed `2,400` ceiling.
+
+Activation remains OFF/pending/UNKNOWN. No install, restart, deployment, delivery, acknowledgement, alert, escalation, WIP display, Office change, credential change, or real-board mutation was performed.
