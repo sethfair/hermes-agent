@@ -90,5 +90,5 @@ Final-head evidence commands (run after the final commit):
 - `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/hermes_cli/test_kanban_per_profile_cap.py tests/hermes_cli/test_kanban_host_cap.py tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_dispatch_tick_hook.py` → exit 0 (54 passed)
 - `scripts/run_tests.sh -j 1 tests/plugins/test_kanban_dashboard_plugin.py` → exit 0 (38 passed)
 
-Recorded final output: `git rev-parse HEAD` → `62bee7b51d0a3446cad62b589df46e72760d7aee`;
-the exact `main...HEAD` count command → `2136` changed lines.
+Final handoff identity is established by rerunning the two commands above on the pushed head;
+the final count must remain <= 2400 changed lines.
