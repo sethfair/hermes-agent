@@ -1862,6 +1862,21 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Aged-Ready observation is metadata-only and deliberately OFF.  A
+        # later deployment must supply an explicit writer roster before it can
+        # become active; this setting never enables delivery.
+        "dispatch_profiles": [],
+        "aged_ready": {
+            "observation_enabled": False,
+            "controller_id": "",
+            "min_age_seconds": 1800,
+            "min_eligible_misses": 3,
+            "controller_stale_seconds": 180,
+            "owner_retry_seconds": [300, 900, 3600],
+            "manager_retry_seconds": [900, 3600],
+            "expected_writer_scopes": {},
+            "resolver_bindings": {},
+        },
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
