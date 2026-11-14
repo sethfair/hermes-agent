@@ -340,6 +340,27 @@ def import_board(
         color=str(staged_meta.get("color") or ""),
         archived=False,
     )
+    # The archive carries its source board identity. Import is the one
+    # authorized physical relocation/rename boundary, so rebind that marker to
+    # the newly allocated target before normal connection validation runs.
+    imported_db = board_root / "kanban.db"
+    with sqlite3.connect(imported_db) as raw:
+        identity_exists = raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'kanban_board_identity'"
+        ).fetchone()
+        if identity_exists is not None:
+            raw.execute("BEGIN IMMEDIATE")
+            raw.execute("DROP TRIGGER IF EXISTS kanban_board_identity_immutable_update")
+            raw.execute(
+                "UPDATE kanban_board_identity SET board = ? WHERE singleton = 1",
+                (target,),
+            )
+            raw.execute(
+                "CREATE TRIGGER kanban_board_identity_immutable_update "
+                "BEFORE UPDATE ON kanban_board_identity "
+                "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
+            )
     # Bring the imported schema up to this install's version before the
     # relocation pass writes to it.
     kb.init_db(board=target)

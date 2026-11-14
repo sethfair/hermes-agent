@@ -743,6 +743,11 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     if resolved in _INITIALIZED_PATHS:
         conn, schema_present = _open_configured(path, _schema_is_present)
         if schema_present:
+            try:
+                _bind_action_receipt_board(conn, path, board)
+            except Exception:
+                conn.close()
+                raise
             return conn
         # Cache says "initialized", file says otherwise: it was deleted or
         # replaced under a live process and the open silently recreated an empty
@@ -777,6 +782,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                _bind_action_receipt_board(conn, path, board)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -811,7 +817,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     # Clear the cache entry so connect() re-runs schema + migrations.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(str(path.resolve()))
-    with contextlib.closing(connect(path)):
+    with contextlib.closing(connect(path, board=board)):
         pass
     return path
 
@@ -886,6 +892,9 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Default-inert fencing state for authenticated action receipts.
+    ("action_generation", "action_generation INTEGER NOT NULL DEFAULT 0"),
+    ("park_generation", "park_generation INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -915,6 +924,45 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute(
         f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
     ).fetchone() is not None
+
+
+def _trusted_board_for_path(path: Path, board: Optional[str]) -> Optional[str]:
+    """Derive board identity from the resolved physical database when possible."""
+    resolved = path.expanduser().resolve()
+    if resolved == (_kb.kanban_home() / "kanban.db").resolve():
+        return _kb.DEFAULT_BOARD
+    try:
+        relative = resolved.relative_to(_kb.boards_root().resolve())
+    except ValueError:
+        relative = None
+    if relative is not None and len(relative.parts) == 2 and relative.name == "kanban.db":
+        return _kb._require_slug(relative.parts[0])
+    if board is None:
+        return None
+    return _kb._normalize_board_slug(board) or _kb.DEFAULT_BOARD
+
+
+def _bind_action_receipt_board(
+    conn: sqlite3.Connection, path: Path, board: Optional[str],
+) -> None:
+    """Persist and verify the board selected by the trusted physical resolver."""
+    trusted = _trusted_board_for_path(path, board)
+    row = conn.execute("SELECT board FROM kanban_board_identity WHERE singleton = 1").fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, ?)",
+            (trusted or _kb.DEFAULT_BOARD,),
+        )
+    elif trusted is not None and row["board"] != trusted:
+        # A fenced worker may be routed through a pinned DB whose physical path
+        # is not the worker's logical board. Preserve the durable identity in
+        # that case; only a missing identity is allowed to be derived from the
+        # physical named-board path above.
+        if _kb._explicit_board_intent_pinned():
+            return
+        raise ValueError(
+            f"kanban database is bound to board {row['board']!r}, not {trusted!r}"
+        )
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -994,6 +1042,172 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+    _install_action_receipt_guards(conn)
+
+
+def _install_action_receipt_guards(conn: sqlite3.Connection) -> None:
+    """Install additive generation and immutable-record guards.
+
+    Direct migration tests and recovery tools may intentionally supply only the
+    legacy ``tasks``/``task_events`` subset. The normal initializer creates the
+    complete schema before this pass; partial schemas get columns only and will
+    receive guards when a full initialization is later performed.
+    """
+    required = (
+        "kanban_board_identity",
+        "tasks",
+        "task_comments",
+        "task_events",
+        "task_links",
+        "task_runs",
+        "principal_registry_events",
+        "kanban_capability_events",
+        "operation_keys",
+        "action_receipts",
+        "advisory_notices",
+    )
+    if not all(_table_exists(conn, table) for table in required):
+        return
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS kanban_board_identity_immutable_update
+        BEFORE UPDATE ON kanban_board_identity
+        BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END;
+        CREATE TRIGGER IF NOT EXISTS kanban_board_identity_immutable_delete
+        BEFORE DELETE ON kanban_board_identity
+        BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END;
+
+        CREATE TRIGGER IF NOT EXISTS tasks_action_generation_update
+        AFTER UPDATE ON tasks
+        WHEN NEW.action_generation = OLD.action_generation
+        BEGIN
+            UPDATE tasks
+               SET action_generation = action_generation + 1,
+                   park_generation = park_generation +
+                       CASE WHEN OLD.status = 'scheduled' OR NEW.status = 'scheduled'
+                            THEN 1 ELSE 0 END
+             WHERE id = NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS task_comments_action_generation_insert
+        AFTER INSERT ON task_comments
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1 WHERE id = NEW.task_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_comments_action_generation_update
+        AFTER UPDATE ON task_comments
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1
+             WHERE id IN (OLD.task_id, NEW.task_id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_comments_action_generation_delete
+        AFTER DELETE ON task_comments
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1 WHERE id = OLD.task_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS task_events_action_generation_insert
+        AFTER INSERT ON task_events
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1 WHERE id = NEW.task_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_events_action_generation_update
+        AFTER UPDATE ON task_events
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1
+             WHERE id IN (OLD.task_id, NEW.task_id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_events_action_generation_delete
+        AFTER DELETE ON task_events
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1 WHERE id = OLD.task_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS task_links_action_generation_insert
+        AFTER INSERT ON task_links
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1
+             WHERE id IN (NEW.parent_id, NEW.child_id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_links_action_generation_delete
+        AFTER DELETE ON task_links
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1
+             WHERE id IN (OLD.parent_id, OLD.child_id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_links_action_generation_update
+        AFTER UPDATE ON task_links
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1
+             WHERE id IN (OLD.parent_id, OLD.child_id, NEW.parent_id, NEW.child_id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS task_runs_action_generation_insert
+        AFTER INSERT ON task_runs
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1 WHERE id = NEW.task_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_runs_action_generation_update
+        AFTER UPDATE ON task_runs
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1
+             WHERE id IN (OLD.task_id, NEW.task_id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS task_runs_action_generation_delete
+        AFTER DELETE ON task_runs
+        BEGIN
+            UPDATE tasks SET action_generation = action_generation + 1 WHERE id = OLD.task_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS receipt_bound_task_preserved
+        BEFORE DELETE ON tasks
+        WHEN EXISTS (SELECT 1 FROM action_receipts WHERE task_id = OLD.id)
+          OR EXISTS (SELECT 1 FROM advisory_notices WHERE task_id = OLD.id)
+        BEGIN SELECT RAISE(ABORT, 'receipt_bound_task'); END;
+        CREATE TRIGGER IF NOT EXISTS receipt_bound_event_preserved_delete
+        BEFORE DELETE ON task_events
+        WHEN EXISTS (SELECT 1 FROM action_receipts WHERE event_id = OLD.id)
+          OR EXISTS (SELECT 1 FROM advisory_notices WHERE event_id = OLD.id)
+        BEGIN SELECT RAISE(ABORT, 'receipt_bound_event'); END;
+        CREATE TRIGGER IF NOT EXISTS receipt_bound_event_preserved_update
+        BEFORE UPDATE ON task_events
+        WHEN EXISTS (SELECT 1 FROM action_receipts WHERE event_id = OLD.id)
+          OR EXISTS (SELECT 1 FROM advisory_notices WHERE event_id = OLD.id)
+        BEGIN SELECT RAISE(ABORT, 'receipt_bound_event'); END;
+        CREATE TRIGGER IF NOT EXISTS receipt_bound_comment_preserved_delete
+        BEFORE DELETE ON task_comments
+        WHEN EXISTS (SELECT 1 FROM action_receipts WHERE projection_comment_id = OLD.id)
+          OR EXISTS (SELECT 1 FROM advisory_notices WHERE projection_comment_id = OLD.id)
+        BEGIN SELECT RAISE(ABORT, 'receipt_bound_comment'); END;
+        CREATE TRIGGER IF NOT EXISTS receipt_bound_comment_preserved_update
+        BEFORE UPDATE ON task_comments
+        WHEN EXISTS (SELECT 1 FROM action_receipts WHERE projection_comment_id = OLD.id)
+          OR EXISTS (SELECT 1 FROM advisory_notices WHERE projection_comment_id = OLD.id)
+        BEGIN SELECT RAISE(ABORT, 'receipt_bound_comment'); END;
+
+        CREATE TRIGGER IF NOT EXISTS principal_registry_events_immutable_update
+        BEFORE UPDATE ON principal_registry_events BEGIN SELECT RAISE(ABORT, 'immutable_principal_event'); END;
+        CREATE TRIGGER IF NOT EXISTS principal_registry_events_immutable_delete
+        BEFORE DELETE ON principal_registry_events BEGIN SELECT RAISE(ABORT, 'immutable_principal_event'); END;
+        CREATE TRIGGER IF NOT EXISTS kanban_capability_events_immutable_update
+        BEFORE UPDATE ON kanban_capability_events BEGIN SELECT RAISE(ABORT, 'immutable_capability_event'); END;
+        CREATE TRIGGER IF NOT EXISTS kanban_capability_events_immutable_delete
+        BEFORE DELETE ON kanban_capability_events BEGIN SELECT RAISE(ABORT, 'immutable_capability_event'); END;
+
+        CREATE TRIGGER IF NOT EXISTS operation_keys_immutable_update
+        BEFORE UPDATE ON operation_keys BEGIN SELECT RAISE(ABORT, 'immutable_operation_key'); END;
+        CREATE TRIGGER IF NOT EXISTS operation_keys_immutable_delete
+        BEFORE DELETE ON operation_keys BEGIN SELECT RAISE(ABORT, 'immutable_operation_key'); END;
+        CREATE TRIGGER IF NOT EXISTS action_receipts_immutable_update
+        BEFORE UPDATE ON action_receipts BEGIN SELECT RAISE(ABORT, 'immutable_action_receipt'); END;
+        CREATE TRIGGER IF NOT EXISTS action_receipts_immutable_delete
+        BEFORE DELETE ON action_receipts BEGIN SELECT RAISE(ABORT, 'immutable_action_receipt'); END;
+        CREATE TRIGGER IF NOT EXISTS advisory_notices_immutable_update
+        BEFORE UPDATE ON advisory_notices BEGIN SELECT RAISE(ABORT, 'immutable_advisory_notice'); END;
+        CREATE TRIGGER IF NOT EXISTS advisory_notices_immutable_delete
+        BEFORE DELETE ON advisory_notices BEGIN SELECT RAISE(ABORT, 'immutable_advisory_notice'); END;
+        """
+    )
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

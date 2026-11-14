@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -143,6 +144,47 @@ class TestPathResolution:
         p = kb.kanban_db_path(board="atm10-server")
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
         assert p != forced
+
+    def test_first_migration_binds_named_board_from_physical_path_under_worker_fence(
+        self, fresh_home, monkeypatch
+    ):
+        """A missing identity on an exact-base named-board DB uses its path, not default."""
+        db_path = fresh_home / "kanban" / "boards" / "acme" / "kanban.db"
+        db_path.parent.mkdir(parents=True)
+        with sqlite3.connect(db_path) as raw:
+            raw.executescript(kb.SCHEMA_SQL)
+
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "acme")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_named_board_migration")
+        with sqlite3.connect(db_path) as raw:
+            raw.row_factory = sqlite3.Row
+            kbc._bind_action_receipt_board(raw, db_path, board="acme")
+            assert raw.execute(
+                "SELECT board FROM kanban_board_identity WHERE singleton = 1"
+            ).fetchone()["board"] == "acme"
+
+    def test_fenced_routing_preserves_existing_identity_on_named_path(
+        self, fresh_home, monkeypatch
+    ):
+        """Routing a pinned worker must not rebind an already identified board."""
+        db_path = fresh_home / "kanban" / "boards" / "acme" / "kanban.db"
+        db_path.parent.mkdir(parents=True)
+        with sqlite3.connect(db_path) as raw:
+            raw.executescript(kb.SCHEMA_SQL)
+            raw.execute(
+                "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, 'imported')"
+            )
+            raw.commit()
+
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_existing_identity")
+        with sqlite3.connect(db_path) as raw:
+            raw.row_factory = sqlite3.Row
+            kbc._bind_action_receipt_board(raw, db_path, board="acme")
+            assert raw.execute(
+                "SELECT board FROM kanban_board_identity WHERE singleton = 1"
+            ).fetchone()["board"] == "imported"
 
 
 # ---------------------------------------------------------------------------

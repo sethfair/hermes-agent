@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_db_receipts_schema import ACTION_RECEIPT_SCHEMA_SQL
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -770,10 +771,9 @@ class Event:
             run_id=_opt_int(run_id),
         )
 
-
 # --- Schema ---
 
-SCHEMA_SQL = """
+SCHEMA_SQL = ACTION_RECEIPT_SCHEMA_SQL + """
 CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
     title                TEXT NOT NULL,
@@ -3989,7 +3989,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) AND id NOT IN (SELECT event_id FROM action_receipts) AND id NOT IN (SELECT event_id FROM advisory_notices)", (cutoff,),
         )
     return int(cur.rowcount or 0)
 
