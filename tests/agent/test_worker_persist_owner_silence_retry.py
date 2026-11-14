@@ -333,36 +333,244 @@ def test_real_receipt_handler_commits_one_row_for_retried_lost_ack(tmp_path):
         db.close()
 
 
+def test_real_receipt_handler_retries_with_nonzero_budget(tmp_path, monkeypatch):
+    """The real worker.persist path retries a committed, lost reply (not just replay)."""
+    import agent.runtime_session_store as module
+    from agent.runtime_session_store import RuntimeSessionStore
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+
+    monkeypatch.setattr(module, "OWNER_SILENCE_BUDGET_S", 2.0)
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s", "cli")
+    epoch = begin_runtime_epoch(db, instance_id="owner")
+    scope = {"epoch": epoch, "execution_id": "worker", "session_id": "s", "generation": 0}
+    register_worker_execution(db, **scope, kind="compute", adoption_secret="private")
+    calls = 0
+
+    def rpc(method, **params):
+        nonlocal calls
+        result = mutate_worker_execution(db, **params)
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("worker_receipt_timeout")
+        return result
+
+    try:
+        store = RuntimeSessionStore(rpc, scope, tmp_path / "outbox")
+        assert store._apply("usage.main", {"input_tokens": 1})
+        assert calls == 2
+        assert db._read_one("SELECT COUNT(*) FROM worker_receipts")[0] == 1
+        assert db.get_session("s")["input_tokens"] == 1
+        assert store.journal["pending"] == []
+        store.close()
+    finally:
+        db.close()
+
+
+def test_real_receipt_handler_late_commit_race_is_one_effect(tmp_path, monkeypatch):
+    """A late first commit racing the retry still resolves one durable receipt."""
+    import agent.runtime_session_store as module
+    from agent.runtime_session_store import RuntimeSessionStore
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+
+    monkeypatch.setattr(module, "OWNER_SILENCE_BUDGET_S", 2.0)
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s", "cli")
+    epoch = begin_runtime_epoch(db, instance_id="owner")
+    scope = {"epoch": epoch, "execution_id": "worker", "session_id": "s", "generation": 0}
+    register_worker_execution(db, **scope, kind="compute", adoption_secret="private")
+    late = []
+    late_threads = []
+    calls = 0
+
+    def rpc(method, **params):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            def commit_late():
+                late.append(mutate_worker_execution(db, **params))
+            thread = threading.Thread(target=commit_late)
+            thread.start()
+            late_threads.append(thread)
+            raise TimeoutError("worker_receipt_timeout")
+        result = mutate_worker_execution(db, **params)
+        return result
+
+    try:
+        store = RuntimeSessionStore(rpc, scope, tmp_path / "outbox")
+        result = store._apply("usage.main", {"input_tokens": 1})
+        for thread in late_threads:
+            thread.join(timeout=2)
+        assert result
+        assert len(late) == 1
+        assert db._read_one("SELECT COUNT(*) FROM worker_receipts")[0] == 1
+        assert db.get_session("s")["input_tokens"] == 1
+        store.close()
+    finally:
+        db.close()
+
+
+def test_owner_transition_requires_adoption_before_replay(tmp_path, monkeypatch):
+    """A replacement epoch fences the unchanged retry; verified adoption then replays it once."""
+    import agent.runtime_session_store as module
+    from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
+    from hermes_state import SessionDB
+    from hermes_state_runtime import (adopt_worker_execution, begin_runtime_epoch,
+                                      mutate_worker_execution, register_worker_execution)
+
+    monkeypatch.setattr(module, "OWNER_SILENCE_BUDGET_S", 0.0)
+    path, outbox = tmp_path / "state.db", tmp_path / "outbox"
+    db = SessionDB(path)
+    db.create_session("s", "cli")
+    first = begin_runtime_epoch(db, instance_id="first")
+    scope = {"epoch": first, "execution_id": "worker", "session_id": "s", "generation": 0}
+    register_worker_execution(db, **scope, kind="compute", adoption_secret="private")
+
+    def lost(method, **params):
+        mutate_worker_execution(db, **params)
+        raise TimeoutError("lost_ack")
+
+    try:
+        store = RuntimeSessionStore(lost, scope, outbox)
+        with pytest.raises(TimeoutError, match="lost_ack"):
+            store._apply("usage.main", {"input_tokens": 1})
+        store._outbox_owner.close()  # retain the journal without flushing the failed store
+        second = begin_runtime_epoch(db, instance_id="second")
+        successor = dict(scope, epoch=second)
+        adopted = adopt_worker_execution(db, epoch=second, execution_id="worker", session_id="s",
+                                         generation=0, adoption_secret="private")
+
+        def fenced(method, **params):
+            return mutate_worker_execution(db, **params)
+
+        with pytest.raises(WorkerPersistenceError, match="outbox_scope_mismatch"):
+            RuntimeSessionStore(fenced, successor, outbox, adopted=None)
+        assert db._read_one("SELECT COUNT(*) FROM worker_receipts")[0] == 1
+        reopened = RuntimeSessionStore(fenced, successor, outbox, adopted=adopted)
+        try:
+            assert reopened.journal["pending"] == []
+            assert db._read_one("SELECT COUNT(*) FROM worker_receipts")[0] == 1
+            assert db.get_session("s")["input_tokens"] == 1
+        finally:
+            reopened.close()
+    finally:
+        db.close()
+
+
 def test_cohort_of_five_stores_recover_same_owner(tmp_path):
     from agent.runtime_session_store import RuntimeSessionStore
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+
+    db = SessionDB(tmp_path / "state.db")
+    epoch = begin_runtime_epoch(db, instance_id="owner")
     calls = {}
 
     def rpc(method, **params):
         key = params["execution_id"]
         calls[key] = calls.get(key, 0) + 1
+        result = mutate_worker_execution(db, **params)
         if calls[key] == 1:
             raise TimeoutError("worker_receipt_timeout")
-        return {"value": key}
+        return result
 
-    stores = [RuntimeSessionStore(rpc, {"execution_id": str(i), "session_id": "s", "epoch": 1,
-                                        "generation": 1}, tmp_path / str(i)) for i in range(5)]
+    stores = []
     try:
+        for i in range(5):
+            session_id = f"s{i}"
+            db.create_session(session_id, "cli")
+            scope = {"execution_id": str(i), "session_id": session_id, "epoch": epoch, "generation": 0}
+            register_worker_execution(db, **scope, kind="compute", adoption_secret="private")
+            stores.append(RuntimeSessionStore(rpc, scope, tmp_path / str(i)))
         for i, store in enumerate(stores):
-            assert store._apply("operation", {"payload": i}) == {"value": str(i)}
+            assert store._apply("usage.main", {"input_tokens": 1})
             assert store.journal["pending"] == []
+        assert db._read_one("SELECT COUNT(*) FROM worker_receipts")[0] == 5
     finally:
         for store in stores:
             store.close()
+        db.close()
 
 
-def test_worker_cancel_wiring_shares_controls_event(tmp_path):
-    from agent.runtime_session_store import WorkerRPC
+def test_execute_wires_store_and_rpc_cancel_to_controls(monkeypatch, tmp_path):
+    """Execute's production wiring is exercised before agent construction begins."""
+    import sys
+    import types
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    from pathlib import Path
+    real_is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: False if "hermes-update-pull" in str(path) else real_is_file(path))
+    monkeypatch.setitem(sys.modules, "hermes_bootstrap", types.ModuleType("hermes_bootstrap"))
+    import agent.managed_worker as managed
+    import agent.runtime_session_store as runtime
 
-    controls_stopped = threading.Event()
-    rpc = WorkerRPC(tmp_path / "home")
-    store = make_store(tmp_path / "store", rpc)
-    store.cancel = controls_stopped
-    rpc.cancel = controls_stopped  # type: ignore[assignment]
-    assert store.cancel is controls_stopped
-    assert rpc.cancel is controls_stopped
-    store.close()
+    class FakeRPC:
+        cancel = None
+        instance = None
+
+        def __init__(self, home):
+            self.home = home
+            self.cancel = object()
+            type(self).instance = self
+
+        def __call__(self, method, **params):
+            return {"owner_epoch": params.get("epoch", 1)}
+
+    class FakeStore:
+        cancel = None
+        instance = None
+
+        def __init__(self, rpc, scope, outbox, adopted=None):
+            self.rpc = rpc
+            self.cancel = object()
+            type(self).instance = self
+
+        def close(self):
+            pass
+
+    class Policy:
+        skills_prompt = ""
+        source = "tool"
+        ignore_rules = True
+        platform = "tool"
+        model = provider = base_url = None
+        toolsets = ()
+        max_turns = 1
+        pass_session_id = False
+        reasoning_config = {}
+
+        def config(self):
+            return {}
+
+    class Channel:
+        def send(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(managed, "bind_worker_policy", lambda frame: None)
+    monkeypatch.setattr(runtime, "WorkerRPC", FakeRPC)
+    monkeypatch.setattr(runtime, "RuntimeSessionStore", FakeStore)
+    monkeypatch.setattr(managed, "outbox_dir", lambda home, execution: tmp_path)
+    monkeypatch.setattr(managed, "discover_profile_mcp", lambda policy: None)
+    def stop_before_agent(*args, **kwargs):
+        assert FakeStore.instance is not None and FakeRPC.instance is not None
+        assert FakeStore.instance.cancel is FakeRPC.instance.cancel
+        raise AssertionError("wired")
+
+    monkeypatch.setattr(managed, "_construct_agent", stop_before_agent)
+    monkeypatch.setattr("tools.approval.register_gateway_notify", lambda *args: None)
+    monkeypatch.setattr("tools.approval.unregister_gateway_notify", lambda *args: None)
+    monkeypatch.setattr("gateway.session_kanban.bind_worker_context", lambda frame: None)
+    monkeypatch.setattr("gateway.session_policy.restore_policy", lambda frame: Policy())
+    monkeypatch.setattr("gateway.session_policy.register_worker_hooks", lambda policy: None)
+    monkeypatch.setattr("gateway.session_policy.policy_scope", lambda policy, home: __import__("contextlib").nullcontext())
+    monkeypatch.setattr("gateway.session_worker_construct.construct_kwargs", lambda frame: {})
+    monkeypatch.setattr("gateway.session_worker_construct.checkpoint_agent_kwargs", lambda policy: {})
+    monkeypatch.setattr("gateway.session_worker_construct.routing_agent_kwargs", lambda *args: {})
+    frame = {"scope": {"execution_id": "e", "session_id": "s", "epoch": 1, "generation": 1},
+             "home": str(tmp_path), "policy": {}, "route": "r", "api_key": None,
+             "user_id": "u", "chat_id": "c", "text": "x"}
+    with pytest.raises(AssertionError) as exc:
+        managed.execute(frame, Channel())
+    assert str(exc.value) == "wired"
