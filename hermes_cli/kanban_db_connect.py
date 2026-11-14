@@ -743,6 +743,11 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     if resolved in _INITIALIZED_PATHS:
         conn, schema_present = _open_configured(path, _schema_is_present)
         if schema_present:
+            try:
+                _bind_action_receipt_board(conn, path, board)
+            except Exception:
+                conn.close()
+                raise
             return conn
         # Cache says "initialized", file says otherwise: it was deleted or
         # replaced under a live process and the open silently recreated an empty
@@ -777,7 +782,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
-                _bind_action_receipt_board(conn, board)
+                _bind_action_receipt_board(conn, path, board)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -921,17 +926,34 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
-def _bind_action_receipt_board(conn: sqlite3.Connection, board: Optional[str]) -> None:
-    """Persist the board selected by the trusted connection resolver."""
-    trusted = _kb._normalize_board_slug(board) if board is not None else _kb.DEFAULT_BOARD
-    trusted = trusted or _kb.DEFAULT_BOARD
+def _trusted_board_for_path(path: Path, board: Optional[str]) -> Optional[str]:
+    """Derive board identity from the resolved physical database when possible."""
+    resolved = path.expanduser().resolve()
+    if resolved == (_kb.kanban_home() / "kanban.db").resolve():
+        return _kb.DEFAULT_BOARD
+    try:
+        relative = resolved.relative_to(_kb.boards_root().resolve())
+    except ValueError:
+        relative = None
+    if relative is not None and len(relative.parts) == 2 and relative.name == "kanban.db":
+        return _kb._require_slug(relative.parts[0])
+    if board is None:
+        return None
+    return _kb._normalize_board_slug(board) or _kb.DEFAULT_BOARD
+
+
+def _bind_action_receipt_board(
+    conn: sqlite3.Connection, path: Path, board: Optional[str],
+) -> None:
+    """Persist and verify the board selected by the trusted physical resolver."""
+    trusted = _trusted_board_for_path(path, board)
     row = conn.execute("SELECT board FROM kanban_board_identity WHERE singleton = 1").fetchone()
     if row is None:
         conn.execute(
             "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, ?)",
-            (trusted,),
+            (trusted or _kb.DEFAULT_BOARD,),
         )
-    elif row["board"] != trusted:
+    elif trusted is not None and row["board"] != trusted:
         raise ValueError(
             f"kanban database is bound to board {row['board']!r}, not {trusted!r}"
         )
