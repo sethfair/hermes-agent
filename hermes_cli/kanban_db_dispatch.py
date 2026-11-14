@@ -2006,15 +2006,32 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     monitor_context=None,
+    _skip_reclaim: bool = False,
+    _contexts_prevalidated: bool = False,
 ) -> DispatchResult:
     if isinstance(monitor_context, (tuple, list)):
+        from hermes_cli import kanban_ready_monitor as monitor
+        try:
+            from hermes_cli.config import load_config
+            loaded = load_config()
+            monitor_config = loaded.get("kanban", {}) if isinstance(loaded, dict) else None
+        except (OSError, TypeError, ValueError, KeyError):
+            monitor_config = None
+        contexts = tuple(monitor_context)
+        if monitor.has_protected_scope(conn) and (
+                monitor_config is None
+                or monitor.validate_runtime_contexts(conn, contexts, monitor_config)
+        ):
+            return DispatchResult(monitor_scope_refused=True)
         merged = DispatchResult()
-        for context in monitor_context:
+        for index, context in enumerate(contexts):
             part = dispatch_once(conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
                                  max_spawn=max_spawn, max_in_progress=max_in_progress, failure_limit=failure_limit,
                                  stale_timeout_seconds=stale_timeout_seconds, board=board,
                                  default_assignee=default_assignee, max_in_progress_per_profile=max_in_progress_per_profile,
-                                 reconcile_orphans=reconcile_orphans, monitor_context=context)
+                                 reconcile_orphans=reconcile_orphans, monitor_context=context,
+                                 _skip_reclaim=_skip_reclaim or index > 0,
+                                 _contexts_prevalidated=True)
             for name in ("reclaimed", "promoted"):
                 setattr(merged, name, getattr(merged, name) + getattr(part, name))
             for name in ("reconciled_orphans", "reaped_terminal_workers", "spawned", "skipped_unassigned",
@@ -2046,6 +2063,9 @@ def dispatch_once(
             return result
         if monitor.has_protected_scope(conn) and monitor_config is None:
             return DispatchResult(monitor_scope_refused=True)
+        if (monitor.has_protected_scope(conn) and not _contexts_prevalidated
+                and monitor.validate_runtime_contexts(conn, (monitor_context,), monitor_config)):
+            return DispatchResult(monitor_scope_refused=True)
         attempt_id = None
         tick_context = monitor_context.for_tick() if monitor_context is not None else None
         if tick_context is not None:
@@ -2072,6 +2092,7 @@ def dispatch_once(
             monitor_attempt_id=attempt_id,
             monitor_context=tick_context,
             monitor_profile=tick_context.profile if tick_context is not None else None,
+            skip_reclaim=_skip_reclaim,
         )
         if attempt_id is not None:
             monitor.record_dispatch_tick(
@@ -2295,38 +2316,6 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _any_spawnable_review(
-    conn: sqlite3.Connection,
-    review_rows: list[sqlite3.Row],
-    *,
-    per_profile_cap: Optional[int] = None,
-    per_profile_running: Optional[dict[str, int]] = None,
-) -> bool:
-    """Mirror review dispatch gates before reserving ready-lane capacity.
-
-    Unavailable profile metadata retains the historic fail-open behavior. A
-    review row that :func:`_dispatch_lane_task` would refuse this tick — its
-    assignee already at the per-profile cap, or respawn-guarded — cannot
-    consume the reservation, so it must not withhold capacity from an
-    otherwise ready task (one such row would pin ``ready_budget`` to 0).
-    """
-    if not review_rows:
-        return False
-    profile_exists = _profile_exists_fn()
-    running = per_profile_running or {}
-    for row in review_rows:
-        assignee = row["assignee"]
-        if not assignee:
-            continue
-        if profile_exists is not None and not profile_exists(assignee):
-            continue
-        if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
-            continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
-            return True
-    return False
-
-
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     """``kanban.default_assignee`` when it names a real profile this home may
     claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
@@ -2359,13 +2348,15 @@ def _dispatch_once_locked(
     monitor_attempt_id: Optional[str] = None,
     monitor_context=None,
     monitor_profile: Optional[str] = None,
+    skip_reclaim: bool = False,
 ) -> DispatchResult:
     result = DispatchResult()
     from hermes_cli import kanban_ready_monitor as monitor
-    _run_reclaim_phase(
-        conn, result, stale_timeout_seconds=stale_timeout_seconds,
-        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
-    )
+    if not skip_reclaim:
+        _run_reclaim_phase(
+            conn, result, stale_timeout_seconds=stale_timeout_seconds,
+            failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
@@ -2941,4 +2932,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
-from hermes_cli.kanban_db_dispatch_lane import _dispatch_lane_task
+from hermes_cli.kanban_db_dispatch_lane import _any_spawnable_review, _dispatch_lane_task

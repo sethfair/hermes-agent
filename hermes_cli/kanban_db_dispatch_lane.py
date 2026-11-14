@@ -9,6 +9,25 @@ from hermes_cli import kanban_db_dispatch as _dispatch
 from hermes_cli import kanban_db_workspace as _kbw
 
 
+def _any_spawnable_review(
+    conn: Any, review_rows: list[Any], *, per_profile_cap: Optional[int] = None,
+    per_profile_running: Optional[dict[str, int]] = None,
+) -> bool:
+    """Mirror review dispatch gates before reserving ready-lane capacity."""
+    if not review_rows:
+        return False
+    profile_exists = _dispatch._profile_exists_fn()
+    running = per_profile_running or {}
+    for row in review_rows:
+        assignee = row["assignee"]
+        if (not assignee or (profile_exists is not None and not profile_exists(assignee))
+                or (per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap)):
+            continue
+        if _dispatch.check_respawn_guard(conn, row["id"], lane="review") is None:
+            return True
+    return False
+
+
 def _decision(result: Any, task_id: str, kind: str, reason: Optional[str] = None) -> None:
     result.monitor_decisions.append({"task_id": task_id, "decision": kind, "guard_reason": reason})
 

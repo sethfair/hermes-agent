@@ -1,6 +1,7 @@
 """Behavioral contracts for aged-Ready monitoring."""
 
 import sqlite3
+import json
 import uuid
 
 from hermes_cli import kanban_db as kb
@@ -204,7 +205,9 @@ def test_resolver_schedule_is_bounded_and_redacted():
     assert [row["state"] for row in complete["intents"]].count("due") == 1
     assert all(row["state"] == "planned" for row in complete["intents"][1:])
     assert "owner_id" not in repr(complete)
-    assert {row[0] for row in conn.execute("SELECT kind FROM task_events")} == {"aged_ready_diagnostic", "aged_ready_intent_due"}
+    assert {row[0] for row in conn.execute("SELECT kind FROM task_events")} == {"aged_ready_diagnostic", "aged_ready_resolver_changed", "aged_ready_intent_due"}
+    due = conn.execute("SELECT payload FROM task_events WHERE kind='aged_ready_intent_due'").fetchone()[0]
+    assert {"intent_id", "stage", "ordinal", "routing_generation", "resolver_digest"} <= set(json.loads(due))
     assert conn.execute("SELECT COUNT(*) FROM kanban_ready_episodes").fetchone()[0] == 1
 
 
@@ -256,7 +259,7 @@ def test_writer_context_requires_unique_configured_member_and_exact_partition():
 
 
 def test_aged_ready_parser_is_strict_about_types_bounds_and_roster_shape():
-    valid = {"aged_ready": {"min_age_seconds": 1, "min_eligible_misses": 1,
+    valid = {"aged_ready": {"controller_id": str(uuid.uuid4()), "min_age_seconds": 1, "min_eligible_misses": 1,
                             "controller_stale_seconds": 1, "owner_retry_seconds": [1],
                             "manager_retry_seconds": [1], "expected_writer_scopes": {},
                             "resolver_bindings": {}}}
@@ -266,6 +269,9 @@ def test_aged_ready_parser_is_strict_about_types_bounds_and_roster_shape():
                 {"aged_ready": {"min_age_seconds": True}},
                 {"aged_ready": {"owner_retry_seconds": [2, 1]}},
                 {"aged_ready": {"owner_retry_seconds": [0]}},
+                {"aged_ready": {"controller_id": True}},
+                {"aged_ready": {"controller_id": str(uuid.uuid4()), "expected_writer_scopes": {
+                    str(uuid.uuid4()): {"roster_generation": str(uuid.uuid4()), "members": [], "extra": 1}}}},
                 {"aged_ready": {"resolver_bindings": {"p": {"owner_ref": "o"}}}},
                 {"aged_ready": {"expected_writer_scopes": []}}):
         try:

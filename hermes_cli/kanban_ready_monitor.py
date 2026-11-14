@@ -97,8 +97,8 @@ def parse_aged_ready_config(value: Any) -> dict[str, Any]:
     result["observation_enabled"] = result.get("observation_enabled", False)
     if not isinstance(result["observation_enabled"], bool):
         raise ValueError("invalid aged_ready observation_enabled")
-    result["controller_id"] = result.get("controller_id", "")
-    if not isinstance(result["controller_id"], str):
+    result["controller_id"] = result.get("controller_id")
+    if not isinstance(result["controller_id"], str) or not _uuid(result["controller_id"]):
         raise ValueError("invalid aged_ready controller_id")
     result["min_age_seconds"] = _strict_int(result.get("min_age_seconds", 1800), "min_age_seconds", minimum=1)
     result["min_eligible_misses"] = _strict_int(result.get("min_eligible_misses", 3), "min_eligible_misses", minimum=1)
@@ -397,7 +397,9 @@ def parse_expected_writer_scopes(value: Any) -> dict[str, dict[str, Any]]:
         raise ValueError("expected_writer_scopes must be a mapping")
     parsed: dict[str, dict[str, Any]] = {}
     for board_id, raw in value.items():
-        if not _uuid(board_id) or not isinstance(raw, Mapping) or not _uuid(raw.get("roster_generation")):
+        if (not _uuid(board_id) or not isinstance(raw, Mapping)
+                or set(raw) - {"roster_generation", "roster_digest", "members"}
+                or not _uuid(raw.get("roster_generation"))):
             raise ValueError("invalid writer scope")
         members = raw.get("members")
         if not isinstance(members, list) or not members:
@@ -406,15 +408,16 @@ def parse_expected_writer_scopes(value: Any) -> dict[str, dict[str, Any]]:
         profiles: set[str] = set()
         canonical = []
         for member in members:
-            if not isinstance(member, Mapping) or not _uuid(member.get("writer_ref")):
+            if (not isinstance(member, Mapping)
+                    or set(member) - {"writer_ref", "profiles", "protocol_version", "compatible_revisions"}
+                    or not _uuid(member.get("writer_ref"))):
                 raise ValueError("invalid writer member")
             member_profiles = _profiles(member.get("profiles"))
             if not member_profiles or member["writer_ref"] in refs or profiles.intersection(member_profiles):
                 raise ValueError("duplicate or overlapping writer member")
-            try:
-                protocol = int(member.get("protocol_version"))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("invalid writer protocol") from exc
+            protocol = member.get("protocol_version")
+            if isinstance(protocol, bool) or not isinstance(protocol, int):
+                raise ValueError("invalid writer protocol")
             compatible = member.get("compatible_revisions")
             if (protocol != PROTOCOL_VERSION or not isinstance(compatible, list) or not compatible
                     or any(not isinstance(item, str) or not item.strip() for item in compatible)
@@ -482,6 +485,26 @@ def validate_writer_context(conn: sqlite3.Connection, controller: MonitorWriterC
             not controller.installed_revision or
             controller.profile not in _profiles(member.get("profiles"))):
         return "incompatible_writer_context"
+    return None
+
+
+def validate_runtime_contexts(conn: sqlite3.Connection, contexts: tuple[MonitorWriterContext, ...],
+                              config: Mapping[str, Any] | None) -> str | None:
+    """Validate the complete protected partition before dispatch can mutate the board."""
+    scopes = conn.execute(
+        "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
+        "AND state IN ('pending','active','faulted') ORDER BY id"
+    ).fetchall()
+    if not scopes or len(contexts) != len(scopes) or len({ctx.profile for ctx in contexts}) != len(contexts):
+        return "writer_scope_incomplete"
+    expected = {(scope["board_scope_id"], scope["profile"]) for scope in scopes}
+    actual = {(ctx.board_scope_id, ctx.profile) for ctx in contexts}
+    if actual != expected:
+        return "writer_scope_incomplete"
+    for context in contexts:
+        error = validate_writer_context(conn, context, config)
+        if error:
+            return error
     return None
 
 
@@ -657,15 +680,7 @@ def runtime_context(conn: sqlite3.Connection, writer_ref: str, controller_genera
     from hermes_cli.version_info import get_version_info
     info = get_version_info()
     dispatch_profiles = _profiles(aged.get("dispatch_profiles", ()))
-    selected_writer = str(aged.get("controller_id") or writer_ref)
-    if not aged.get("controller_id"):
-        board = (aged.get("expected_writer_scopes", {}).get(scope["board_scope_id"], {})
-                 if isinstance(aged.get("expected_writer_scopes", {}), Mapping) else {})
-        for member in board.get("members", ()) if isinstance(board, Mapping) else ():
-            if scope["profile"] in _profiles(member.get("profiles")):
-                selected_writer = str(member.get("writer_ref"))
-                dispatch_profiles = _profiles(member.get("profiles"))
-                break
+    selected_writer = aged["controller_id"]
     return MonitorWriterContext(
         board_scope_id=scope["board_scope_id"], profile=scope["profile"],
         writer_ref=selected_writer, controller_generation=controller_generation,
@@ -750,6 +765,8 @@ def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterC
                 project_escalation_intents(
                     conn, observed["episode_id"], bindings=bindings,
                     owner_retry_seconds=aged["owner_retry_seconds"], manager_retry_seconds=aged["manager_retry_seconds"], now=now,
+                    owner_profiles=tuple(profile for profile, item in aged["resolver_bindings"].items()
+                                         if item["owner_ref"] == bindings.get("owner_ref")),
                 )
         except Exception:
             conn.rollback()
@@ -877,16 +894,10 @@ def reconcile_truthful_hold(conn: sqlite3.Connection, task_id: str, *, status: s
     return closed
 
 
-def _binding_digest(binding: Mapping[str, Any] | None) -> str | None:
-    if not binding:
-        return None
-    safe = {str(k): str(v) for k, v in binding.items() if str(k).endswith(("_id", "_digest", "_alias"))}
-    return hashlib.sha256(json.dumps(safe, sort_keys=True).encode()).hexdigest()
-
-
 def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bindings: Mapping[str, Any] | None,
                                owner_retry_seconds: tuple[int, ...] = (300, 900, 3600),
-                               manager_retry_seconds: tuple[int, ...] = (900, 3600), now: int | None = None) -> dict[str, Any]:
+                               manager_retry_seconds: tuple[int, ...] = (900, 3600), now: int | None = None,
+                               owner_profiles: tuple[str, ...] = ()) -> dict[str, Any]:
     """Create bounded, metadata-only escalation facts; never sends or claims."""
     now = int(time.time()) if now is None else int(now)
     episode = conn.execute("SELECT * FROM kanban_ready_episodes WHERE id=?", (episode_id,)).fetchone()
@@ -903,15 +914,14 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
             conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_diagnostic', ?, ? FROM kanban_ready_episodes WHERE id=?",
                          (json.dumps({"code": code, "episode_id": episode_id}), now, episode_id))
         return {"episode_id": episode_id, "state": "unavailable", "diagnostic": code, "intents": []}
-    digest = _binding_digest(binding)
+    from hermes_cli.kanban_ready_monitor_resolver import binding_digest
+    digest = binding_digest(conn, binding, profile=episode["profile"], owner_profiles=owner_profiles)
     old = episode["authority_set_digest"] if "authority_set_digest" in episode.keys() else None
     routing = int(episode["routing_generation"] or 0) + (1 if old and old != digest else 0)
     prior_stage = episode["resolver_stage"] or "unavailable"
-    if old and old != digest:
+    changed = old != digest or prior_stage != "owner"
+    if changed and old is not None:
         conn.execute("UPDATE kanban_ready_escalation_intents SET state='superseded' WHERE episode_id=? AND state IN ('due','planned')", (episode_id,))
-        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_resolver_changed', ?, ? FROM kanban_ready_episodes WHERE id=?",
-                     (json.dumps({"episode_id": episode_id, "routing_generation": routing, "from_stage": prior_stage,
-                                  "to_stage": "owner", "resolver_digest": digest}), now, episode_id))
     conn.execute("UPDATE kanban_ready_episodes SET resolver_stage='owner', routing_generation=?, authority_set_digest=? WHERE id=?",
                  (routing, digest, episode_id))
     schedule = [("owner", i + 1, 0 if i == 0 else delay, "due" if i == 0 else "planned")
@@ -922,13 +932,24 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
                      "(id,episode_id,routing_generation,stage,ordinal,scheduled_at,state,resolver_ref_digest,authority_set_digest) VALUES(?,?,?,?,?,?,?,?,?)",
                      (f"intent_{secrets.token_hex(10)}", episode_id, routing, stage, ordinal, now + delay, state,
                       _digest(str(binding["owner_ref" if stage == "owner" else "manager_ref"])), digest))
+    promoted_due = conn.execute(
+        "UPDATE kanban_ready_escalation_intents SET state='due' "
+        "WHERE episode_id=? AND routing_generation=? AND state='planned' AND scheduled_at<=?",
+        (episode_id, routing, now),
+    ).rowcount
     conn.execute("UPDATE kanban_ready_episodes SET intent_count=(SELECT COUNT(*) FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=?) WHERE id=?", (episode_id, routing, episode_id))
-    if not old or old != digest:
-        for row in conn.execute("SELECT id,stage,ordinal,resolver_ref_digest FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=?", (episode_id, routing)):
+    for row in conn.execute("SELECT id,stage,ordinal,resolver_ref_digest,scheduled_at,state FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=?", (episode_id, routing)):
+        payload = {"episode_id": episode_id, "intent_id": row["id"], "stage": row["stage"],
+                   "ordinal": row["ordinal"], "retry_ordinal": row["ordinal"],
+                   "routing_generation": routing, "from_stage": prior_stage,
+                   "to_stage": row["stage"], "from_resolver_digest": old,
+                   "to_resolver_digest": digest, "resolver_digest": digest}
+        if changed:
+            conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_resolver_changed', ?, ? FROM kanban_ready_episodes WHERE id=?",
+                         (json.dumps(payload), now, episode_id))
+        if row["state"] == "due" and (changed or promoted_due):
             conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_intent_due', ?, ? FROM kanban_ready_episodes WHERE id=?",
-                         (json.dumps({"episode_id": episode_id, "intent_id": row["id"], "from_stage": prior_stage,
-                                      "to_stage": row["stage"], "ordinal": row["ordinal"],
-                                      "resolver_digest": row["resolver_ref_digest"], "authority_digest": digest}), now, episode_id))
+                         (json.dumps(payload), now, episode_id))
     rows = conn.execute("SELECT stage,ordinal,scheduled_at,state FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=? ORDER BY CASE stage WHEN 'owner' THEN 0 ELSE 1 END, ordinal", (episode_id, routing)).fetchall()
     return {"episode_id": episode_id, "routing_generation": routing, "resolver_stage": "owner", "resolver_digest": digest,
             "intents": [dict(row) for row in rows]}
