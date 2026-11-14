@@ -74,7 +74,22 @@ def _clear_seed_worktree(repo: Path) -> None:
 def _reduced_reviewed_tree(repo: Path, revision: str) -> str:
     """Materialize only the files exercised by this fixture, then snapshot them."""
     _clear_seed_worktree(repo)
-    git(repo, "read-tree", "--reset", "-u", revision)
+    wanted = ("scripts/observer_v2", "scripts/frozen_import_policy.py", "scripts/check",
+              "scripts/check-windows-footguns.py", "scripts/check_frozen_ruff.py",
+              "scripts/code_health", "scripts/ci", "scripts/reviewed.py", "scripts/later.py",
+              ".github/workflows/lint.yml",
+              "pyproject.toml", "ruff.toml", "tests/cron/fixtures/observer-v2-reference")
+    for line in git(repo, "ls-tree", "-r", revision, "--", *wanted).splitlines():
+        metadata, relative = line.split("\t", 1)
+        mode, kind, oid = metadata.split()
+        assert kind == "blob" and mode in {"100644", "100755"}
+        result = subprocess.run(("git", "cat-file", "blob", oid), cwd=repo,
+                                capture_output=True, timeout=60, check=False)
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(result.stdout)
+        target.chmod(int(mode, 8))
     git(repo, "read-tree", "--empty")
     paths = [relative for relative in
              ("scripts", ".github/workflows/lint.yml", "tests", "pyproject.toml", "ruff.toml")
