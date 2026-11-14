@@ -1456,7 +1456,8 @@ def _record_task_failure(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "consecutive_failures = ?, last_failure_error = ?, block_kind = NULL, "
+            "block_recurrences = 0, block_identity = NULL, block_identity_state = 'unknown' "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
@@ -1487,17 +1488,15 @@ def _record_task_failure(
             payload["sticky"] = True
         if event_payload_extra:
             payload.update(event_payload_extra)
+        _kbi.append_unknown_event(conn, task_id, "failure_breaker", run_id=run_id)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
-    """Publish the launcher only while this claim has no executing worker yet, together with its
-    restart-stable fingerprint (``_process_fingerprint``); the ``spawned`` event carries both. The
-    fingerprint is what lets every later liveness/kill decision tell OUR worker from a process that
-    recycled the PID after a reboot. A failed capture is persisted as ``UNVERIFIED_WORKER_FINGERPRINT``,
-    never NULL: NULL is the legacy pre-fingerprint row whose bare-PID kill authority a new spawn must
-    not inherit."""
+    """Publish this claim's launcher with a restart-stable process fingerprint.
+
+    Failed capture uses ``UNVERIFIED_WORKER_FINGERPRINT``; NULL grants no new bare-PID authority."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
         if run_id is None:
@@ -2940,5 +2939,6 @@ def run_daemon(
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_db_block_identity as _kbi
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw

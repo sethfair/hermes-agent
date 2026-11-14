@@ -538,6 +538,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    block_subject: Optional[str] = None
     # Handoff fields forwarded to complete_task on -> 'done' (parity with ``hermes kanban complete``).
     summary: Optional[str] = None
     metadata: Optional[dict] = None
@@ -560,6 +562,8 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    block_kind: Optional[str] = None
+    block_subject: Optional[str] = None
     reclaim_first: bool = False
     # Same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -574,6 +578,34 @@ class _StatusRejected(Exception):
 
 
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+
+
+def _unknown_release_refused(conn, task_id: str, status: Optional[str]) -> bool:
+    """Fail closed before a compound dashboard request mutates any task field."""
+    if status not in {"ready", "todo", "triage"}:
+        return False
+    row = conn.execute(
+        "SELECT status, block_kind, block_recurrences, block_identity, block_identity_state "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return bool(
+        row and row["status"] in {"blocked", "todo", "triage"}
+        and kanban_db.effective_block_identity(row).state == "unknown"
+    )
+
+
+def _dashboard_block(conn, task_id: str, payload) -> bool:
+    """A typed block request against an existing UNKNOWN hold is classification."""
+    kind = getattr(payload, "block_kind", None)
+    subject = getattr(payload, "block_subject", None)
+    current = kanban_db.get_task(conn, task_id)
+    if current is not None and current.status == "blocked" and kind is not None and subject is not None:
+        return kanban_db.classify_block(
+            conn, task_id, kind=kind, subject=subject, actor="dashboard",
+        )
+    return kanban_db.block_task(
+        conn, task_id, reason=getattr(payload, "block_reason", None), kind=kind, subject=subject,
+    )
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
@@ -594,7 +626,7 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "blocked": _dashboard_block,
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
@@ -696,6 +728,27 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
+        has_block_identity = payload.block_kind is not None or payload.block_subject is not None
+        if has_block_identity and (payload.block_kind is None or payload.block_subject is None):
+            raise HTTPException(status_code=400, detail="block_kind and block_subject must be provided together")
+        if has_block_identity and payload.status not in (None, "blocked"):
+            raise HTTPException(
+                status_code=400,
+                detail="block classification and release must be separate requests",
+            )
+        if has_block_identity and payload.status is None:
+            with _map_errors(400, ValueError):
+                classified = kanban_db.classify_block(
+                    conn,
+                    task_id,
+                    kind=payload.block_kind,
+                    subject=payload.block_subject,
+                    actor="dashboard",
+                )
+            if not classified:
+                raise _conflict("block classification refused")
+        if _unknown_release_refused(conn, task_id, payload.status):
+            raise _conflict(f"status transition to {payload.status!r} not valid from current state")
         if payload.assignee is not None and not review_assignee_deferred:
             with _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
@@ -747,9 +800,15 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, worker_pid, claim_lock, worker_started_at, "
+            "block_kind, block_recurrences, block_identity, block_identity_state "
+            "FROM tasks WHERE id = ?",
             (task_id,)).fetchone()
         if prev is None:
+            return False
+        if prev["status"] in {"blocked", "todo", "triage"} and new_status in {
+            "ready", "todo", "triage"
+        } and kanban_db.effective_block_identity(prev).state == "unknown":
             return False
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
@@ -830,6 +889,22 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
+    has_block_identity = payload.block_kind is not None or payload.block_subject is not None
+    if has_block_identity and (payload.block_kind is None or payload.block_subject is None):
+        raise ValueError("block_kind and block_subject must be provided together")
+    if has_block_identity and payload.status not in (None, "blocked"):
+        raise ValueError("block classification and release must be separate requests")
+    if _unknown_release_refused(conn, tid, payload.status):
+        entry.update(ok=False, error=f"transition to {payload.status!r} refused")
+        return
+    if has_block_identity and payload.status is None and not kanban_db.classify_block(
+        conn,
+        tid,
+        kind=payload.block_kind,
+        subject=payload.block_subject,
+        actor="dashboard",
+    ):
+        entry.update(ok=False, error="block classification refused")
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:

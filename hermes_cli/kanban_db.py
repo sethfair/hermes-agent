@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_db_block_identity import establish_unknown_hold
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -634,8 +635,10 @@ class Task:
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     session_id: Optional[str] = None         # originating HERMES_SESSION_ID; NULL from CLI/dashboard
-    # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
+    # Block identity is durable across unblock; completion clears it.
     block_kind: Optional[str] = None
+    block_identity: Optional[str] = None
+    block_identity_state: str = "none"
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
 
@@ -670,10 +673,12 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "block_identity_state",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "block_identity",
 )
 
 
@@ -874,7 +879,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Canonical versioned JSON key. NULL is never comparable to another NULL.
+    block_identity       TEXT,
+    -- none = no block history, known = validated identity, unknown = fail-closed hold.
+    block_identity_state TEXT NOT NULL DEFAULT 'none'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2050,12 +2059,17 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, block_kind, "
+            "block_recurrences, block_identity, block_identity_state "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            from hermes_cli.kanban_db_block_identity import effective_identity
+
+            if effective_identity(row).state == "unknown":
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -2181,6 +2195,15 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_db_block_identity import effective_identity
+
+        identity_row = conn.execute(
+            "SELECT block_kind, block_recurrences, block_identity, block_identity_state "
+            "FROM tasks WHERE id = ? AND status = 'ready'", (task_id,),
+        ).fetchone()
+        if identity_row is not None and effective_identity(identity_row).state == "unknown":
+            _append_bounded_block_refusal(conn, task_id, "claim", "unknown_identity")
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2700,7 +2723,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       block_identity = NULL,
+                       block_identity_state = 'none'
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -3124,121 +3149,19 @@ def edit_task(
 
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    kind: Optional[str] = None, subject: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
-    toward the loop breaker so a forever-flaky task escalates. True on any
-    transition.
+    from hermes_cli.kanban_db_block_identity import block_task as _block_task
 
-    An already-``blocked`` card that the failure breaker parked UNTYPED
-    (``block_kind IS NULL``, no live run) is classified in place when *kind*
-    is supplied: ``block_kind``/``block_recurrences`` are set and a ``blocked``
-    audit event is appended, while status, failure evidence and the terminal
-    runs stay exactly as the breaker left them. A typed block, a card with a
-    live run, or a kind-less call on a blocked card are still refused.
-    """
-    if kind is not None and kind not in VALID_BLOCK_KINDS:
-        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    with write_txn(conn):
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
-        # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
-        # ``block_kind`` and no ``blocked`` event -- the policy is the
-        # supervisor's, not the kernel's -- but the transition guard below only
-        # matches running/ready, so that policy could never be attached later
-        # (#117363). Classify in place; never re-type or flap status. A caller
-        # asserting run ownership (``expected_run_id``) cannot own a parked
-        # card -- its run is over -- so it is refused like any stale worker.
-        if cur_row["status"] == "blocked":
-            if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
-                return False
-            classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
-                "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
-                "AND current_run_id IS NULL",
-                (kind, task_id),
-            ).rowcount
-            if classified != 1:
-                return False
-            _append_event(conn, task_id, "blocked", {
-                "kind": kind, "reason": reason, "classified_in_place": True,
-            })
-            return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
-        requested_kind = kind
-        rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
-        new_status, event_kind, set_sql, params, payload = _route_block(
-            kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
-            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
-        )
-        if rekind_reason:
-            payload["requested_kind"] = requested_kind
-            payload["rekind_reason"] = rekind_reason
-        sql = f"""
-                UPDATE tasks
-                   SET status        = '{new_status}',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       {set_sql}
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """
-        params = (*params, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
-        )
-        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
-        blocked_task = get_task(conn, task_id)
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    return True
-
-
-def _route_block(
-    kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
-) -> tuple[str, str, str, tuple, dict]:
-    """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
-
-    ``dependency`` never enters the human ``blocked`` bucket: it waits in
-    ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Callers that pass ``dependency`` with no
-    incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
-    recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
-    """
-    payload = {"reason": reason, "kind": kind, "source_status": source_status}
-    if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
-        payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
-    return "blocked", "blocked", set_sql, (kind, recurrences), payload
+    return _block_task(
+        conn,
+        task_id,
+        reason=reason,
+        kind=kind,
+        subject=subject,
+        expected_run_id=expected_run_id,
+    )
 
 
 def redact_review_value(value: Any) -> Any:
@@ -3408,9 +3331,7 @@ def _nonblank_str(value: Any) -> Optional[str]:
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Close an active reviewer run (claimed from ``review``) and hand the task
-    back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    """Close active review to its recorded implementer with parent gating reapplied."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3457,6 +3378,8 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        if new_status == "todo":
+            establish_unknown_hold(conn, task_id, "changes_requested_parent_wait")
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
@@ -3482,9 +3405,17 @@ def promote_task(
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
     Refused while a parent is unfinished; ``dry_run`` only validates.
     Returns ``(ok, reason)``."""
-    cur_status = _task_status(conn, task_id)
+    row = conn.execute(
+        "SELECT status, block_kind, block_recurrences, block_identity, block_identity_state "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    cur_status = row["status"] if row is not None else None
     if cur_status is None:
         return False, f"task {task_id} not found"
+    from hermes_cli.kanban_db_block_identity import effective_identity
+
+    if effective_identity(row).state == "unknown":
+        return False, "manual block classification required before promotion"
 
     if cur_status not in ("todo", "blocked"):
         return False, (
@@ -3513,6 +3444,12 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        locked = conn.execute(
+            "SELECT block_kind, block_recurrences, block_identity, block_identity_state "
+            "FROM tasks WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+        ).fetchone()
+        if locked is None or effective_identity(locked).state == "unknown":
+            return False, f"task {task_id} status or block identity changed during promotion"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
@@ -3559,6 +3496,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        from hermes_cli.kanban_db_block_identity import effective_identity
+
+        identity_row = conn.execute(
+            "SELECT block_kind, block_recurrences, block_identity, block_identity_state "
+            "FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            (task_id,),
+        ).fetchone()
+        if identity_row is not None and effective_identity(identity_row).state == "unknown":
+            _append_bounded_block_refusal(conn, task_id, "unblock", "unknown_identity")
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3598,11 +3545,61 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def classify_block(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    subject: str,
+    actor: str,
+    expected_unknown: bool = True,
+) -> bool:
+    from hermes_cli.kanban_db_block_identity import classify_block as _classify_block
+
+    return _classify_block(
+        conn,
+        task_id,
+        kind=kind,
+        subject=subject,
+        actor=actor,
+        expected_unknown=expected_unknown,
+    )
+
+
+def effective_block_identity(row):
+    """Return the fail-closed blocker identity interpretation for a task-like row."""
+    from hermes_cli.kanban_db_block_identity import effective_identity
+
+    return effective_identity(row)
+
+
+def _append_bounded_block_refusal(
+    conn: sqlite3.Connection, task_id: str, operation: str, cause: str
+) -> None:
+    """Record one refusal per operation/cause until another lifecycle event occurs."""
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    payload = _json_dict(_row_get(last, "payload"))
+    if (
+        last is not None
+        and last["kind"] == "block_release_refused"
+        and payload.get("operation") == operation
+        and payload.get("unknown_cause") == cause
+    ):
+        return
+    _append_event(
+        conn,
+        task_id,
+        "block_release_refused",
+        {"operation": operation, "identity_state": "unknown", "unknown_cause": cause},
+    )
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
-    comments; restores the implementer from the ``review_requested`` event.
-    Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    """Reopen review to its implementer, preserving failure and block counters
+    because only :func:`complete_task` proves the pathology cleared."""
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -3625,6 +3622,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if new_status == "todo":
+            establish_unknown_hold(conn, task_id, "review_reopened_parent_wait")
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
@@ -3696,6 +3695,7 @@ def invalidate_descendants_for_parent_reopen(
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
             )
+            establish_unknown_hold(conn, row["id"], "ancestor_reopened_parent_wait")
             entry = {
                 "id": row["id"], "prior_status": previous_status,
                 "new_status": "todo", "resume_status": resume_status,

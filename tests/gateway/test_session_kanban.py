@@ -90,7 +90,10 @@ def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):
     with closing(connect(board='owned')) as conn:
         tid = kb.create_task(conn, title='Owned race', assignee='default')
         old = kb.claim_task(conn, tid)
-        kb.block_task(conn, tid, reason='replace claim', expected_run_id=old.current_run_id)
+        kb.block_task(
+            conn, tid, reason='replace claim', kind='transient', subject='claim-replacement',
+            expected_run_id=old.current_run_id,
+        )
         kb.unblock_task(conn, tid)
         new = kb.claim_task(conn, tid)
         dispatch._set_worker_pid(conn, tid, 424242, run_id=old.current_run_id, claim_lock=old.claim_lock)
@@ -126,7 +129,10 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     def create_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None):
         # Another process reclaims the task while the owner session is being created.
         with closing(connect(board='owned')) as conn:
-            kb.block_task(conn, task_id, reason='replace claim', expected_run_id=old.current_run_id)
+            kb.block_task(
+                conn, task_id, reason='replace claim', kind='transient', subject='claim-replacement',
+                expected_run_id=old.current_run_id,
+            )
             kb.unblock_task(conn, task_id)
             kb.claim_task(conn, task_id)
         return SimpleNamespace(session_id='owner-session', profile_id=str(tmp_path))
@@ -146,3 +152,55 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "subject"),
+    [
+        ("transient", "goal-loop-budget"),
+        ("capability", "goal-loop-unachievable"),
+        ("transient", "goal-loop-finalization"),
+    ],
+)
+def test_gateway_goal_fallback_persists_identity_through_real_database(
+    tmp_path, monkeypatch, kind, subject,
+):
+    """The managed gateway producer writes the stable identity to the task DB."""
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from gateway.session_kanban import _run_task_turns
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kb.init_db()
+    with closing(connect()) as conn:
+        tid = kb.create_task(conn, title="goal", body="finish", assignee="worker", goal_mode=True)
+        claimed = kb.claim_task(conn, tid)
+        db_path = str(kb.kanban_db_path())
+    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
+
+    def exercise(**kwargs):
+        kwargs["block_fn"]("fallback", kind=kind, subject=subject)
+
+    monkeypatch.setattr("hermes_cli.goals.run_kanban_goal_loop", exercise)
+
+    class Agent:
+        session_id = "goal-session"
+        _session_db = SimpleNamespace(get_messages_as_conversation=lambda _sid: [])
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "not done", "messages": []}
+
+    context = {
+        "skills": [], "context": "", "task_id": tid, "run_id": claimed.current_run_id,
+        "claim_lock": claimed.claim_lock, "goal_mode": True, "goal_text": "finish",
+        "goal_max_turns": 1,
+    }
+    _run_task_turns(Agent(), {"text": "work"}, [], context)
+
+    with closing(connect()) as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == kind
+        assert task.block_identity_state == "known"
+        assert subject in task.block_identity

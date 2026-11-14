@@ -250,6 +250,60 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
             for event in kb.list_events(conn, task["id"])
         )
 
+
+def test_patch_block_with_identity_classifies_existing_unknown_hold(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "classify me"}).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "untyped"},
+    ).status_code == 200
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_kind": "transient", "block_subject": "dashboard-manual"},
+    )
+
+    assert response.status_code == 200, response.text
+    with kbc.connect() as conn:
+        row = conn.execute(
+            "SELECT block_kind, block_identity_state FROM tasks WHERE id = ?", (task["id"],),
+        ).fetchone()
+        assert tuple(row) == ("transient", "known")
+        classified = [e for e in kb.list_events(conn, task["id"]) if e.kind == "block_classified"]
+        assert classified and classified[-1].payload["actor"] == "dashboard"
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_unknown_release_refusal_is_atomic_for_complete_dashboard_patch(client, bulk):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "atomic refusal", "assignee": "before"},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "blocked", "block_reason": "unknown"},
+    ).status_code == 200
+    with kbc.connect() as conn:
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone())
+
+    if bulk:
+        response = client.post(
+            "/api/plugins/kanban/tasks/bulk",
+            json={"ids": [task["id"]], "status": "ready", "assignee": "after", "priority": 99},
+        )
+        assert response.status_code == 200
+        assert response.json()["results"] == [
+            {"id": task["id"], "ok": False, "error": "transition to 'ready' refused"},
+        ]
+    else:
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task['id']}",
+            json={"status": "ready", "assignee": "after", "priority": 99},
+        )
+        assert response.status_code == 409
+
+    with kbc.connect() as conn:
+        after = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone())
+    assert after == before
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 
@@ -341,6 +395,14 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
+        assert child.status == "todo"
+        assert child.block_identity_state == "unknown"
+        assert kb.classify_block(
+            conn, child_id, kind="dependency", subject=parent_id, actor="dashboard-test",
+        )
+        kb.recompute_ready(conn)
+        child = kb.get_task(conn, child_id)
+        assert child is not None
         assert child.status == "review"
         review = kb.claim_review_task(conn, child_id)
         assert review is not None
@@ -399,6 +461,13 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
     with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         grandchild = kb.get_task(conn, grandchild_id)
+        assert child is not None and child.status == "todo"
+        assert child.block_identity_state == "unknown"
+        assert kb.classify_block(
+            conn, child_id, kind="dependency", subject=parent_id, actor="dashboard-test",
+        )
+        kb.recompute_ready(conn)
+        child = kb.get_task(conn, child_id)
         assert child is not None and child.status == "ready"
         assert grandchild is not None and grandchild.status == "todo"
 
@@ -565,7 +634,12 @@ def test_bulk_status_ready(client):
     for tid in (a["id"], b["id"], c2["id"]):
         client.patch(
             f"/api/plugins/kanban/tasks/{tid}",
-            json={"status": "blocked", "block_reason": "wait"},
+            json={
+                "status": "blocked",
+                "block_reason": "wait",
+                "block_kind": "transient",
+                "block_subject": "dashboard-wait",
+            },
         )
 
     response = client.post(
@@ -580,6 +654,52 @@ def test_bulk_status_ready(client):
     ready = next(col for col in board["columns"] if col["name"] == "ready")
     ids = {task["id"] for task in ready["tasks"]}
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
+
+
+def test_patch_classifies_unknown_block_before_explicit_release(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "classify me"}).json()["task"]
+    blocked = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "legacy client"},
+    )
+    assert blocked.status_code == 200
+
+    refused = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"}
+    )
+    assert refused.status_code == 409
+
+    classified = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"block_kind": "needs_input", "block_subject": "owner/decision"},
+    )
+    assert classified.status_code == 200, classified.text
+    current = classified.json()["task"]
+    assert current["status"] == "blocked"
+    assert current["block_identity_state"] == "known"
+
+    released = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"}
+    )
+    assert released.status_code == 200
+
+
+def test_patch_cannot_release_unknown_dependency_todo(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "unknown todo"}).json()["task"]
+    with kbc.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', block_kind='dependency', block_recurrences=1, "
+                "block_identity_state='unknown' WHERE id=?",
+                (task["id"],),
+            )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"}
+    )
+    assert response.status_code == 409
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, task["id"]).status == "todo"
 
 def test_bulk_review_assignment_preserves_implementer_provenance(client):
     tasks = [

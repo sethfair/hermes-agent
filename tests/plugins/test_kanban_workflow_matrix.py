@@ -55,7 +55,9 @@ def _task_in(client, src: str) -> str:
         elif src == "running":
             assert kb.claim_task(conn, tid) is not None
         elif src == "blocked":
-            assert kb.block_task(conn, tid, reason="x")
+            assert kb.block_task(
+                conn, tid, reason="x", kind="transient", subject="workflow-matrix"
+            )
         elif src == "scheduled":
             assert kb.schedule_task(conn, tid, reason="x")
         elif src == "review":

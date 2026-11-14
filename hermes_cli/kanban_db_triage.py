@@ -313,12 +313,23 @@ def _release_triage_task(
     try:
         with kb.write_txn(conn):
             existing = conn.execute(
-                "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+                "SELECT title, body, assignee, block_kind, block_recurrences, "
+                "block_identity, block_identity_state "
+                "FROM tasks WHERE id = ? AND status = 'triage'",
                 (task_id,),
             ).fetchone()
             if existing is None:
                 status = kb._task_status(conn, task_id)
                 return TriageReleaseReceipt(False, "not_in_triage", status)
+            from hermes_cli.kanban_db_block_identity import effective_identity
+
+            if effective_identity(existing).state == "unknown":
+                return TriageReleaseReceipt(
+                    False,
+                    "block_identity_unknown",
+                    "triage",
+                    guard_reason="manual block classification required",
+                )
 
             if guard is not None:
                 changes_before_guard = conn.total_changes
