@@ -2007,41 +2007,9 @@ def dispatch_once(
     reconcile_orphans: bool = True,
     monitor_context=None,
     _skip_reclaim: bool = False,
-    _contexts_prevalidated: bool = False,
 ) -> DispatchResult:
-    if isinstance(monitor_context, (tuple, list)):
-        from hermes_cli import kanban_ready_monitor as monitor
-        try:
-            from hermes_cli.config import load_config
-            loaded = load_config()
-            monitor_config = loaded.get("kanban", {}) if isinstance(loaded, dict) else None
-        except (OSError, TypeError, ValueError, KeyError):
-            monitor_config = None
-        contexts = tuple(monitor_context)
-        if monitor.has_protected_scope(conn) and (
-                monitor_config is None
-                or monitor.validate_runtime_contexts(conn, contexts, monitor_config)
-        ):
-            return DispatchResult(monitor_scope_refused=True)
-        merged = DispatchResult()
-        for index, context in enumerate(contexts):
-            part = dispatch_once(conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
-                                 max_spawn=max_spawn, max_in_progress=max_in_progress, failure_limit=failure_limit,
-                                 stale_timeout_seconds=stale_timeout_seconds, board=board,
-                                 default_assignee=default_assignee, max_in_progress_per_profile=max_in_progress_per_profile,
-                                 reconcile_orphans=reconcile_orphans, monitor_context=context,
-                                 _skip_reclaim=_skip_reclaim or index > 0,
-                                 _contexts_prevalidated=True)
-            for name in ("reclaimed", "promoted"):
-                setattr(merged, name, getattr(merged, name) + getattr(part, name))
-            for name in ("reconciled_orphans", "reaped_terminal_workers", "spawned", "skipped_unassigned",
-                         "auto_assigned_default", "skipped_nonspawnable", "skipped_per_profile_capped",
-                         "crashed", "auto_blocked", "timed_out", "stale", "respawn_guarded", "rate_limited",
-                         "monitor_decisions"):
-                getattr(merged, name).extend(getattr(part, name))
-            merged.monitor_scope_refused |= part.monitor_scope_refused
-            merged.monitor_attempt_id = part.monitor_attempt_id
-        return merged
+    contexts = (tuple(monitor_context) if isinstance(monitor_context, (tuple, list))
+                else (() if monitor_context is None else (monitor_context,)))
 
     def _locked_tick() -> DispatchResult:
         from hermes_cli import kanban_ready_monitor as monitor
@@ -2052,53 +2020,50 @@ def dispatch_once(
         # health: allow BLE001 -- unreadable config must refuse protected dispatch
         except Exception:
             monitor_config = None
-        if monitor.has_protected_scope(conn) and monitor_context is None:
-            result = DispatchResult(monitor_scope_refused=True)
+        protected = monitor.has_protected_scope(conn)
+        if protected and not contexts:
             conn.execute(
                 "INSERT INTO kanban_writer_faults(board_scope_id,profile,activation_epoch,diagnostic_code,created_at) "
                 "SELECT board_scope_id,profile,activation_epoch,'missing_writer_context',strftime('%s','now') "
                 "FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL AND state IN ('pending','active','faulted')"
             )
             conn.commit()
-            return result
-        if monitor.has_protected_scope(conn) and monitor_config is None:
             return DispatchResult(monitor_scope_refused=True)
-        if (monitor.has_protected_scope(conn) and not _contexts_prevalidated
-                and monitor.validate_runtime_contexts(conn, (monitor_context,), monitor_config)):
+        context_error = ("writer_scope_incomplete" if monitor_config is None else
+                         monitor.validate_runtime_contexts(conn, contexts, monitor_config))
+        if protected and context_error:
+            monitor.record_writer_faults(conn, context_error)
             return DispatchResult(monitor_scope_refused=True)
-        attempt_id = None
-        tick_context = monitor_context.for_tick() if monitor_context is not None else None
-        if tick_context is not None:
+        partitions = {}
+        for context in contexts:
+            tick_context = context.for_tick()
             monitor.publish_controller_observation(conn, controller=tick_context)
             attempt = monitor.begin_dispatch_attempt(
                 conn, controller=tick_context, surface="standalone", config=monitor_config,
             )
             if attempt is None:
+                if partitions:
+                    conn.executemany(
+                        "UPDATE kanban_dispatch_attempts SET state='aborted', diagnostic_code='writer_scope_incomplete' WHERE id=?",
+                        ((attempt_id,) for attempt_id, _ctx in partitions.values()),
+                    )
+                    conn.commit()
                 return DispatchResult(monitor_scope_refused=True)
-            attempt_id = attempt["id"]
+            partitions[tick_context.profile] = (attempt["id"], tick_context)
         result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-            monitor_attempt_id=attempt_id,
-            monitor_context=tick_context,
-            monitor_profile=tick_context.profile if tick_context is not None else None,
+            conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+            max_spawn=max_spawn, max_in_progress=max_in_progress, failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds, board=board,
+            default_assignee=default_assignee, max_in_progress_per_profile=max_in_progress_per_profile,
+            reconcile_orphans=reconcile_orphans, monitor_partitions=partitions,
             skip_reclaim=_skip_reclaim,
         )
-        if attempt_id is not None:
-            monitor.record_dispatch_tick(
-                conn, controller=tick_context, attempt_id=attempt_id,
-                decisions=result.monitor_decisions, config=monitor_config,
-            )
+        for profile, (attempt_id, tick_context) in partitions.items():
+            task_ids = {row["id"] for row in conn.execute("SELECT id FROM tasks WHERE assignee=?", (profile,))}
+            decisions: list[Mapping[str, Any]] = [
+                item for item in result.monitor_decisions if item["task_id"] in task_ids]
+            monitor.record_dispatch_tick(conn, controller=tick_context, attempt_id=attempt_id,
+                                         decisions=decisions, config=monitor_config)
             result.monitor_attempt_id = attempt_id
         return result
 
@@ -2110,6 +2075,7 @@ def dispatch_once(
         # and admission fence when the path cannot be resolved.
         from hermes_cli import kanban_ready_monitor as monitor
         if monitor.has_protected_scope(conn):
+            monitor.record_writer_faults(conn, "writer_scope_incomplete")
             result = DispatchResult(monitor_scope_refused=True)
         else:
             result = _dispatch_once_locked(
@@ -2331,6 +2297,20 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
+def _monitor_profiles(partitions: Optional[Mapping[str, Any]], profile: Optional[str]) -> set[str]:
+    return set(partitions or ()) or ({profile} if profile else set())
+
+
+def _ensure_partition_decisions(conn, result, reason: str, profiles: set[str]) -> None:
+    from hermes_cli import kanban_ready_monitor as monitor
+    for profile in profiles or {None}:
+        monitor.ensure_ready_decisions(conn, result, reason, profile=profile)
+
+
+def _monitor_partition(partitions, profile, attempt_id, context):
+    return (partitions or {}).get(profile) or (attempt_id, context)
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -2348,6 +2328,7 @@ def _dispatch_once_locked(
     monitor_attempt_id: Optional[str] = None,
     monitor_context=None,
     monitor_profile: Optional[str] = None,
+    monitor_partitions: Optional[dict[str, tuple[str, Any]]] = None,
     skip_reclaim: bool = False,
 ) -> DispatchResult:
     result = DispatchResult()
@@ -2365,18 +2346,19 @@ def _dispatch_once_locked(
     if not may_spawn:
         for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'"):
             monitor.reconcile_truthful_hold(conn, episode["task_id"])
-        monitor.ensure_ready_decisions(
+        _ensure_partition_decisions(
             conn, result, "memory_pressure" if result.memory_pressure else "board_cap",
-            profile=monitor_profile,
+            _monitor_profiles(monitor_partitions, monitor_profile),
         )
         return result
 
     ready_rows = _lane_rows(conn, "ready")
-    if monitor_profile is not None:
-        ready_rows = [row for row in ready_rows if row["assignee"] == monitor_profile]
+    allowed_profiles = _monitor_profiles(monitor_partitions, monitor_profile)
+    if allowed_profiles:
+        ready_rows = [row for row in ready_rows if row["assignee"] in allowed_profiles]
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
-    if monitor_profile is not None:
-        review_rows = [row for row in review_rows if row["assignee"] == monitor_profile]
+    if allowed_profiles:
+        review_rows = [row for row in review_rows if row["assignee"] in allowed_profiles]
     per_profile_cap = max_in_progress_per_profile if (
         # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
@@ -2403,7 +2385,6 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-        monitor_attempt_id=monitor_attempt_id, monitor_context=monitor_context,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2423,7 +2404,11 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+        attempt_id, context = _monitor_partition(
+            monitor_partitions, row_assignee, monitor_attempt_id, monitor_context)
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready",
+                               monitor_attempt_id=attempt_id, monitor_context=context,
+                               **lane_kwargs):
             spawned += 1
 
     for row in review_rows:
@@ -2432,11 +2417,18 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        attempt_id, context = _monitor_partition(
+            monitor_partitions, row["assignee"], monitor_attempt_id, monitor_context)
+        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review",
+                               monitor_attempt_id=attempt_id, monitor_context=context,
+                               **lane_kwargs):
             spawned += 1
     for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'"):
         monitor.reconcile_truthful_hold(conn, episode["task_id"])
-    monitor.ensure_ready_decisions(conn, result, "shared_budget_exhausted", profile=monitor_profile)
+    _ensure_partition_decisions(
+        conn, result, "shared_budget_exhausted",
+        _monitor_profiles(monitor_partitions, monitor_profile),
+    )
     return result
 
 

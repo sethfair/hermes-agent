@@ -92,3 +92,25 @@ Exact head verification:
 The broader aggregate was stopped after isolated workers stalled without assertion output; no
 passing result is claimed for that aggregate or the dashboard file. The exact count remains below
 the 2,400-line cap before publication.
+
+## Reviewed 2,800-line amendment correction
+
+Amended whole-plan SHA-256: `0896f6d38c7b67f8b564f73f07619de0c945793fbb858330aff08254a3fe7f2e`.
+The rejected exact head `cb968310e48cf92ce1253d45a908a8e352f5138a` preserved RED for the four
+remaining findings. The bounded correction keeps all protected partitions behind one dispatch
+lock, prevalidates them and opens their attempts before one shared reclaim/query/budget/claim
+cycle, separates resolver identity from running owner WIP, emits only owner ordinal 1 as due with
+contract-exact events, and enforces disabled-by-default canonical configuration and roster UUIDs.
+
+Final candidate verification before publication:
+
+- `python scripts/check` -> exit `0` (17 checks).
+- Eight focused monitor/dispatch/claim/lock/cap/promotion files -> exit `0` (`61 passed`).
+- Workflow/review/transfer/dashboard/config/CLI regression set -> exit `0` (`281 passed`, `4 skipped` Windows-only).
+- Gateway dispatch/reconcile set -> exit `0` (`11 passed`).
+- `git diff --check` -> exit `0`.
+- Total diff against reviewed base: `2,615` changed lines, below the amended hard ceiling of `2,800`.
+
+Activation remains OFF/pending/UNKNOWN. This correction performs no installation, restart,
+deployment, delivery, acknowledgement, alert, escalation, WIP display, Hermes Office change,
+credential change, or real-board mutation.

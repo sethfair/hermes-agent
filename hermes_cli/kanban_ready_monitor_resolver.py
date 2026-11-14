@@ -8,9 +8,14 @@ import sqlite3
 from typing import Any, Mapping
 
 
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
 def binding_digest(conn: sqlite3.Connection, binding: Mapping[str, Any] | None, *,
                    profile: str | None = None,
                    owner_profiles: tuple[str, ...] = ()) -> str | None:
+    """Digest routing identity only; mutable WIP must not rotate a resolver generation."""
     if not binding:
         return None
     refs = {
@@ -18,16 +23,21 @@ def binding_digest(conn: sqlite3.Connection, binding: Mapping[str, Any] | None, 
         "manager_ref": str(binding["manager_ref"]),
         "acknowledgement_authority_refs": tuple(map(str, binding["acknowledgement_authority_refs"])),
     }
-    profiles = tuple(sorted(set(owner_profiles or ((profile,) if profile else ()))))
-    wip = {}
-    if profiles:
+    return _digest(json.dumps(refs, sort_keys=True))
+
+
+def owner_wip_totals(conn: sqlite3.Connection, bindings: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate actual Ready/running cards by the owner bound to each assignee profile."""
+    owners: dict[str, set[str]] = {}
+    for profile, binding in bindings.items():
+        if binding.get("owner_ref"):
+            owners.setdefault(_digest(str(binding["owner_ref"])), set()).add(str(profile))
+    result = []
+    for owner, profiles in sorted(owners.items()):
         marks = ",".join("?" for _ in profiles)
-        rows = conn.execute(
-            f"SELECT assignee, status, COUNT(*) AS total FROM tasks "
-            f"WHERE assignee IN ({marks}) AND status IN ('running','ready') GROUP BY assignee,status",
-            profiles,
-        ).fetchall()
-        wip = {name: {"running": 0, "ready": 0} for name in profiles}
-        for row in rows:
-            wip[row["assignee"]][row["status"]] = row["total"]
-    return hashlib.sha256(json.dumps({"refs": refs, "owner_wip": wip}, sort_keys=True).encode()).hexdigest()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM tasks WHERE assignee IN ({marks}) AND status='running'",
+            tuple(sorted(profiles)),
+        ).fetchone()[0]
+        result.append({"owner": owner, "total": total})
+    return result

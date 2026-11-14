@@ -159,7 +159,7 @@ class _KanbanDispatcher:
         revision = info.commit or info.base_version
         profile = scope["profile"]
         try:
-            aged = monitor.parse_aged_ready_config(cfg.get("aged_ready") or {}) if isinstance(cfg, dict) else {}
+            aged = monitor.parse_aged_ready_config(cfg) if isinstance(cfg, dict) else {}
         except ValueError:
             return None
         aged_profiles = aged.get("dispatch_profiles", cfg.get("dispatch_profiles", ()))
