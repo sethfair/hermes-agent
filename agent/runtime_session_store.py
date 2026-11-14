@@ -228,7 +228,11 @@ class WorkerRPC:
                     link = self._connection()
                     link.send(request_id, message)
                 receive_cancel = None if self.cancel is not None and self.cancel.is_set() else self.cancel
-                response = link.receive(self.RECEIPT_ATTEMPT_TIMEOUT_S, cancel=receive_cancel)
+                if receive_cancel is None:
+                    # Preserve small reply-link test doubles that predate cancellable receive.
+                    response = link.receive(self.RECEIPT_ATTEMPT_TIMEOUT_S)
+                else:
+                    response = link.receive(self.RECEIPT_ATTEMPT_TIMEOUT_S, cancel=receive_cancel)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
