@@ -108,8 +108,9 @@ Final candidate verification before publication:
 - Eight focused monitor/dispatch/claim/lock/cap/promotion files -> exit `0` (`61 passed`).
 - Workflow/review/transfer/dashboard/config/CLI regression set -> exit `0` (`281 passed`, `4 skipped` Windows-only).
 - Gateway dispatch/reconcile set -> exit `0` (`11 passed`).
+- CI-discovered migration/boundary/docs-drift regressions -> exit `0` (`14 passed`).
 - `git diff --check` -> exit `0`.
-- Total diff against reviewed base: `2,615` changed lines, below the amended hard ceiling of `2,800`.
+- Total diff against reviewed base: `2,643` changed lines, below the amended hard ceiling of `2,800`.
 
 Activation remains OFF/pending/UNKNOWN. This correction performs no installation, restart,
 deployment, delivery, acknowledgement, alert, escalation, WIP display, Hermes Office change,
