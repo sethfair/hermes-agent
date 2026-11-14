@@ -301,17 +301,13 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     return _env_int("HERMES_KANBAN_CLAIM_TTL_SECONDS", DEFAULT_CLAIM_TTL_SECONDS, minimum=1)
 
 
-# ``detect_crashed_workers`` skips ``_pid_alive`` this long after start: the
-# fork -> /proc window can report a fresh worker dead.
+# Grace period for the fork -> /proc window.
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
-# Worker exit "provider rate-limited": released WITHOUT counting a failure (the
-# breaker must never trip on a throttle). 75 == BSD EX_TEMPFAIL.
+# Worker exit "provider rate-limited": released without counting a failure. 75 == BSD EX_TEMPFAIL.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
-# Worker exit "provider rejected the configuration": credential revoked (401/403), model gone
-# (404), TLS chain broken — a retry cannot fix it, so the dispatcher parks the card blocked on
-# the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
+# Worker exit "provider rejected configuration": retry cannot fix it; 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
 
@@ -326,13 +322,11 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
 
 
 # --- Paths ---
-
 DEFAULT_BOARD = "default"
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override", default=None,
 )
-# Machine flows that enumerate boards (gateway notifier / watcher / dispatcher
-# ticks) resolve board paths env-pin-first — see pin_first_board_resolution().
+# Machine board enumeration resolves paths env-pin-first; see pin_first_board_resolution().
 _PIN_FIRST_BOARD_RESOLUTION: ContextVar[bool] = ContextVar(
     "hermes_kanban_pin_first_board_resolution", default=False,
 )
@@ -369,8 +363,7 @@ def scoped_current_board(slug: str):
         _CURRENT_BOARD_OVERRIDE.reset(token)
 
 
-# Slug = directory name: strict enough to stop traversal / separators, loose
-# enough for kebab-case. Display names (spaces, emoji) live in board.json.
+# Slugs are directory names; display names live in board.json.
 _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 
 
@@ -2353,7 +2346,9 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
+    from hermes_cli.kanban_owner_recovery import (
+        is_host_side_loss, owner_attempt_note, owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error,
+    )
     for row in stale:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -2384,6 +2379,7 @@ def release_stale_claims(
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            host_loss = is_host_side_loss(owner_attempt_note(conn, row["id"]))
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2407,6 +2403,7 @@ def release_stale_claims(
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
+                    **({"infrastructure": True} if host_loss else {}),
                 },
             )
             reclaimed += 1
@@ -2418,6 +2415,7 @@ def release_stale_claims(
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            infrastructure=host_loss,
         )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
@@ -2435,7 +2433,9 @@ def _record_reclaim(
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
     (payload merged with the termination report). Caller holds the txn."""
     run_id = _end_run(
-        conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
+        conn, task_id, outcome="reclaimed", status="reclaimed", error=error,
+        # ``infrastructure`` rides in the run metadata so ``check_respawn_guard`` can space the retry.
+        metadata={**termination, **({"infrastructure": True} if payload.get("infrastructure") else {})},
     )
     payload.update(termination)
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
