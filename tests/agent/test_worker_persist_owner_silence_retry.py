@@ -362,4 +362,3 @@ def test_worker_cancel_wiring_shares_controls_event(tmp_path):
     assert store.cancel is controls_stopped
     assert rpc.cancel is controls_stopped
     store.close()
-
