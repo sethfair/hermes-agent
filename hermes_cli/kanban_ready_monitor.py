@@ -39,6 +39,9 @@ class MonitorWriterContext:
     protocol_version: int = PROTOCOL_VERSION
     compatibility_identity: str = COMPATIBILITY_IDENTITY
     tick_id: str = ""
+    dispatch_profiles: tuple[str, ...] = ()
+    min_age_seconds: int = 1800
+    min_eligible_misses: int = 3
 
     def for_tick(self) -> MonitorWriterContext:
         return dataclasses.replace(self, tick_id=str(uuid.uuid4()))
@@ -84,8 +87,10 @@ def _payload(value: Any) -> Mapping[str, Any] | None:
 
 
 def _absent_or_ready(value: Any) -> bool:
+    if value is None:
+        return True
     data = _payload(value)
-    return data is None or data.get("status") == "ready"
+    return bool(data and data.get("status") == "ready")
 
 
 def _retry_ready(value: Any) -> bool:
@@ -148,8 +153,12 @@ def ready_generation(conn: sqlite3.Connection, task_id: str) -> tuple[int, int] 
         (task_id,),
     )
     for row in rows:
-        if row["kind"] in READY_ENTRY_CLASSIFIERS and classify_ready_state(row["kind"], row["payload"], task["status"]):
-            return int(row["id"]), int(row["created_at"])
+        # A recognized Ready-entry event is authoritative.  If its payload is
+        # malformed, an older valid event cannot resurrect the card's age.
+        if row["kind"] in READY_ENTRY_CLASSIFIERS:
+            if classify_ready_state(row["kind"], row["payload"], task["status"]):
+                return int(row["id"]), int(row["created_at"])
+            return None
     return None
 
 
@@ -186,7 +195,13 @@ CREATE TABLE IF NOT EXISTS kanban_writer_faults (
 CREATE TABLE IF NOT EXISTS kanban_controller_observations (
  board_scope_id TEXT NOT NULL, profile TEXT NOT NULL, writer_ref_digest TEXT NOT NULL,
  controller_generation TEXT NOT NULL, activation_epoch TEXT, last_seen_at INTEGER NOT NULL,
- state TEXT NOT NULL, diagnostic_code TEXT, PRIMARY KEY(board_scope_id, writer_ref_digest, controller_generation, profile));
+ state TEXT NOT NULL, diagnostic_code TEXT,
+ profile_scope_digest TEXT, monitor_protocol_version INTEGER, compatibility_identity TEXT,
+ installed_revision TEXT, roster_generation TEXT, roster_digest TEXT,
+ dispatch_profiles_fingerprint TEXT, board_running INTEGER, board_cap INTEGER,
+ host_running INTEGER, host_cap INTEGER, profile_running INTEGER, profile_cap INTEGER,
+ ready_count INTEGER, eligible_ready_count INTEGER, suppressed_ready_count INTEGER,
+ PRIMARY KEY(board_scope_id, writer_ref_digest, controller_generation, profile));
 CREATE TABLE IF NOT EXISTS kanban_ready_state (
  task_id TEXT PRIMARY KEY, ready_generation INTEGER, ready_since INTEGER,
  run_generation INTEGER NOT NULL DEFAULT 0, first_observed_at INTEGER NOT NULL,
@@ -236,12 +251,22 @@ BEGIN
                      AND a.attempt_id IN (SELECT id FROM kanban_dispatch_attempts WHERE state = 'open'));
  SELECT RAISE(IGNORE)
  WHERE NOT EXISTS (SELECT 1 FROM kanban_claim_admissions a
+                   JOIN kanban_dispatch_attempts d ON d.id = a.attempt_id
+                   JOIN kanban_monitor_scope_activation s
+                     ON s.board_scope_id = a.board_scope_id AND s.profile = a.profile
+                    AND s.activation_epoch = a.activation_epoch AND s.disabled_at IS NULL
                    WHERE a.token = NEW.dispatch_admission_id AND a.state = 'armed'
-                     AND a.task_id = OLD.id AND a.profile = OLD.assignee
-                     AND a.activation_epoch = (SELECT activation_epoch FROM kanban_monitor_scope_activation
-                                               WHERE profile=OLD.assignee AND disabled_at IS NULL
-                                               ORDER BY id DESC LIMIT 1)
-                     AND a.attempt_id IN (SELECT id FROM kanban_dispatch_attempts WHERE state = 'open'));
+                     AND d.state = 'open' AND a.task_id = OLD.id AND a.profile = OLD.assignee
+                     AND d.board_scope_id = a.board_scope_id AND d.profile = a.profile
+                     AND d.activation_epoch = a.activation_epoch
+                     AND d.writer_ref_digest = a.writer_ref_digest
+                     AND d.controller_generation = a.controller_generation
+                     AND a.ready_generation = COALESCE((SELECT MAX(id) FROM task_events
+                         WHERE task_id=OLD.id AND kind IN ('created','promoted','promoted_manual',
+                         'unblocked','changes_requested','review_reopened','status','reclaimed',
+                         'timed_out','stale','protocol_violation','rate_limited','crashed',
+                         'spawn_failed','reconciled','imported')), 0)
+                     AND a.run_generation = COALESCE((SELECT MAX(id) FROM task_runs WHERE task_id=OLD.id), 0));
  UPDATE kanban_claim_admissions SET state='consumed', consumed_at=strftime('%s','now')
  WHERE token = NEW.dispatch_admission_id AND state='armed';
 END;
@@ -249,10 +274,23 @@ END;
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TRIGGER IF EXISTS kanban_ready_claim_admission")
     conn.executescript(MONITOR_SCHEMA_SQL)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_ready_episodes)")}
     if "authority_set_digest" not in columns:
         conn.execute("ALTER TABLE kanban_ready_episodes ADD COLUMN authority_set_digest TEXT")
+    observation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_controller_observations)")}
+    for name, definition in {
+        "profile_scope_digest": "TEXT", "monitor_protocol_version": "INTEGER",
+        "compatibility_identity": "TEXT", "installed_revision": "TEXT",
+        "roster_generation": "TEXT", "roster_digest": "TEXT",
+        "dispatch_profiles_fingerprint": "TEXT", "board_running": "INTEGER",
+        "board_cap": "INTEGER", "host_running": "INTEGER", "host_cap": "INTEGER",
+        "profile_running": "INTEGER", "profile_cap": "INTEGER", "ready_count": "INTEGER",
+        "eligible_ready_count": "INTEGER", "suppressed_ready_count": "INTEGER",
+    }.items():
+        if name not in observation_columns:
+            conn.execute(f"ALTER TABLE kanban_controller_observations ADD COLUMN {name} {definition}")
     row = conn.execute("SELECT board_scope_id FROM kanban_board_identity WHERE singleton=1").fetchone()
     if row is None:
         conn.execute(
@@ -263,10 +301,116 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _scope(conn: sqlite3.Connection, profile: str) -> sqlite3.Row | None:
-    return conn.execute(
+    rows = conn.execute(
         "SELECT * FROM kanban_monitor_scope_activation WHERE profile=? AND disabled_at IS NULL "
-        "ORDER BY id DESC LIMIT 1", (profile,)
-    ).fetchone()
+        "ORDER BY id", (profile,)
+    ).fetchall()
+    return rows[0] if len(rows) == 1 else None
+
+
+def _uuid(value: Any) -> bool:
+    try:
+        uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
+def _profiles(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    return tuple(sorted({str(item).strip() for item in value if str(item).strip()}))
+
+
+def parse_expected_writer_scopes(value: Any) -> dict[str, dict[str, Any]]:
+    """Parse and canonicalize the deployment-owned writer roster."""
+    if not isinstance(value, Mapping):
+        raise ValueError("expected_writer_scopes must be a mapping")
+    parsed: dict[str, dict[str, Any]] = {}
+    for board_id, raw in value.items():
+        if not _uuid(board_id) or not isinstance(raw, Mapping) or not _uuid(raw.get("roster_generation")):
+            raise ValueError("invalid writer scope")
+        members = raw.get("members")
+        if not isinstance(members, list) or not members:
+            raise ValueError("writer scope requires members")
+        refs: set[str] = set()
+        profiles: set[str] = set()
+        canonical = []
+        for member in members:
+            if not isinstance(member, Mapping) or not _uuid(member.get("writer_ref")):
+                raise ValueError("invalid writer member")
+            member_profiles = _profiles(member.get("profiles"))
+            if not member_profiles or member["writer_ref"] in refs or profiles.intersection(member_profiles):
+                raise ValueError("duplicate or overlapping writer member")
+            try:
+                protocol = int(member.get("protocol_version"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid writer protocol") from exc
+            compatible = member.get("compatible_revisions")
+            if protocol != PROTOCOL_VERSION or not isinstance(compatible, list) or not compatible:
+                raise ValueError("invalid writer compatibility")
+            refs.add(str(member["writer_ref"])); profiles.update(member_profiles)
+            canonical.append({"writer_ref": str(member["writer_ref"]), "profiles": member_profiles,
+                              "protocol_version": protocol, "compatible_revisions": tuple(sorted(map(str, compatible)))})
+        parsed[str(board_id)] = {"roster_generation": str(raw["roster_generation"]),
+                                 "roster_digest": raw.get("roster_digest"),
+                                 "members": tuple(sorted(canonical, key=lambda item: item["writer_ref"]))}
+    return parsed
+
+
+def validate_writer_context(conn: sqlite3.Connection, controller: MonitorWriterContext,
+                            config: Mapping[str, Any] | None = None) -> str | None:
+    """Validate a writer against the configured roster and one exact scope."""
+    scope = conn.execute(
+        "SELECT * FROM kanban_monitor_scope_activation WHERE board_scope_id=? AND profile=? "
+        "AND disabled_at IS NULL", (controller.board_scope_id, controller.profile),
+    ).fetchall()
+    if len(scope) != 1:
+        return "writer_scope_incomplete"
+    scope = scope[0]
+    cfg = dict(config or {})
+    aged = cfg.get("aged_ready", cfg)
+    try:
+        expected = parse_expected_writer_scopes(aged.get("expected_writer_scopes", {})) if isinstance(aged, Mapping) else {}
+    except ValueError:
+        return "writer_scope_incomplete"
+    board = expected.get(controller.board_scope_id)
+    members = board.get("members", []) if isinstance(board, Mapping) else []
+    configured_id = aged.get("controller_id") if isinstance(aged, Mapping) else None
+    declared_profiles = _profiles(cfg.get("dispatch_profiles", aged.get("dispatch_profiles", ()))) if isinstance(aged, Mapping) else ()
+    if not _uuid(configured_id) or controller.writer_ref != str(configured_id):
+        return "incompatible_writer_context"
+    matches = []
+    for member in members if isinstance(members, (list, tuple)) else ():
+        if not isinstance(member, Mapping):
+            continue
+        if member.get("writer_ref") == controller.writer_ref and _profiles(member.get("profiles")) == declared_profiles:
+            matches.append(member)
+    if len(matches) != 1:
+        return "writer_scope_incomplete"
+    member = matches[0]
+    if declared_profiles != (controller.profile,) and controller.profile not in declared_profiles:
+        return "incompatible_writer_context"
+    try:
+        member_protocol = int(member.get("protocol_version", -1))
+    except (TypeError, ValueError):
+        return "incompatible_writer_context"
+    compatible = member.get("compatible_revisions", ())
+    if not isinstance(compatible, (list, tuple, set)):
+        return "incompatible_writer_context"
+    if (scope["activation_epoch"] != controller.activation_epoch or
+            scope["roster_generation"] != controller.roster_generation or
+            scope["roster_digest"] != controller.roster_digest or
+            scope["board_scope_id"] != controller.board_scope_id or
+            (isinstance(board, Mapping) and board.get("roster_generation") not in (None, controller.roster_generation)) or
+            (isinstance(board, Mapping) and board.get("roster_digest") not in (None, controller.roster_digest)) or
+            member_protocol != controller.protocol_version or
+            controller.compatibility_identity not in compatible or
+            controller.compatibility_identity != COMPATIBILITY_IDENTITY or
+            not controller.installed_revision or
+            controller.profile not in _profiles(member.get("profiles"))):
+        return "incompatible_writer_context"
+    return None
 
 
 def activate_scope(conn: sqlite3.Connection, *, profile: str, state: str = "pending",
@@ -298,20 +442,23 @@ def _digest(value: str) -> str:
 
 
 def begin_dispatch_attempt(conn: sqlite3.Connection, *, controller: MonitorWriterContext,
-                           surface: str, now: int | None = None) -> dict[str, Any] | None:
+                           surface: str, now: int | None = None,
+                           config: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
     ensure_schema(conn)
     now = int(time.time()) if now is None else int(now)
     scope = _scope(conn, controller.profile)
     if not scope or scope["board_scope_id"] != controller.board_scope_id:
         return None
-    if (scope["activation_epoch"] != controller.activation_epoch or
+    context_error = (validate_writer_context(conn, controller, config)
+                     if config is not None else None)
+    if (context_error or scope["activation_epoch"] != controller.activation_epoch or
             scope["roster_generation"] != controller.roster_generation or
             scope["roster_digest"] != controller.roster_digest or
             scope["protocol_version"] != controller.protocol_version or
             scope["compatibility_identity"] != controller.compatibility_identity or
             not controller.installed_revision):
         conn.execute("INSERT INTO kanban_writer_faults(board_scope_id,profile,activation_epoch,diagnostic_code,created_at) VALUES(?,?,?,?,?)",
-                     (scope["board_scope_id"], controller.profile, scope["activation_epoch"], "incompatible_writer_context", now))
+                     (scope["board_scope_id"], controller.profile, scope["activation_epoch"], context_error or "incompatible_writer_context", now))
         return None
     attempt_id = str(uuid.uuid4())
     conn.execute("INSERT INTO kanban_dispatch_attempts(id,board_scope_id,profile,activation_epoch,writer_ref_digest,controller_generation,tick_id,surface,protocol_version,compatibility_identity,installed_revision,roster_generation,roster_digest,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -330,11 +477,19 @@ def publish_controller_observation(conn: sqlite3.Connection, *, controller: Moni
     now = int(time.time()) if now is None else int(now)
     conn.execute(
         "INSERT INTO kanban_controller_observations "
-        "(board_scope_id,profile,writer_ref_digest,controller_generation,activation_epoch,last_seen_at,state,diagnostic_code) "
-        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(board_scope_id,writer_ref_digest,controller_generation,profile) DO UPDATE SET "
-        "activation_epoch=excluded.activation_epoch,last_seen_at=excluded.last_seen_at,state=excluded.state,diagnostic_code=excluded.diagnostic_code",
+        "(board_scope_id,profile,writer_ref_digest,controller_generation,activation_epoch,last_seen_at,state,diagnostic_code,"
+        "profile_scope_digest,monitor_protocol_version,compatibility_identity,installed_revision,roster_generation,roster_digest,dispatch_profiles_fingerprint) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(board_scope_id,writer_ref_digest,controller_generation,profile) DO UPDATE SET "
+        "activation_epoch=excluded.activation_epoch,last_seen_at=excluded.last_seen_at,state=excluded.state,diagnostic_code=excluded.diagnostic_code,"
+        "profile_scope_digest=excluded.profile_scope_digest,monitor_protocol_version=excluded.monitor_protocol_version,"
+        "compatibility_identity=excluded.compatibility_identity,installed_revision=excluded.installed_revision,"
+        "roster_generation=excluded.roster_generation,roster_digest=excluded.roster_digest,"
+        "dispatch_profiles_fingerprint=excluded.dispatch_profiles_fingerprint",
         (controller.board_scope_id, controller.profile, _digest(controller.writer_ref), controller.controller_generation,
-         controller.activation_epoch, now, state, diagnostic_code),
+         controller.activation_epoch, now, state, diagnostic_code,
+         _digest(controller.profile), controller.protocol_version, controller.compatibility_identity,
+         controller.installed_revision, controller.roster_generation, controller.roster_digest,
+         _digest(",".join(controller.dispatch_profiles or (controller.profile,)))),
     )
 
 
@@ -350,21 +505,87 @@ def arm_claim_admission(conn: sqlite3.Connection, *, attempt_id: str, task_id: s
     return token
 
 
+def validate_claim_admission(conn: sqlite3.Connection, token: str, task_id: str,
+                             profile: str, ready_gen: int, run_gen: int) -> bool:
+    row = conn.execute(
+        "SELECT a.*, d.state AS d_state, d.board_scope_id AS d_board, d.profile AS d_profile, "
+        "d.activation_epoch AS d_epoch, d.writer_ref_digest AS d_writer, "
+        "d.controller_generation AS d_controller, d.tick_id AS d_tick "
+        "FROM kanban_claim_admissions a JOIN kanban_dispatch_attempts d ON d.id=a.attempt_id "
+        "WHERE a.token=? AND a.state='armed' AND a.task_id=? AND a.profile=? "
+        "AND a.ready_generation=? AND a.run_generation=?", (token, task_id, profile, ready_gen, run_gen),
+    ).fetchone()
+    if not row or row["d_state"] != "open":
+        return False
+    current = ready_generation(conn, task_id)
+    return bool(current and current[0] == ready_gen and row["d_board"] == row["board_scope_id"]
+                and row["d_profile"] == profile and row["d_epoch"] == row["activation_epoch"]
+                and row["d_writer"] == row["writer_ref_digest"]
+                and row["d_controller"] == row["controller_generation"]
+                and row["d_tick"] == conn.execute(
+                    "SELECT tick_id FROM kanban_dispatch_attempts WHERE id=?", (row["attempt_id"],)
+                ).fetchone()[0])
+
+
 def has_protected_scope(conn: sqlite3.Connection) -> bool:
     ensure_schema(conn)
     return conn.execute(
         "SELECT 1 FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
-        "AND state IN ('pending','active','faulted') LIMIT 1"
+        "AND state IN ('pending','active','faulted')"
     ).fetchone() is not None
 
 
+def ensure_ready_decisions(conn: sqlite3.Connection, result: Any, reason: str) -> None:
+    seen = {entry["task_id"] for entry in result.monitor_decisions}
+    for row in conn.execute("SELECT id, assignee FROM tasks WHERE status='ready' AND claim_lock IS NULL"):
+        if row["id"] not in seen:
+            result.monitor_decisions.append({"task_id": row["id"], "decision": "unassigned" if not row["assignee"] else reason})
+
+
+def runtime_context(conn: sqlite3.Connection, writer_ref: str, controller_generation: str) -> MonitorWriterContext | None:
+    scopes = conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL AND state IN ('pending','active','faulted') ORDER BY id").fetchall()
+    if len(scopes) != 1:
+        return None
+    scope = scopes[0]
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config().get("kanban", {})
+    except (OSError, TypeError, ValueError, KeyError):
+        cfg = {}
+    aged = cfg.get("aged_ready") or {}
+    from hermes_cli.version_info import get_version_info
+    info = get_version_info()
+    return MonitorWriterContext(
+        board_scope_id=scope["board_scope_id"], profile=scope["profile"],
+        writer_ref=aged.get("controller_id") or writer_ref, controller_generation=controller_generation,
+        activation_epoch=scope["activation_epoch"], roster_generation=scope["roster_generation"],
+        roster_digest=scope["roster_digest"], installed_revision=info.commit or info.base_version,
+        dispatch_profiles=(scope["profile"],), min_age_seconds=int(aged.get("min_age_seconds", 1800)),
+        min_eligible_misses=int(aged.get("min_eligible_misses", 3)),
+    )
+
+
 def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterContext,
-                         attempt_id: str, decisions: list[Mapping[str, Any]], now: int | None = None) -> bool:
+                         attempt_id: str, decisions: list[Mapping[str, Any]], now: int | None = None,
+                         config: Mapping[str, Any] | None = None) -> bool:
     """Persist a tick exactly once; replayed task decisions do not increment."""
     ensure_schema(conn)
     now = int(time.time()) if now is None else int(now)
+    conn.execute("BEGIN IMMEDIATE")
     attempt = conn.execute("SELECT * FROM kanban_dispatch_attempts WHERE id=?", (attempt_id,)).fetchone()
     if not attempt or attempt["state"] != "open":
+        conn.rollback()
+        return False
+    if any((attempt[key] != value) for key, value in {
+        "board_scope_id": controller.board_scope_id,
+        "profile": controller.profile,
+        "activation_epoch": controller.activation_epoch,
+        "writer_ref_digest": _digest(controller.writer_ref),
+        "controller_generation": controller.controller_generation,
+        "roster_generation": controller.roster_generation,
+        "roster_digest": controller.roster_digest,
+    }.items()):
+        conn.rollback()
         return False
     scope = _scope(conn, controller.profile)
     projection_allowed = bool(scope and scope["state"] == "active" and
@@ -384,14 +605,26 @@ def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterC
             (controller.activation_epoch, _digest(controller.writer_ref), controller.controller_generation,
              attempt["tick_id"], task_id, now),
         )
-        observe_ready(conn, task_id, now=now, decision=(str(decision.get("decision", "unknown"))
-                      if projection_allowed else "unknown"),
-                      guard_reason=decision.get("guard_reason"), profile=controller.profile,
-                      controller_ref_digest=_digest(controller.writer_ref),
-                      controller_generation=controller.controller_generation,
-                      activation_epoch=controller.activation_epoch, tick_id=attempt["tick_id"],
-                      min_age_seconds=int(decision.get("min_age_seconds", 1800)),
-                      min_eligible_misses=int(decision.get("min_eligible_misses", 3)))
+        try:
+            observed = observe_ready(conn, task_id, now=now, decision=(str(decision.get("decision", "unknown"))
+                          if projection_allowed else "unknown"),
+                          guard_reason=decision.get("guard_reason"), profile=controller.profile,
+                          controller_ref_digest=_digest(controller.writer_ref),
+                          controller_generation=controller.controller_generation,
+                          activation_epoch=controller.activation_epoch, tick_id=attempt["tick_id"],
+                          min_age_seconds=controller.min_age_seconds,
+                          min_eligible_misses=controller.min_eligible_misses, commit=False)
+            if observed.get("episode_id") and config:
+                aged = config.get("aged_ready", config)
+                bindings = aged.get("resolver_bindings", {}).get(controller.profile, {}) if isinstance(aged, Mapping) else {}
+                project_escalation_intents(
+                    conn, observed["episode_id"], bindings=bindings,
+                    owner_retry_seconds=tuple(aged.get("owner_retry_seconds", (300, 900, 3600))),
+                    manager_retry_seconds=tuple(aged.get("manager_retry_seconds", (900, 3600))), now=now,
+                )
+        except Exception:
+            conn.rollback()
+            raise
     conn.execute("UPDATE kanban_dispatch_attempts SET state='complete', completed_at=?, decision_count=? WHERE id=?",
                  (now, len(decisions), attempt_id))
     conn.commit()
@@ -403,7 +636,8 @@ def observe_ready(conn: sqlite3.Connection, task_id: str, *, now: int | None = N
                   guard_evidence: Mapping[str, Any] | None = None, profile: str | None = None,
                   controller_ref_digest: str | None = None, controller_generation: str | None = None,
                   activation_epoch: str = "disabled", tick_id: str | None = None,
-                  min_age_seconds: int = 1800, min_eligible_misses: int = 3) -> dict[str, Any]:
+                  min_age_seconds: int = 1800, min_eligible_misses: int = 3,
+                  commit: bool = True) -> dict[str, Any]:
     """Reconcile one observation. Disabled/default callers only observe UNKNOWN."""
     ensure_schema(conn)
     now = int(time.time()) if now is None else int(now)
@@ -431,7 +665,8 @@ def observe_ready(conn: sqlite3.Connection, task_id: str, *, now: int | None = N
     age = max(0, now - ready_since)
     if activation_epoch != "disabled" and age >= min_age_seconds and count >= min_eligible_misses:
         episode = _open_episode(conn, task_id, gen, now, count, profile, controller_ref_digest, controller_generation, guard_reason, fingerprint)
-    conn.commit()
+    if commit:
+        conn.commit()
     return {"task_id": task_id, "ready_generation": gen, "ready_since": ready_since,
             "age_seconds": age, "eligible_miss_count": count, "episode_id": episode,
             "decision": decision, "guard_reason": guard_reason, "guard_fingerprint": fingerprint}
@@ -446,6 +681,11 @@ def _open_episode(conn: sqlite3.Connection, task_id: str, generation: int, now: 
         return row["id"]
     episode_id = "ep_" + secrets.token_hex(12)
     conn.execute("INSERT INTO kanban_ready_episodes (id,task_id,ready_generation,profile,controller_ref_digest,controller_generation,first_observed_at,last_observed_at,opened_at,eligible_miss_count,guard_reason,guard_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (episode_id,task_id,generation,profile,controller_ref_digest,controller_generation,now,now,now,count,reason,fingerprint))
+    conn.execute(
+        "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+        (task_id, "aged_ready_opened", json.dumps({"episode_id": episode_id,
+         "ready_generation": generation, "eligible_miss_count": count}), now),
+    )
     conn.execute("UPDATE kanban_ready_state SET episode_id=? WHERE task_id=?", (episode_id, task_id))
     return episode_id
 
@@ -549,7 +789,48 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
             "intents": [dict(row) for row in rows]}
 
 
-def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None, stale_after_seconds: int = 180) -> dict[str, Any]:
+def _projection_proven(conn: sqlite3.Connection, scope: sqlite3.Row, *, now: int,
+                       stale_after_seconds: int, config: Mapping[str, Any] | None) -> bool:
+    if not config or scope["state"] != "active" or scope["legacy_exclusion_proof_state"] != "proven":
+        return False
+    aged = config.get("aged_ready", config)
+    expected = aged.get("expected_writer_scopes", {}) if isinstance(aged, Mapping) else {}
+    board = expected.get(scope["board_scope_id"]) if isinstance(expected, Mapping) else None
+    members = board.get("members", []) if isinstance(board, Mapping) else []
+    expected_refs = {m.get("writer_ref") for m in members if isinstance(m, Mapping)}
+    expected_digests = {_digest(str(ref)) for ref in expected_refs}
+    if not expected_refs or any(not _uuid(ref) for ref in expected_refs):
+        return False
+    observations = conn.execute(
+        "SELECT * FROM kanban_controller_observations WHERE board_scope_id=? AND profile=?",
+        (scope["board_scope_id"], scope["profile"]),
+    ).fetchall()
+    fresh = [row for row in observations if now - int(row["last_seen_at"]) <= stale_after_seconds]
+    if {row["writer_ref_digest"] for row in fresh} != expected_digests:
+        return False
+    if any(row["state"] != "fresh" or row["activation_epoch"] != scope["activation_epoch"]
+           or row["roster_generation"] != scope["roster_generation"]
+           or row["roster_digest"] != scope["roster_digest"]
+           or row["monitor_protocol_version"] != scope["protocol_version"]
+           or row["compatibility_identity"] != scope["compatibility_identity"]
+           or not row["installed_revision"] for row in fresh):
+        return False
+    attempts = conn.execute(
+        "SELECT writer_ref_digest, controller_generation, state FROM kanban_dispatch_attempts "
+        "WHERE board_scope_id=? AND profile=? AND activation_epoch=?",
+        (scope["board_scope_id"], scope["profile"], scope["activation_epoch"]),
+    ).fetchall()
+    if any(row["state"] in ("open", "aborted") for row in attempts):
+        return False
+    fresh_pairs = {(row["writer_ref_digest"], row["controller_generation"]) for row in fresh}
+    admitted = {(row["writer_ref_digest"], row["controller_generation"])
+                for row in attempts if row["state"] == "complete"}
+    return fresh_pairs <= admitted and {writer for writer, _generation in fresh_pairs} == expected_digests
+
+
+def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
+                          stale_after_seconds: int = 180,
+                          config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     ensure_schema(conn)
     now = int(time.time()) if now is None else int(now)
     cards = []
@@ -574,7 +855,9 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None, s
         ).fetchall()
         fresh = [row for row in observations if now - int(row["last_seen_at"]) <= stale_after_seconds]
         states = {row["state"] for row in fresh}
-        if scope["state"] != "active" or scope["legacy_exclusion_proof_state"] != "proven":
+        proven = _projection_proven(conn, scope, now=now,
+                                    stale_after_seconds=stale_after_seconds, config=config)
+        if not proven:
             state = "UNKNOWN"
         elif len({row["controller_generation"] for row in fresh}) > 1:
             state = "CONFLICT"
@@ -582,8 +865,10 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None, s
             state = "STALE"
         else:
             state = "FRESH"
-        running = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' AND assignee=?", (scope["profile"],)).fetchone()[0]
-        ready = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='ready' AND assignee=?", (scope["profile"],)).fetchone()[0]
+        running = (conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' AND assignee=?", (scope["profile"],)).fetchone()[0]
+                   if proven else None)
+        ready = (conn.execute("SELECT COUNT(*) FROM tasks WHERE status='ready' AND assignee=?", (scope["profile"],)).fetchone()[0]
+                 if proven else None)
         profiles.append({"profile": scope["profile"], "running_wip": running, "ready_count": ready,
                          "controller_digests": sorted({row["writer_ref_digest"] for row in fresh}), "state": state})
     activation = "OFF" if not scopes else ("UNKNOWN" if any(p["state"] != "FRESH" for p in profiles) else "FRESH")

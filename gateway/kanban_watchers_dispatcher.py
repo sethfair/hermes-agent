@@ -139,21 +139,36 @@ class _KanbanDispatcher:
     def _monitor_context(self, conn: sqlite3.Connection):
         """Build one process-generation context from the opened board scope."""
         from hermes_cli import kanban_ready_monitor as monitor
-        scope = conn.execute(
+        scopes = conn.execute(
             "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
-            "AND state IN ('pending','active','faulted') ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+            "AND state IN ('pending','active','faulted') ORDER BY id"
+        ).fetchall()
+        if len(scopes) > 1:
+            return None
+        scope = scopes[0] if scopes else None
         if scope is None:
             return None
         from hermes_cli.version_info import get_version_info
         info = get_version_info()
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config().get("kanban", {})
+            configured_id = ((cfg.get("aged_ready") or {}).get("controller_id") or "").strip()
+        # health: allow BLE001 -- config load is a long-lived dispatcher boundary
+        except Exception:
+            cfg = {}
+            configured_id = ""
         revision = info.commit or info.base_version
         profile = scope["profile"]
+        aged = (cfg.get("aged_ready") or {}) if isinstance(cfg, dict) else {}
         return monitor.MonitorWriterContext(
-            board_scope_id=scope["board_scope_id"], profile=profile, writer_ref=self.writer_ref,
+            board_scope_id=scope["board_scope_id"], profile=profile,
+            writer_ref=configured_id or self.writer_ref,
             controller_generation=self.controller_generation, activation_epoch=scope["activation_epoch"],
             roster_generation=scope["roster_generation"], roster_digest=scope["roster_digest"],
-            installed_revision=revision,
+            installed_revision=revision, dispatch_profiles=(profile,),
+            min_age_seconds=int(aged.get("min_age_seconds", 1800)),
+            min_eligible_misses=int(aged.get("min_eligible_misses", 3)),
         )
 
     def _board_slugs(self) -> list:

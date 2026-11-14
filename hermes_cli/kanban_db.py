@@ -2106,13 +2106,22 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     ).fetchall()
     return [(row["id"], row["status"]) for row in rows]
 
-
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, admission_id: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    if admission_id is not None and source_status == "ready":
+        from hermes_cli import kanban_ready_monitor as monitor
+        task = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()
+        previous_run = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        generation = monitor.ready_generation(conn, task_id)
+        if not task or not generation or not monitor.validate_claim_admission(
+                conn, admission_id, task_id, task["assignee"] or "", generation[0], int(previous_run)):
+            return None
     cur = conn.execute(
         f"""
         UPDATE tasks

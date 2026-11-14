@@ -1,6 +1,7 @@
 """Behavioral contracts for aged-Ready monitoring."""
 
 import sqlite3
+import uuid
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -75,6 +76,10 @@ def test_matching_admission_is_single_use_and_replay_is_refused():
         "INSERT INTO tasks(id,title,status,created_at,assignee) VALUES(?,?,?,?,?)",
         (task_id, "Ready", "ready", 100, "p1"),
     )
+    conn.execute(
+        "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+        (task_id, "created", '{"status":"ready"}', 100),
+    )
     scope = monitor.activate_scope(conn, profile="p1", state="active", legacy_exclusion_proof_state="proven", roster_generation="r1", roster_digest="rd")
     ctx = monitor.MonitorWriterContext(
         board_scope_id=scope["board_scope_id"], profile="p1", writer_ref="w1",
@@ -83,7 +88,7 @@ def test_matching_admission_is_single_use_and_replay_is_refused():
     )
     attempt = monitor.begin_dispatch_attempt(conn, controller=ctx, surface="standalone", now=150)
     token = monitor.arm_claim_admission(
-        conn, attempt_id=attempt["id"], task_id=task_id, ready_generation=0, run_generation=0,
+        conn, attempt_id=attempt["id"], task_id=task_id, ready_generation=1, run_generation=0,
     )
     conn.commit()
     with kb.write_txn(conn):
@@ -168,3 +173,37 @@ def test_truthful_hold_closes_once_but_ready_and_intent_do_not():
     conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
     assert monitor.reconcile_truthful_hold(conn, task_id, now=302)
     assert not monitor.reconcile_truthful_hold(conn, task_id, now=303)
+
+
+def test_malformed_new_ready_event_does_not_fall_back_to_old_generation():
+    conn = _db()
+    conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES('t','T','ready',10)")
+    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t','created','{\"status\":\"ready\"}',10)")
+    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t','promoted','not-json',20)")
+    assert monitor.ready_generation(conn, "t") is None
+
+
+def test_writer_context_requires_unique_configured_member_and_exact_partition():
+    conn = _db()
+    board = conn.execute("SELECT board_scope_id FROM kanban_board_identity").fetchone()[0]
+    roster_generation = str(uuid.uuid4())
+    scope = monitor.activate_scope(conn, profile="p1", roster_generation=roster_generation, roster_digest="rd")
+    controller = str(uuid.uuid4())
+    ctx = monitor.MonitorWriterContext(
+        board_scope_id=board, profile="p1", writer_ref=controller,
+        controller_generation="boot", activation_epoch=scope["activation_epoch"],
+        roster_generation=roster_generation, roster_digest="rd", installed_revision="rev",
+    )
+    config = {"dispatch_profiles": ["p1"], "aged_ready": {
+        "controller_id": controller,
+        "dispatch_profiles": ["p1"],
+        "expected_writer_scopes": {board: {"roster_generation": roster_generation, "members": [{
+            "writer_ref": controller, "profiles": ["p1"],
+            "protocol_version": 1, "compatible_revisions": [monitor.COMPATIBILITY_IDENTITY],
+        }]}}
+    }}
+    assert monitor.validate_writer_context(conn, ctx, config) is None
+    bad = monitor.MonitorWriterContext(**{**ctx.__dict__, "roster_digest": "other"})
+    assert monitor.validate_writer_context(conn, bad, config) == "incompatible_writer_context"
+    bad_config = {**config, "dispatch_profiles": ["p1", "p2"]}
+    assert monitor.validate_writer_context(conn, ctx, bad_config) == "writer_scope_incomplete"

@@ -2017,6 +2017,13 @@ def dispatch_once(
     """
     def _locked_tick() -> DispatchResult:
         from hermes_cli import kanban_ready_monitor as monitor
+        try:
+            from hermes_cli.config import load_config
+            loaded_config = load_config()
+            monitor_config = loaded_config.get("kanban", {}) if isinstance(loaded_config, dict) else {}
+        # health: allow BLE001 -- unreadable config must refuse protected dispatch
+        except Exception:
+            monitor_config = None
         if monitor.has_protected_scope(conn) and monitor_context is None:
             result = DispatchResult(monitor_scope_refused=True)
             conn.execute(
@@ -2026,11 +2033,14 @@ def dispatch_once(
             )
             conn.commit()
             return result
+        if monitor.has_protected_scope(conn) and monitor_config is None:
+            return DispatchResult(monitor_scope_refused=True)
         attempt_id = None
         tick_context = monitor_context.for_tick() if monitor_context is not None else None
         if tick_context is not None:
+            monitor.publish_controller_observation(conn, controller=tick_context)
             attempt = monitor.begin_dispatch_attempt(
-                conn, controller=tick_context, surface="standalone",
+                conn, controller=tick_context, surface="standalone", config=monitor_config,
             )
             if attempt is None:
                 return DispatchResult(monitor_scope_refused=True)
@@ -2054,7 +2064,7 @@ def dispatch_once(
         if attempt_id is not None:
             monitor.record_dispatch_tick(
                 conn, controller=tick_context, attempt_id=attempt_id,
-                decisions=result.monitor_decisions,
+                decisions=result.monitor_decisions, config=monitor_config,
             )
             result.monitor_attempt_id = attempt_id
         return result
@@ -2062,8 +2072,9 @@ def dispatch_once(
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
-        # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
+        # A protected scope cannot be established safely without the DB path
+        # and its lock. Refuse closed rather than bypassing the fence.
+        result = DispatchResult(monitor_scope_refused=True)
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
@@ -2333,6 +2344,7 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    from hermes_cli import kanban_ready_monitor as monitor
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
@@ -2341,6 +2353,9 @@ def _dispatch_once_locked(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
     if not may_spawn:
+        monitor.ensure_ready_decisions(
+            conn, result, "memory_pressure" if result.memory_pressure else "board_cap",
+        )
         return result
 
     ready_rows = _lane_rows(conn, "ready")
@@ -2396,6 +2411,7 @@ def _dispatch_once_locked(
                 conn, row["id"], default_assignee, dry_run=dry_run,
             ):
                 result.skipped_unassigned.append(row["id"])
+                result.monitor_decisions.append({"task_id": row["id"], "decision": "unassigned"})
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
@@ -2414,6 +2430,7 @@ def _dispatch_once_locked(
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+    monitor.ensure_ready_decisions(conn, result, "shared_budget_exhausted")
     return result
 
 
@@ -2884,21 +2901,8 @@ def run_daemon(
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
             with contextlib.closing(_kbc.connect()) as conn:
-                monitor_context = None
                 from hermes_cli import kanban_ready_monitor as monitor
-                scope = conn.execute(
-                    "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
-                    "AND state IN ('pending','active','faulted') ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                if scope is not None:
-                    from hermes_cli.version_info import get_version_info
-                    info = get_version_info()
-                    monitor_context = monitor.MonitorWriterContext(
-                        board_scope_id=scope["board_scope_id"], profile=scope["profile"],
-                        writer_ref=writer_ref, controller_generation=controller_generation,
-                        activation_epoch=scope["activation_epoch"], roster_generation=scope["roster_generation"],
-                        roster_digest=scope["roster_digest"], installed_revision=info.commit or info.base_version,
-                    )
+                monitor_context = monitor.runtime_context(conn, writer_ref, controller_generation)
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
@@ -2909,6 +2913,7 @@ def run_daemon(
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
+        # health: allow BLE001 -- daemon tick failures are isolated to one tick
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback

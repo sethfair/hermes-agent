@@ -32,9 +32,12 @@ def _claim_lane_task(
         from hermes_cli import kanban_ready_monitor as monitor
 
         generation = monitor.ready_generation(conn, task_id)
+        run_generation = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
         admission_id = monitor.arm_claim_admission(
             conn, attempt_id=monitor_attempt_id, task_id=task_id,
-            ready_generation=generation[0] if generation else 0, run_generation=0,
+            ready_generation=generation[0] if generation else 0, run_generation=int(run_generation),
         )
     if lane == "ready":
         return claim(conn, task_id, ttl_seconds=ttl_seconds, admission_id=admission_id)
