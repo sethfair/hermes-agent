@@ -195,6 +195,13 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "subject": {
+            "type": "string",
+            "description": (
+                "Stable blocker subject. For dependency, use the exact direct parent task id; "
+                "for other kinds, use a stable lowercase slug such as owner/decision."
+            ),
+        },
     },
     ["reason"],
 )

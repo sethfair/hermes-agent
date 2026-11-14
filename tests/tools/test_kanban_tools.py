@@ -578,15 +578,17 @@ def test_schedule_exposed_to_codex_runtime_workers():
     assert "kanban_schedule" in EXPOSED_TOOLS
 
 
-def test_block_dependency_without_open_parent_is_rekinded(worker_env):
-    """kind=dependency with no incomplete parent must not park in todo; the
-    tool reports the landed kind and tells the worker why."""
+def test_block_dependency_without_open_parent_is_unknown(worker_env):
+    """A dependency identity not naming an open direct parent fails closed."""
     from tools import kanban_tools as kt
 
-    d = json.loads(kt._handle_block({"reason": "upstream input is missing", "kind": "dependency"}))
-    assert (d["ok"], d["status"], d["block_kind"]) == (True, "blocked", "needs_input")
-    assert d["requested_kind"] == "dependency"
-    assert "no parent is open" in d["note"]
+    d = json.loads(kt._handle_block({
+        "reason": "upstream input is missing", "kind": "dependency",
+        "subject": "t_deadbeef",
+    }))
+    assert (d["ok"], d["status"], d["block_kind"], d["block_identity_state"]) == (
+        True, "blocked", "dependency", "unknown"
+    )
 
 
 def test_heartbeat_extends_claim_expires(worker_env):

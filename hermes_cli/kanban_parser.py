@@ -322,6 +322,7 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--subject", help="Stable blocker subject; dependency requires an exact direct parent task id."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -332,6 +333,12 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("classify-block", [
+        _TASK_ID,
+        _arg("--kind", required=True, choices=sorted(kb.VALID_BLOCK_KINDS)),
+        _arg("--subject", required=True, help="Canonical blocker subject."),
+        _arg("--actor", required=True, help="Operator identity recorded in the audit event."),
+    ], help="Classify an UNKNOWN blocker identity without releasing the hold"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
