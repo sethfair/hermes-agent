@@ -26,6 +26,26 @@ class AuthenticatedCallerContext:
     operation_scope: str
 
 
+def trusted_board(conn: sqlite3.Connection) -> str:
+    """Return the board identity persisted by the trusted connection resolver."""
+    rows = conn.execute("SELECT singleton, board FROM kanban_board_identity").fetchall()
+    if (
+        len(rows) != 1
+        or rows[0]["singleton"] != 1
+        or not isinstance(rows[0]["board"], str)
+        or not rows[0]["board"].strip()
+    ):
+        raise ActionReceiptError("board_mismatch")
+    return rows[0]["board"]
+
+
+def require_trusted_board(conn: sqlite3.Connection, board: str) -> str:
+    trusted = trusted_board(conn)
+    if board != trusted:
+        raise ActionReceiptError("board_mismatch")
+    return trusted
+
+
 def require_caller_context(
     conn: sqlite3.Connection,
     caller_context: AuthenticatedCallerContext | None,
@@ -67,6 +87,7 @@ def provision_service_principal(
     configure: bool = False,
 ) -> None:
     """Provision a board-local producer principal."""
+    require_trusted_board(conn, board)
     values = (board, operation_scope, principal_id, credential_id)
     if any(not value or not value.strip() for value in values):
         raise ActionReceiptError("invalid_request")
@@ -122,6 +143,7 @@ def disable_service_principal(
     principal_id: str,
 ) -> None:
     """Disable a provisioned producer principal."""
+    require_trusted_board(conn, board)
     now = int(time.time())
     with write_txn(conn):
         granted = conn.execute(
@@ -172,6 +194,7 @@ def admit_configured_caller(
     operation_scope: str,
 ) -> AuthenticatedCallerContext:
     """Resolve the configured principal without caller-supplied identity."""
+    require_trusted_board(conn, board)
     row = conn.execute(
         """
         SELECT p.principal_id, p.credential_id, p.registry_revision, p.enabled
@@ -206,6 +229,7 @@ def validate_caller_context(
     operation_scope: str,
 ) -> AuthenticatedCallerContext:
     """Validate the context against the board's configured producer."""
+    require_trusted_board(conn, board)
     context = require_caller_context(conn, caller_context)
     configured = conn.execute(
         """

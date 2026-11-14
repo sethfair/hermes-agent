@@ -5,14 +5,19 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from contextlib import contextmanager
 from dataclasses import replace
+import json
+from pathlib import Path
 import sqlite3
 import threading
+import time
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_receipts as receipts
 try:  # Base-RED compatibility: the selected first test must collect before these modules exist.
     from hermes_cli.kanban_db_receipts import (
         ActionRequest,
@@ -201,8 +206,20 @@ def _enable_live(conn):
         conn,
         board="default",
         mode="live",
-        required_consumer_version="receipt-v1",
-        cutover_evidence="test-only drained old-reader fixture",
+        required_consumer_version="1.0.0",
+        cutover_evidence=json.dumps(
+            {
+                "schema_version": 1,
+                "board": "default",
+                "consumer_build": "office-test",
+                "consumer_version": "1.0.0",
+                "supported_receipt_schema_versions": [1],
+                "legacy_readers_drained": True,
+                "verifier": "repository-test",
+                "verified_at": int(time.time()),
+            },
+            sort_keys=True,
+        ),
     )
 
 
@@ -304,11 +321,11 @@ def test_action_commit_is_atomic_exactly_replayable_and_conflict_safe(conn):
           FROM kanban_capabilities WHERE board = 'default'
         """
     ).fetchone()
-    assert tuple(capability) == (
-        "off",
-        "receipt-v1",
-        "test-only drained old-reader fixture",
-    )
+    assert capability["mode"] == "off"
+    assert capability["required_consumer_version"] == "1.0.0"
+    retained_evidence = json.loads(capability["cutover_evidence"])
+    assert retained_evidence["consumer_build"] == "office-test"
+    assert retained_evidence["legacy_readers_drained"] is True
     assert [
         tuple(row)
         for row in conn.execute(
@@ -744,3 +761,335 @@ def test_legacy_schema_migrates_default_off_and_tracks_old_writer_changes(tmp_pa
             assert migrated.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
             ).fetchone() is not None
+
+
+def test_board_a_rejects_valid_board_b_context_without_mutation(conn, tmp_path):
+    task_id = kb.create_task(conn, title="physical board", assignee="worker")
+    other_path = tmp_path / "other.db"
+    raw_other = sqlite3.connect(other_path)
+    raw_other.executescript(kb.SCHEMA_SQL)
+    raw_other.execute(
+        "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, 'other')"
+    )
+    raw_other.commit()
+    raw_other.close()
+    with closing(kbc.connect(other_path, board="other")) as other:
+        provision_service_principal(
+            other,
+            board="other",
+            operation_scope="task.transition",
+            principal_id="office",
+            credential_id="office-local",
+            configure=True,
+        )
+        context = admit_configured_caller(
+            other, board="other", operation_scope="task.transition"
+        )
+    row = conn.execute(
+        "SELECT status, action_generation, park_generation FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    request = ActionRequest(
+        schema_version=1,
+        board="other",
+        task_id=task_id,
+        operation_id="op-cross-board",
+        operation="task.transition",
+        expected_action_generation=int(row["action_generation"]),
+        expected_guard_fingerprint=guard_fingerprint(
+            conn,
+            task_id,
+            action_class="office.approval",
+            from_status=row["status"],
+            to_status="todo",
+            decision_revision=1,
+        ),
+        park_generation=int(row["park_generation"]),
+        action_class="office.approval",
+        from_status=row["status"],
+        to_status="todo",
+        transition={"status": "todo"},
+        decision_revision=1,
+    )
+    with pytest.raises(ActionReceiptError, match="board_mismatch"):
+        commit_action(conn, request, caller_context=context)
+    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "ready"
+    assert conn.execute("SELECT COUNT(*) FROM operation_keys").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "free-form evidence",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "board": "default",
+                "consumer_build": "office-test",
+                "consumer_version": "0.9.0",
+                "supported_receipt_schema_versions": [1],
+                "legacy_readers_drained": True,
+                "verifier": "repository-test",
+                "verified_at": int(time.time()),
+            }
+        ),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "board": "default",
+                "consumer_build": "office-test",
+                "consumer_version": "1.0.0",
+                "supported_receipt_schema_versions": [1],
+                "legacy_readers_drained": False,
+                "verifier": "repository-test",
+                "verified_at": int(time.time()),
+            }
+        ),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "board": "default",
+                "consumer_build": "office-test",
+                "consumer_version": "1.0.0",
+                "supported_receipt_schema_versions": [1],
+                "legacy_readers_drained": True,
+                "verifier": "repository-test",
+                "verified_at": int(time.time()) - 86_401,
+            }
+        ),
+    ],
+)
+def test_live_rejects_malformed_incompatible_or_undrained_evidence(conn, evidence):
+    with pytest.raises(ActionReceiptError, match="incompatible_consumer"):
+        configure_action_receipts(
+            conn,
+            board="default",
+            mode="live",
+            required_consumer_version="1.0.0",
+            cutover_evidence=evidence,
+        )
+    assert action_receipts_mode(conn, board="default") == "off"
+
+
+def test_lost_commit_ack_is_transaction_unknown_and_same_key_recovers_action(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "lost-ack-action.db"
+    with closing(kbc.connect(db_path)) as connection:
+        _task_id, context, request = _live_transition_setup(connection)
+        _enable_live(connection)
+        original = receipts.write_txn
+
+        @contextmanager
+        def commit_then_lose_ack(conn):
+            with original(conn):
+                yield conn
+            raise RuntimeError("injected lost commit acknowledgement")
+
+        monkeypatch.setattr(receipts, "write_txn", commit_then_lose_ack)
+        with pytest.raises(ActionReceiptError, match="transaction_unknown"):
+            commit_action(connection, request, caller_context=context)
+
+    monkeypatch.setattr(receipts, "write_txn", original)
+    with closing(kbc.connect(db_path)) as retry:
+        recovered = commit_action(retry, request, caller_context=context)
+        assert recovered.operation_id == request.operation_id
+        assert retry.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0] == 1
+        assert retry.execute("SELECT COUNT(*) FROM operation_keys").fetchone()[0] == 1
+
+
+def test_lost_commit_ack_is_transaction_unknown_and_same_key_recovers_notice(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "lost-ack-notice.db"
+    with closing(kbc.connect(db_path)) as connection:
+        task_id = kb.create_task(connection, title="notice ack", assignee="worker")
+        provision_service_principal(
+            connection,
+            board="default",
+            operation_scope="advisory.notice",
+            principal_id="office",
+            credential_id="office-local",
+            configure=True,
+        )
+        context = admit_configured_caller(
+            connection, board="default", operation_scope="advisory.notice"
+        )
+        _enable_live(connection)
+        row = connection.execute(
+            "SELECT action_generation, park_generation FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        request = AdvisoryNoticeRequest(
+            schema_version=1,
+            board="default",
+            task_id=task_id,
+            notice_operation_id="op-lost-ack-notice",
+            notice_kind="Z",
+            park_generation=int(row["park_generation"]),
+            expected_action_generation=int(row["action_generation"]),
+            expected_guard_fingerprint=guard_fingerprint(connection, task_id),
+            content="Lost acknowledgement notice.",
+        )
+        original = receipts.write_txn
+
+        @contextmanager
+        def commit_then_lose_ack(conn):
+            with original(conn):
+                yield conn
+            raise RuntimeError("injected lost commit acknowledgement")
+
+        monkeypatch.setattr(receipts, "write_txn", commit_then_lose_ack)
+        with pytest.raises(ActionReceiptError, match="transaction_unknown"):
+            append_advisory_notice(connection, request, caller_context=context)
+
+    monkeypatch.setattr(receipts, "write_txn", original)
+    with closing(kbc.connect(db_path)) as retry:
+        recovered = append_advisory_notice(retry, request, caller_context=context)
+        assert recovered.operation_id == request.notice_operation_id
+        assert retry.execute("SELECT COUNT(*) FROM advisory_notices").fetchone()[0] == 1
+        assert retry.execute("SELECT COUNT(*) FROM operation_keys").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("related_write", ["comment", "link", "hold"])
+def test_related_write_makes_precomputed_action_stale(conn, related_write):
+    task_id, context, request = _live_transition_setup(conn)
+    _enable_live(conn)
+    if related_write == "comment":
+        kb.add_comment(conn, task_id, "legacy", "intervening comment")
+    elif related_write == "link":
+        parent_id = kb.create_task(conn, title="parent", assignee="worker")
+        kb.link_tasks(conn, parent_id, task_id)
+    else:
+        kb.block_task(conn, task_id, reason="intervening hold", kind="needs_input")
+
+    with pytest.raises(
+        ActionReceiptError, match="generation_conflict|status_conflict|hold_active"
+    ):
+        commit_action(conn, request, caller_context=context)
+    assert conn.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM operation_keys").fetchone()[0] == 0
+
+
+def test_producer_off_retains_markers_visible_to_legacy_sql_reader(conn):
+    _task_id, context, request = _live_transition_setup(conn)
+    _enable_live(conn)
+    receipt = commit_action(conn, request, caller_context=context)
+    configure_action_receipts(conn, board="default", mode="off")
+    assert receipt.projection is not None
+    assert request.projection is not None
+
+    legacy_comment = conn.execute(
+        "SELECT author, body FROM task_comments WHERE id = ?",
+        (receipt.projection.comment_id,),
+    ).fetchone()
+    legacy_event = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE id = ?", (receipt.event_id,)
+    ).fetchone()
+    assert tuple(legacy_comment) == (
+        "action-receipt",
+        request.projection.comment_body,
+    )
+    assert legacy_event["kind"] == "authenticated_action"
+    assert json.loads(legacy_event["payload"])["receipt_id"] == receipt.receipt_id
+    with pytest.raises(ActionReceiptError, match="capability_disabled"):
+        commit_action(
+            conn,
+            replace(request, operation_id="op-after-off"),
+            caller_context=context,
+        )
+
+
+def test_exact_base_schema_migrates_idempotently_across_reconnects(tmp_path):
+    db_path = tmp_path / "exact-base.db"
+    fixture = Path(__file__).parents[1] / "fixtures" / "kanban_pre_action_receipts.sql"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(fixture.read_text(encoding="utf-8"))
+    raw.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('base-task', 'Base', 'ready', 1)"
+    )
+    raw.commit()
+    raw.close()
+
+    inventories = []
+    for _ in range(3):
+        kbc.init_db(db_path)
+        with closing(kbc.connect(db_path)) as migrated:
+            row = migrated.execute(
+                "SELECT action_generation, park_generation FROM tasks WHERE id = 'base-task'"
+            ).fetchone()
+            assert tuple(row) == (0, 0)
+            assert action_receipts_mode(migrated, board="default") == "off"
+            inventories.append(
+                [
+                    tuple(item)
+                    for item in migrated.execute(
+                        "SELECT type, name, sql FROM sqlite_master "
+                        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                    )
+                ]
+            )
+    assert inventories[0] == inventories[1] == inventories[2]
+
+
+def test_action_and_notice_malformed_schema_versions_fail_closed(conn):
+    _task_id, action_context, action_request = _live_transition_setup(conn)
+    action_request = replace(action_request, projection=None, operation_id="op-bad-action-schema")
+    _enable_live(conn)
+    receipt = commit_action(conn, action_request, caller_context=action_context)
+    conn.execute("DROP TRIGGER action_receipts_immutable_update")
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute(
+        "UPDATE action_receipts SET schema_version = 2 WHERE receipt_id = ?",
+        (receipt.receipt_id,),
+    )
+    with pytest.raises(ActionReceiptError, match="receipt_missing"):
+        lookup_action_receipt(
+            conn,
+            board="default",
+            receipt_id=receipt.receipt_id,
+            caller_context=action_context,
+        )
+    conn.execute("PRAGMA ignore_check_constraints=OFF")
+
+    task_id = kb.create_task(conn, title="bad notice", assignee="worker")
+    provision_service_principal(
+        conn,
+        board="default",
+        operation_scope="advisory.notice",
+        principal_id="office",
+        credential_id="office-local",
+        configure=True,
+    )
+    notice_context = admit_configured_caller(
+        conn, board="default", operation_scope="advisory.notice"
+    )
+    row = conn.execute(
+        "SELECT action_generation, park_generation FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    notice_request = AdvisoryNoticeRequest(
+        schema_version=1,
+        board="default",
+        task_id=task_id,
+        notice_operation_id="op-bad-notice-schema",
+        notice_kind="S",
+        park_generation=int(row["park_generation"]),
+        expected_action_generation=int(row["action_generation"]),
+        expected_guard_fingerprint=guard_fingerprint(conn, task_id),
+        content="Malformed authority probe.",
+    )
+    notice = append_advisory_notice(conn, notice_request, caller_context=notice_context)
+    conn.execute("DROP TRIGGER advisory_notices_immutable_update")
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute(
+        "UPDATE advisory_notices SET schema_version = 2 WHERE notice_id = ?",
+        (notice.notice_id,),
+    )
+    with pytest.raises(ActionReceiptError, match="receipt_missing"):
+        lookup_operation(
+            conn,
+            board="default",
+            operation_id=notice.operation_id,
+            caller_context=notice_context,
+        )
+    conn.execute("PRAGMA ignore_check_constraints=OFF")

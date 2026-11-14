@@ -1,13 +1,17 @@
 """Additive schema for authenticated Kanban action receipts."""
 
 ACTION_RECEIPT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS kanban_board_identity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    board TEXT NOT NULL UNIQUE
+);
 CREATE TABLE IF NOT EXISTS service_principals (
     board TEXT NOT NULL,
     principal_id TEXT NOT NULL,
     credential_id TEXT NOT NULL,
     operation_scope TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    registry_revision INTEGER NOT NULL DEFAULT 1,
+    registry_revision INTEGER NOT NULL DEFAULT 1 CHECK (registry_revision > 0),
     created_at INTEGER NOT NULL,
     disabled_at INTEGER,
     PRIMARY KEY (board, principal_id, operation_scope)
@@ -60,16 +64,16 @@ CREATE TABLE IF NOT EXISTS operation_keys (
 );
 CREATE TABLE IF NOT EXISTS action_receipts (
     receipt_id TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
     board TEXT NOT NULL,
     task_id TEXT NOT NULL,
     operation_id TEXT NOT NULL,
     operation TEXT NOT NULL,
     principal_id TEXT NOT NULL,
     credential_id TEXT NOT NULL,
-    action_generation INTEGER NOT NULL,
-    resulting_generation INTEGER NOT NULL,
-    park_generation INTEGER NOT NULL,
+    action_generation INTEGER NOT NULL CHECK (action_generation >= 0),
+    resulting_generation INTEGER NOT NULL CHECK (resulting_generation > action_generation),
+    park_generation INTEGER NOT NULL CHECK (park_generation >= 0),
     action_class TEXT NOT NULL,
     from_status TEXT NOT NULL,
     to_status TEXT NOT NULL,
@@ -89,15 +93,15 @@ CREATE TABLE IF NOT EXISTS action_receipts (
 );
 CREATE TABLE IF NOT EXISTS advisory_notices (
     notice_id TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
     board TEXT NOT NULL,
     task_id TEXT NOT NULL,
     operation_id TEXT NOT NULL,
     notice_kind TEXT NOT NULL,
     principal_id TEXT NOT NULL,
     credential_id TEXT NOT NULL,
-    action_generation INTEGER NOT NULL,
-    park_generation INTEGER NOT NULL,
+    action_generation INTEGER NOT NULL CHECK (action_generation >= 0),
+    park_generation INTEGER NOT NULL CHECK (park_generation >= 0),
     guard_fingerprint TEXT NOT NULL,
     content TEXT NOT NULL,
     content_digest TEXT NOT NULL,

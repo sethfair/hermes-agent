@@ -14,10 +14,11 @@ from typing import Literal, Mapping, cast
 from hermes_cli.kanban_principal import (
     ActionReceiptError,
     AuthenticatedCallerContext,
+    require_trusted_board,
     validate_caller_context,
 )
 from hermes_cli.kanban_workflow import DEFAULT_WORKFLOW
-from hermes_cli.sqlite_util import write_txn
+from hermes_cli.sqlite_util import TransactionOutcomeUnknown, write_txn
 
 _CAPABILITY = "authenticated_action_receipts_v1"
 JSONValue = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
@@ -175,10 +176,17 @@ def configure_action_receipts(
     cutover_evidence: str | None = None,
 ) -> None:
     """Record the default-off producer fence; live requires drain evidence."""
+    require_trusted_board(conn, board)
     if mode not in {"off", "compatible", "live"}:
         raise ActionReceiptError("invalid_request")
-    if mode != "off" and (not required_consumer_version or not cutover_evidence):
-        raise ActionReceiptError("incompatible_consumer")
+    if mode != "off":
+        evidence = _validate_cutover_evidence(
+            board=board,
+            mode=mode,
+            required_consumer_version=required_consumer_version,
+            raw=cutover_evidence,
+        )
+        cutover_evidence = _canonical(evidence)
     now = int(time.time())
     with write_txn(conn):
         previous = conn.execute(
@@ -236,11 +244,64 @@ def configure_action_receipts(
 
 
 def action_receipts_mode(conn: sqlite3.Connection, *, board: str) -> str:
+    require_trusted_board(conn, board)
     row = conn.execute(
         "SELECT mode FROM kanban_capabilities WHERE board = ? AND capability = ?",
         (board, _CAPABILITY),
     ).fetchone()
     return row["mode"] if row else "off"
+
+
+def _version(value: str | None) -> tuple[int, int, int]:
+    pattern = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    if not isinstance(value, str) or not re.fullmatch(pattern, value):
+        raise ActionReceiptError("incompatible_consumer")
+    return cast(tuple[int, int, int], tuple(int(part) for part in value.split(".")))
+
+
+def _validate_cutover_evidence(
+    *,
+    board: str,
+    mode: str,
+    required_consumer_version: str | None,
+    raw: str | None,
+) -> dict:
+    try:
+        evidence = json.loads(raw) if isinstance(raw, str) else None
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ActionReceiptError("incompatible_consumer") from exc
+    required_keys = {
+        "schema_version",
+        "board",
+        "consumer_build",
+        "consumer_version",
+        "supported_receipt_schema_versions",
+        "legacy_readers_drained",
+        "verifier",
+        "verified_at",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != required_keys:
+        raise ActionReceiptError("incompatible_consumer")
+    try:
+        verified_at = _integer(evidence["verified_at"])
+    except ActionReceiptError as exc:
+        raise ActionReceiptError("incompatible_consumer") from exc
+    now = int(time.time())
+    if (
+        evidence["schema_version"] != 1
+        or evidence["board"] != board
+        or not isinstance(evidence["consumer_build"], str)
+        or not evidence["consumer_build"].strip()
+        or not isinstance(evidence["verifier"], str)
+        or not evidence["verifier"].strip()
+        or evidence["supported_receipt_schema_versions"] != [1]
+        or verified_at > now + 300
+        or verified_at < now - 86_400
+        or _version(evidence["consumer_version"]) < _version(required_consumer_version)
+        or (mode == "live" and evidence["legacy_readers_drained"] is not True)
+    ):
+        raise ActionReceiptError("incompatible_consumer")
+    return evidence
 
 
 def guard_fingerprint(
@@ -371,8 +432,22 @@ def _action_payload(request: ActionRequest, context: AuthenticatedCallerContext)
 
 
 def _ensure_live(conn: sqlite3.Connection, board: str) -> None:
-    if action_receipts_mode(conn, board=board) != "live":
+    require_trusted_board(conn, board)
+    row = conn.execute(
+        """
+        SELECT mode, required_consumer_version, cutover_evidence
+          FROM kanban_capabilities WHERE board = ? AND capability = ?
+        """,
+        (board, _CAPABILITY),
+    ).fetchone()
+    if row is None or row["mode"] != "live":
         raise ActionReceiptError("capability_disabled")
+    _validate_cutover_evidence(
+        board=board,
+        mode="live",
+        required_consumer_version=row["required_consumer_version"],
+        raw=row["cutover_evidence"],
+    )
 
 
 def _operation_row(conn: sqlite3.Connection, board: str, operation_id: str):
@@ -380,6 +455,27 @@ def _operation_row(conn: sqlite3.Connection, board: str, operation_id: str):
         "SELECT * FROM operation_keys WHERE board = ? AND operation_id = ?",
         (board, operation_id),
     ).fetchone()
+
+
+def _raise_write_error(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    operation_id: str,
+    error: Exception,
+) -> None:
+    if isinstance(error, ActionReceiptError):
+        raise error
+    existing = _operation_row(conn, board, operation_id)
+    if isinstance(error, TransactionOutcomeUnknown):
+        raise ActionReceiptError("transaction_unknown") from error
+    if isinstance(error, sqlite3.IntegrityError) and existing is not None:
+        raise ActionReceiptError("operation_conflict") from error
+    if isinstance(error, sqlite3.Error):
+        raise ActionReceiptError("storage_unavailable") from error
+    if existing is not None:
+        raise ActionReceiptError("transaction_unknown") from error
+    raise error
 
 
 def _projection_binding(
@@ -618,10 +714,14 @@ def commit_action(
                 committed_at=now,
                 projection=projection,
             )
-    except sqlite3.IntegrityError as exc:
-        if _operation_row(conn, request.board, request.operation_id) is not None:
-            raise ActionReceiptError("operation_conflict") from exc
-        raise ActionReceiptError("storage_unavailable") from exc
+    except (sqlite3.Error, RuntimeError) as exc:
+        _raise_write_error(
+            conn,
+            board=request.board,
+            operation_id=request.operation_id,
+            error=exc,
+        )
+        raise AssertionError("unreachable")
 
 
 def _projection_from_json(raw: str | None) -> ProjectionBinding | None:
@@ -637,6 +737,13 @@ def _verify_record_integrity(
     *,
     kind: Literal["action", "notice"],
 ) -> None:
+    if type(row["schema_version"]) is not int or row["schema_version"] != 1:
+        raise ActionReceiptError("receipt_missing")
+    generation_columns = ["action_generation", "park_generation"]
+    if kind == "action":
+        generation_columns.append("resulting_generation")
+    if any(type(row[column]) is not int or row[column] < 0 for column in generation_columns):
+        raise ActionReceiptError("receipt_missing")
     record_column = "receipt_id" if kind == "action" else "notice_id"
     digest_column = "request_digest"
     key = conn.execute(
@@ -660,7 +767,8 @@ def _verify_record_integrity(
             raise ActionReceiptError("receipt_missing") from exc
         if (
             row["outcome"] != "committed"
-            or int(row["resulting_generation"]) <= int(row["action_generation"])
+            or int(row["resulting_generation"])
+            != int(row["action_generation"]) + (3 if row["projection_json"] else 2)
             or _digest("hermes.kanban.transition.v1", transition)
             != row["transition_digest"]
         ):
@@ -838,10 +946,14 @@ def append_advisory_notice(
         return _append_advisory_notice(
             conn, request, caller_context=caller_context
         )
-    except sqlite3.IntegrityError as exc:
-        if _operation_row(conn, request.board, request.notice_operation_id) is not None:
-            raise ActionReceiptError("operation_conflict") from exc
-        raise ActionReceiptError("storage_unavailable") from exc
+    except (sqlite3.Error, RuntimeError) as exc:
+        _raise_write_error(
+            conn,
+            board=request.board,
+            operation_id=request.notice_operation_id,
+            error=exc,
+        )
+        raise AssertionError("unreachable")
 
 
 def _append_advisory_notice(

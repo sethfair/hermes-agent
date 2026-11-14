@@ -777,6 +777,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                _bind_action_receipt_board(conn, board)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -811,7 +812,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     # Clear the cache entry so connect() re-runs schema + migrations.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(str(path.resolve()))
-    with contextlib.closing(connect(path)):
+    with contextlib.closing(connect(path, board=board)):
         pass
     return path
 
@@ -920,6 +921,22 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+def _bind_action_receipt_board(conn: sqlite3.Connection, board: Optional[str]) -> None:
+    """Persist the board selected by the trusted connection resolver."""
+    trusted = _kb._normalize_board_slug(board) if board is not None else _kb.DEFAULT_BOARD
+    trusted = trusted or _kb.DEFAULT_BOARD
+    row = conn.execute("SELECT board FROM kanban_board_identity WHERE singleton = 1").fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, ?)",
+            (trusted,),
+        )
+    elif row["board"] != trusted:
+        raise ValueError(
+            f"kanban database is bound to board {row['board']!r}, not {trusted!r}"
+        )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns introduced after v1 to legacy DBs (called via ``init_db``)."""
     cols = _column_names(conn, "tasks")
@@ -1009,6 +1026,7 @@ def _install_action_receipt_guards(conn: sqlite3.Connection) -> None:
     receive guards when a full initialization is later performed.
     """
     required = (
+        "kanban_board_identity",
         "tasks",
         "task_comments",
         "task_events",
@@ -1024,6 +1042,13 @@ def _install_action_receipt_guards(conn: sqlite3.Connection) -> None:
         return
     conn.executescript(
         """
+        CREATE TRIGGER IF NOT EXISTS kanban_board_identity_immutable_update
+        BEFORE UPDATE ON kanban_board_identity
+        BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END;
+        CREATE TRIGGER IF NOT EXISTS kanban_board_identity_immutable_delete
+        BEFORE DELETE ON kanban_board_identity
+        BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END;
+
         CREATE TRIGGER IF NOT EXISTS tasks_action_generation_update
         AFTER UPDATE ON tasks
         WHEN NEW.action_generation = OLD.action_generation
