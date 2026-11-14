@@ -40,7 +40,7 @@ class MonitorWriterContext:
     compatibility_identity: str = COMPATIBILITY_IDENTITY
     tick_id: str = ""
 
-    def for_tick(self) -> "MonitorWriterContext":
+    def for_tick(self) -> MonitorWriterContext:
         return dataclasses.replace(self, tick_id=str(uuid.uuid4()))
 
 

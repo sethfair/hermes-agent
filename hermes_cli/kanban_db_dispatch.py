@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import signal
@@ -28,6 +29,8 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -2089,157 +2092,46 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
-def _dispatch_lane_task(
-    conn: sqlite3.Connection,
-    row: sqlite3.Row,
-    assignee: str,
-    result: DispatchResult,
-    *,
-    lane: str,
-    dry_run: bool,
-    ttl_seconds: Optional[int],
-    board: Optional[str],
-    failure_limit: int,
-    spawn_fn,
-    per_profile_cap: Optional[int],
-    per_profile_running: dict[str, int],
-    monitor_attempt_id: Optional[str] = None,
-    monitor_context=None,
-) -> bool:
-    """Guard, claim, resolve the workspace and spawn one ready/review row.
-    Returns True when a spawn slot was consumed (real or ``dry_run``); every
-    skip is recorded on ``result``.
-    """
-    task_id = row["id"]
-    def decision(kind: str, reason: Optional[str] = None) -> None:
-        result.monitor_decisions.append({"task_id": task_id, "decision": kind, "guard_reason": reason})
-    # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
-    # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
-    # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
-    # it by assigning a profile, and health telemetry suppresses "stuck" for it.
-    profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
-        result.skipped_nonspawnable.append(task_id)
-        decision("nonspawnable_profile")
-        # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
-        # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
-        # condition never expires on its own, so write it once: a repeat only when something
-        # else happened on the card since (reassign, comment) — not one row per tick forever,
-        # and not one row per foreign home per tick on a shared board (#101015).
-        if not dry_run:
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
-                    _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
-        return False
-    # Per-profile cap: one profile's local model / API quota / browser pool
-    # must not be overwhelmed by a fan-out even with global headroom.
-    if per_profile_cap is not None:
-        current = per_profile_running.get(assignee, 0)
-        if current >= per_profile_cap:
-            result.skipped_per_profile_capped.append((task_id, assignee, current))
-            decision("profile_cap")
-            return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
-    if guard_reason is not None:
-        result.respawn_guarded.append((task_id, guard_reason))
-        mapped = {
-            "active_pr": "auth_or_quota_guard", "blocker_auth": "auth_or_quota_guard",
-            "recent_success": "recent_success", "rate_limited": "rate_limit_cooldown",
-        }.get(guard_reason, "guard_unknown")
-        decision(mapped, guard_reason)
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
-        if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
-        return False
-
-    def _count_spawn(name: str) -> None:
-        # Later rows in this tick respect the per-profile cap; subsequent
-        # ticks re-query from the DB.
-        if per_profile_cap is not None and name:
-            per_profile_running[name] = per_profile_running.get(name, 0) + 1
-
-    if dry_run:
-        decision("dry_run")
-        result.spawned.append((task_id, assignee, ""))
-        _count_spawn(assignee)
-        return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    admission_id = None
-    if lane == "ready" and monitor_attempt_id and monitor_context is not None:
-        from hermes_cli import kanban_ready_monitor as monitor
-        generation = monitor.ready_generation(conn, task_id)
-        admission_id = monitor.arm_claim_admission(
-            conn, attempt_id=monitor_attempt_id, task_id=task_id,
-            ready_generation=generation[0] if generation else 0, run_generation=0,
-        )
-    if lane == "ready":
-        claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, admission_id=admission_id)
-    else:
-        claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
-    if claimed is None:
-        if lane == "ready":
-            decision("eligible_missed")
-        return False
+def _resolve_lane_workspace(
+    claimed: Task, board: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[Exception]]:
     try:
-        resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
-        else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
-    except Exception as exc:
-        if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+            workspace, branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            return str(workspace), branch_name, None
+        return str(_kbw.resolve_workspace(claimed, board=board)), None, None
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            raise
+        _log.debug("kanban dispatcher: workspace resolution failed for %s", claimed.id, exc_info=True)
+        return None, None, exc
+
+
+def _spawn_lane_worker(
+    conn: sqlite3.Connection, claimed: Task, workspace: str, board: Optional[str], spawn_fn,
+) -> tuple[bool, Optional[Exception], bool]:
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, workspace, board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
-        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-        decision("claimed")
-        _count_spawn(claimed.assignee)
-        return True
-    except Exception as exc:
+            _set_worker_pid(
+                conn, claimed.id, int(pid), run_id=claimed.current_run_id,
+                claim_lock=claimed.claim_lock,
+            )
+        _kb._fire_worker_spawned_hook(conn, claimed, workspace, pid, board=board)
+        return True, None, False
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            raise
         from tools.process_registry import RestartSafeScopeUnavailable
 
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
         if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
+            _kb._log.warning(
+                "kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
+                claimed.id, exc,
+            )
+        _log.debug("kanban dispatcher: worker spawn failed for %s", claimed.id, exc_info=True)
+        return False, exc, infrastructure
 
 
 def _apply_default_assignee(
@@ -3029,3 +2921,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli.kanban_db_dispatch_lane import _dispatch_lane_task

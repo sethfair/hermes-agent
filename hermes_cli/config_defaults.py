@@ -5,6 +5,7 @@ docs of config.yaml.
 """
 
 from hermes_cli.config_defaults_auxiliary import _aux
+from hermes_cli.config_defaults_kanban import AGED_READY_DEFAULTS
 
 #: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
 #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
@@ -1862,21 +1863,7 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
-        # Aged-Ready observation is metadata-only and deliberately OFF.  A
-        # later deployment must supply an explicit writer roster before it can
-        # become active; this setting never enables delivery.
-        "dispatch_profiles": [],
-        "aged_ready": {
-            "observation_enabled": False,
-            "controller_id": "",
-            "min_age_seconds": 1800,
-            "min_eligible_misses": 3,
-            "controller_stale_seconds": 180,
-            "owner_retry_seconds": [300, 900, 3600],
-            "manager_retry_seconds": [900, 3600],
-            "expected_writer_scopes": {},
-            "resolver_bindings": {},
-        },
+        **AGED_READY_DEFAULTS,
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
@@ -2714,9 +2701,7 @@ DEFAULT_CONFIG = {
     "_config_version": 53,  # Config schema version - bump this when adding new required fields
 }
 
-
 from hermes_cli.config_defaults_env import OptionalEnvVars, _base_url, _env, _msg, _prov, _setting, _skill, _tool
-
 
 # Optional environment variables that enhance functionality. Feeds the dashboard keys page and setup
 # checklists; category: provider|tool|skill|messaging|setting, advanced=True hides from checklists,
