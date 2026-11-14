@@ -66,6 +66,55 @@ DIAGNOSTIC_CODES = frozenset({
     "writer_scope_incomplete",
 })
 
+_AGED_READY_KEYS = frozenset({
+    "observation_enabled", "controller_id", "min_age_seconds", "min_eligible_misses",
+    "controller_stale_seconds", "owner_retry_seconds", "manager_retry_seconds",
+    "expected_writer_scopes", "resolver_bindings", "dispatch_profiles",
+})
+
+
+def _strict_int(value: Any, name: str, *, minimum: int, maximum: int = 2_147_483_647) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"invalid aged_ready {name}")
+    return value
+
+
+def _retry_list(value: Any, name: str) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value or len(value) > 8:
+        raise ValueError(f"invalid aged_ready {name}")
+    result = tuple(_strict_int(item, name, minimum=0, maximum=86_400) for item in value)
+    if tuple(sorted(set(result))) != result:
+        raise ValueError(f"invalid aged_ready {name}")
+    return result
+
+
+def parse_aged_ready_config(value: Any) -> dict[str, Any]:
+    """Validate the deployment-owned monitor section; reject ambiguous YAML."""
+    aged = value.get("aged_ready", {}) if isinstance(value, Mapping) and "aged_ready" in value else value
+    if not isinstance(aged, Mapping) or set(aged) - _AGED_READY_KEYS:
+        raise ValueError("unknown aged_ready key")
+    result = dict(aged)
+    result["observation_enabled"] = result.get("observation_enabled", False)
+    if not isinstance(result["observation_enabled"], bool):
+        raise ValueError("invalid aged_ready observation_enabled")
+    result["controller_id"] = result.get("controller_id", "")
+    if not isinstance(result["controller_id"], str):
+        raise ValueError("invalid aged_ready controller_id")
+    result["min_age_seconds"] = _strict_int(result.get("min_age_seconds", 1800), "min_age_seconds", minimum=1)
+    result["min_eligible_misses"] = _strict_int(result.get("min_eligible_misses", 3), "min_eligible_misses", minimum=1)
+    result["controller_stale_seconds"] = _strict_int(result.get("controller_stale_seconds", 180), "controller_stale_seconds", minimum=1)
+    result["owner_retry_seconds"] = _retry_list(result.get("owner_retry_seconds", [300, 900, 3600]), "owner_retry_seconds")
+    result["manager_retry_seconds"] = _retry_list(result.get("manager_retry_seconds", [900, 3600]), "manager_retry_seconds")
+    result["dispatch_profiles"] = _profiles(result.get("dispatch_profiles", []))
+    if "dispatch_profiles" in aged and not isinstance(aged["dispatch_profiles"], list):
+        raise ValueError("invalid aged_ready dispatch_profiles")
+    result["expected_writer_scopes"] = parse_expected_writer_scopes(result.get("expected_writer_scopes", {}))
+    bindings = result.get("resolver_bindings", {})
+    if not isinstance(bindings, Mapping) or any(not isinstance(v, Mapping) for v in bindings.values()):
+        raise ValueError("invalid aged_ready resolver_bindings")
+    result["resolver_bindings"] = {str(k): dict(v) for k, v in bindings.items()}
+    return result
+
 
 @dataclass(frozen=True)
 class ReadyEntryClassifier:
@@ -300,10 +349,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _scope(conn: sqlite3.Connection, profile: str) -> sqlite3.Row | None:
+def _scope(conn: sqlite3.Connection, profile: str, board_scope_id: str | None = None) -> sqlite3.Row | None:
     rows = conn.execute(
         "SELECT * FROM kanban_monitor_scope_activation WHERE profile=? AND disabled_at IS NULL "
-        "ORDER BY id", (profile,)
+        + ("AND board_scope_id=? " if board_scope_id else "") + "ORDER BY id",
+        (profile, board_scope_id) if board_scope_id else (profile,),
     ).fetchall()
     return rows[0] if len(rows) == 1 else None
 
@@ -452,7 +502,7 @@ def begin_dispatch_attempt(conn: sqlite3.Connection, *, controller: MonitorWrite
     # real claim (write_txn intentionally refuses that composition).
     if conn.in_transaction:
         conn.commit()
-    scope = _scope(conn, controller.profile)
+    scope = _scope(conn, controller.profile, controller.board_scope_id)
     if not scope or scope["board_scope_id"] != controller.board_scope_id:
         return None
     context_error = (validate_writer_context(conn, controller, config)
@@ -564,20 +614,24 @@ def ensure_ready_decisions(conn: sqlite3.Connection, result: Any, reason: str) -
             result.monitor_decisions.append({"task_id": row["id"], "decision": "unassigned" if not row["assignee"] else reason})
 
 
-def runtime_context(conn: sqlite3.Connection, writer_ref: str, controller_generation: str) -> MonitorWriterContext | None:
+def runtime_context(conn: sqlite3.Connection, writer_ref: str, controller_generation: str,
+                    profile: str | None = None) -> MonitorWriterContext | None:
     scopes = conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL AND state IN ('pending','active','faulted') ORDER BY id").fetchall()
-    if len(scopes) != 1:
+    if not scopes:
         return None
-    scope = scopes[0]
     try:
         from hermes_cli.config import load_config
         cfg = load_config().get("kanban", {})
     except (OSError, TypeError, ValueError, KeyError):
         cfg = {}
-    aged = cfg.get("aged_ready") or {}
+    try:
+        aged = parse_aged_ready_config(cfg.get("aged_ready") or {})
+    except ValueError:
+        return None
+    scope = next((item for item in scopes if item["profile"] == profile), None) if profile else next((item for item in scopes if item["profile"] in aged["dispatch_profiles"]), scopes[0])
     from hermes_cli.version_info import get_version_info
     info = get_version_info()
-    dispatch_profiles = _profiles(aged.get("dispatch_profiles", cfg.get("dispatch_profiles", ())))
+    dispatch_profiles = _profiles(aged.get("dispatch_profiles", ()))
     selected_writer = str(aged.get("controller_id") or writer_ref)
     if not aged.get("controller_id"):
         board = (aged.get("expected_writer_scopes", {}).get(scope["board_scope_id"], {})
@@ -592,9 +646,24 @@ def runtime_context(conn: sqlite3.Connection, writer_ref: str, controller_genera
         writer_ref=selected_writer, controller_generation=controller_generation,
         activation_epoch=scope["activation_epoch"], roster_generation=scope["roster_generation"],
         roster_digest=scope["roster_digest"], installed_revision=info.commit or info.base_version,
-        dispatch_profiles=dispatch_profiles or (scope["profile"],), min_age_seconds=int(aged.get("min_age_seconds", 1800)),
-        min_eligible_misses=int(aged.get("min_eligible_misses", 3)),
+        dispatch_profiles=dispatch_profiles or (scope["profile"],), min_age_seconds=aged["min_age_seconds"],
+        min_eligible_misses=aged["min_eligible_misses"],
     )
+
+
+def runtime_contexts(conn: sqlite3.Connection, writer_ref: str, controller_generation: str) -> tuple[MonitorWriterContext, ...]:
+    """Return one explicit context per protected partition served by a process."""
+    contexts = []
+    for scope in conn.execute("SELECT profile FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL AND state IN ('pending','active','faulted') ORDER BY id"):
+        context = runtime_context(conn, writer_ref, controller_generation, profile=scope["profile"])
+        if context is not None:
+            contexts.append(context)
+    return tuple(contexts)
+
+
+def runtime_context_for_profile(conn: sqlite3.Connection, profile: str, writer_ref: str,
+                                controller_generation: str) -> MonitorWriterContext | None:
+    return runtime_context(conn, writer_ref, controller_generation, profile=profile)
 
 
 def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterContext,
@@ -619,9 +688,13 @@ def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterC
     }.items()):
         conn.rollback()
         return False
-    scope = _scope(conn, controller.profile)
-    projection_allowed = bool(scope and scope["state"] == "active" and
-                              scope["legacy_exclusion_proof_state"] == "proven")
+    scope = _scope(conn, controller.profile, controller.board_scope_id)
+    try:
+        aged = parse_aged_ready_config(config or {})
+    except ValueError:
+        aged = None
+    projection_allowed = bool(scope and aged and _projection_proven(
+        conn, scope, now=now, stale_after_seconds=aged["controller_stale_seconds"], config=aged))
     for decision in decisions:
         task_id = str(decision["task_id"])
         duplicate = conn.execute(
@@ -646,17 +719,17 @@ def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterC
                           activation_epoch=controller.activation_epoch, tick_id=attempt["tick_id"],
                           min_age_seconds=controller.min_age_seconds,
                           min_eligible_misses=controller.min_eligible_misses, commit=False)
-            if observed.get("episode_id") and config:
-                aged = config.get("aged_ready", config)
-                bindings = aged.get("resolver_bindings", {}).get(controller.profile, {}) if isinstance(aged, Mapping) else {}
+            if observed.get("episode_id") and aged:
+                bindings = aged["resolver_bindings"].get(controller.profile, {})
                 project_escalation_intents(
                     conn, observed["episode_id"], bindings=bindings,
-                    owner_retry_seconds=tuple(aged.get("owner_retry_seconds", (300, 900, 3600))),
-                    manager_retry_seconds=tuple(aged.get("manager_retry_seconds", (900, 3600))), now=now,
+                    owner_retry_seconds=aged["owner_retry_seconds"], manager_retry_seconds=aged["manager_retry_seconds"], now=now,
                 )
         except Exception:
             conn.rollback()
             raise
+    for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'").fetchall():
+        reconcile_truthful_hold(conn, episode["task_id"], now=now)
     conn.execute("UPDATE kanban_dispatch_attempts SET state='complete', completed_at=?, decision_count=? WHERE id=?",
                  (now, len(decisions), attempt_id))
     conn.commit()
@@ -809,6 +882,8 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
     routing = int(episode["routing_generation"] or 0) + (1 if old and old != digest else 0)
     if old and old != digest:
         conn.execute("UPDATE kanban_ready_escalation_intents SET state='superseded' WHERE episode_id=? AND state IN ('due','planned')", (episode_id,))
+        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_resolver_changed', ?, ? FROM kanban_ready_episodes WHERE id=?",
+                     (json.dumps({"episode_id": episode_id, "routing_generation": routing}), now, episode_id))
     conn.execute("UPDATE kanban_ready_episodes SET resolver_stage='owner', routing_generation=?, authority_set_digest=? WHERE id=?",
                  (routing, digest, episode_id))
     schedule = [("owner", i + 1, 0 if i == 0 else delay, "due" if i == 0 else "planned")
@@ -820,7 +895,7 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
                      (f"intent_{secrets.token_hex(10)}", episode_id, routing, stage, ordinal, now + delay, state, digest))
     conn.execute("UPDATE kanban_ready_episodes SET intent_count=(SELECT COUNT(*) FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=?) WHERE id=?", (episode_id, routing, episode_id))
     if not old or old != digest:
-        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_intents_projected', ?, ? FROM kanban_ready_episodes WHERE id=?",
+        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_intent_due', ?, ? FROM kanban_ready_episodes WHERE id=?",
                      (json.dumps({"episode_id": episode_id, "routing_generation": routing}), now, episode_id))
     rows = conn.execute("SELECT stage,ordinal,scheduled_at,state FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=? ORDER BY CASE stage WHEN 'owner' THEN 0 ELSE 1 END, ordinal", (episode_id, routing)).fetchall()
     return {"episode_id": episode_id, "routing_generation": routing, "resolver_stage": "owner", "resolver_digest": digest,
@@ -888,11 +963,16 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
                           config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     ensure_schema(conn)
     now = int(time.time()) if now is None else int(now)
+    try:
+        config = parse_aged_ready_config(config or {})
+    except ValueError:
+        config = None
     cards = []
     for row in conn.execute("SELECT * FROM kanban_ready_state ORDER BY task_id"):
         fresh = now - int(row["last_observed_at"]) <= stale_after_seconds
         episode = conn.execute("SELECT state,outcome,resolver_stage,routing_generation FROM kanban_ready_episodes WHERE id=?", (row["episode_id"],)).fetchone() if row["episode_id"] else None
         cards.append({"task_id": row["task_id"], "ready_generation": row["ready_generation"],
+                      "run_generation": row["run_generation"],
                       "ready_age_seconds": max(0, now - row["ready_since"]) if row["ready_since"] is not None else None,
                       "decision": row["decision"], "guard_reason": row["guard_reason"],
                       "guard_fingerprint": row["guard_fingerprint"], "eligible_miss_count": row["eligible_miss_count"],
@@ -900,7 +980,8 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
                       "resolver_stage": episode["resolver_stage"] if episode else None,
                       "routing_generation": episode["routing_generation"] if episode else None,
                       "controller_digest": row["controller_ref_digest"], "controller_generation": row["controller_generation"],
-                      "profile": row["profile"], "freshness": "FRESH" if fresh else "UNKNOWN"})
+                      "profile": row["profile"], "freshness": "FRESH" if fresh else "UNKNOWN",
+                      "cap": "UNKNOWN", "eligible_count": row["eligible_miss_count"], "suppressed_count": "UNKNOWN"})
     scopes = conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL").fetchall()
     profiles = []
     for scope in scopes:
@@ -910,8 +991,8 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
         ).fetchall()
         fresh = [row for row in observations if now - int(row["last_seen_at"]) <= stale_after_seconds]
         states = {row["state"] for row in fresh}
-        proven = _projection_proven(conn, scope, now=now,
-                                    stale_after_seconds=stale_after_seconds, config=config)
+        proven = bool(config and _projection_proven(conn, scope, now=now,
+                                    stale_after_seconds=config["controller_stale_seconds"], config=config))
         conflicting_generations = len({row["controller_generation"] for row in fresh}) > 1
         if conflicting_generations:
             state = "CONFLICT"
@@ -922,10 +1003,23 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
         else:
             state = "FRESH"
         running = (conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' AND assignee=?", (scope["profile"],)).fetchone()[0]
-                   if proven else None)
+                   if proven else "UNKNOWN")
         ready = (conn.execute("SELECT COUNT(*) FROM tasks WHERE status='ready' AND assignee=?", (scope["profile"],)).fetchone()[0]
-                 if proven else None)
+                 if proven else "UNKNOWN")
+        eligible = (conn.execute("SELECT COUNT(*) FROM kanban_ready_state WHERE profile=? AND decision='eligible_missed'", (scope["profile"],)).fetchone()[0]
+                    if proven else "UNKNOWN")
+        suppressed = (ready - eligible if isinstance(ready, int) else "UNKNOWN")
+        cap = (config.get("profile_cap", "UNKNOWN") if proven and config else "UNKNOWN")
         profiles.append({"profile": scope["profile"], "running_wip": running, "ready_count": ready,
+                         "eligible_count": eligible, "suppressed_count": suppressed, "cap": cap,
+                         "run_generation": max((int(row["controller_generation"] is not None) for row in fresh), default="UNKNOWN"),
                          "controller_digests": sorted({row["writer_ref_digest"] for row in fresh}), "state": state})
     activation = "OFF" if not scopes else ("UNKNOWN" if any(p["state"] != "FRESH" for p in profiles) else "FRESH")
-    return {"cards": cards, "activation": activation, "profiles": profiles, "owners": [], "read_only": True}
+    owners = []
+    for row in conn.execute("SELECT COALESCE(assignee, '') AS owner, COUNT(*) AS total FROM tasks GROUP BY COALESCE(assignee, '')"):
+        owners.append({"owner": row["owner"] or "UNKNOWN", "total": row["total"] if activation == "FRESH" else "UNKNOWN",
+                       "eligible_count": "UNKNOWN" if activation != "FRESH" else row["total"], "suppressed_count": "UNKNOWN"})
+    return {"cards": cards, "activation": activation, "profiles": profiles, "owners": owners,
+            "eligible_count": sum(p["eligible_count"] for p in profiles if isinstance(p["eligible_count"], int)) if activation == "FRESH" else "UNKNOWN",
+            "suppressed_count": sum(p["suppressed_count"] for p in profiles if isinstance(p["suppressed_count"], int)) if activation == "FRESH" else "UNKNOWN",
+            "cap": "UNKNOWN", "run_generation": "UNKNOWN", "read_only": True}

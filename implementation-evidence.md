@@ -73,3 +73,19 @@ Exact head before publication: `ed825791e89e6db4e7380d45e94ea55d001bf726` (tree 
 - Final non-generated diff count: `1,409` additions plus deletions, below the reviewed `2,400` ceiling.
 
 Activation remains OFF/pending/UNKNOWN. No install, restart, deployment, delivery, acknowledgement, alert, escalation, WIP display, Office change, credential change, or real-board mutation was performed.
+
+## Final bounded correction verification
+
+The correction reuses the projection's complete fail-closed predicate for tick recording, validates
+aged-Ready configuration strictly, keeps incomplete public numeric facts `UNKNOWN`, supports
+partition-specific runtime contexts, composes truthful-hold closure in the recorder transaction, and
+emits `aged_ready_resolver_changed`, `aged_ready_intent_due`, and `aged_ready_diagnostic`.
+
+Final-head evidence commands (run after the final commit):
+
+- `git rev-parse HEAD`
+- `git diff main...HEAD --numstat | awk '{a+=$1; d+=$2} END {print a+d}'` (must remain <= 2400)
+- `git diff --check`
+- `python scripts/check` → exit 0 (17 checks)
+- `scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py tests/hermes_cli/test_kanban_per_profile_cap.py tests/hermes_cli/test_kanban_host_cap.py tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_dispatch_tick_hook.py` → exit 0 (54 passed)
+- `scripts/run_tests.sh -j 1 tests/plugins/test_kanban_dashboard_plugin.py` → exit 0 (38 passed)

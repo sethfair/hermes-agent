@@ -164,9 +164,11 @@ def test_tick_ledger_replay_does_not_increment_or_duplicate_episode():
     attempt = monitor.begin_dispatch_attempt(conn, controller=ctx, surface="standalone", now=200)
     decision = {"task_id": task_id, "decision": "eligible_missed", "min_age_seconds": 0, "min_eligible_misses": 1}
     assert monitor.record_dispatch_tick(conn, controller=ctx, attempt_id=attempt["id"], decisions=[decision], now=200)
-    assert conn.execute("SELECT eligible_miss_count FROM kanban_ready_state WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+    # Without a complete roster/heartbeat/attempt proof the recorder must not
+    # advance the durable miss counter, even when the dispatcher said eligible.
+    assert conn.execute("SELECT eligible_miss_count FROM kanban_ready_state WHERE task_id=?", (task_id,)).fetchone()[0] == 0
     assert monitor.record_dispatch_tick(conn, controller=ctx, attempt_id=attempt["id"], decisions=[decision], now=201) is False
-    assert conn.execute("SELECT eligible_miss_count FROM kanban_ready_state WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+    assert conn.execute("SELECT eligible_miss_count FROM kanban_ready_state WHERE task_id=?", (task_id,)).fetchone()[0] == 0
 
 
 def test_native_claim_closes_episode_and_review_claim_does_not():
@@ -202,6 +204,7 @@ def test_resolver_schedule_is_bounded_and_redacted():
     assert [row["state"] for row in complete["intents"]].count("due") == 1
     assert all(row["state"] == "planned" for row in complete["intents"][1:])
     assert "owner_id" not in repr(complete)
+    assert {row[0] for row in conn.execute("SELECT kind FROM task_events")} == {"aged_ready_diagnostic", "aged_ready_intent_due"}
     assert conn.execute("SELECT COUNT(*) FROM kanban_ready_episodes").fetchone()[0] == 1
 
 
@@ -250,3 +253,38 @@ def test_writer_context_requires_unique_configured_member_and_exact_partition():
     assert monitor.validate_writer_context(conn, bad, config) == "incompatible_writer_context"
     bad_config = {**config, "dispatch_profiles": ["p1", "p2"]}
     assert monitor.validate_writer_context(conn, ctx, bad_config) == "writer_scope_incomplete"
+
+
+def test_aged_ready_parser_is_strict_about_types_bounds_and_roster_shape():
+    valid = {"aged_ready": {"min_age_seconds": 1, "min_eligible_misses": 1,
+                            "controller_stale_seconds": 1, "owner_retry_seconds": [0],
+                            "manager_retry_seconds": [0], "expected_writer_scopes": {},
+                            "resolver_bindings": {}}}
+    parsed = monitor.parse_aged_ready_config(valid)
+    assert parsed["min_age_seconds"] == 1
+    for bad in ({"aged_ready": {"surprise": 1}},
+                {"aged_ready": {"min_age_seconds": True}},
+                {"aged_ready": {"owner_retry_seconds": [2, 1]}},
+                {"aged_ready": {"expected_writer_scopes": []}}):
+        try:
+            monitor.parse_aged_ready_config(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("malformed aged_ready config was accepted")
+
+
+def test_public_health_marks_numeric_scope_facts_unknown_when_roster_is_incomplete():
+    conn = _db()
+    task_id = "public-unknown"
+    conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES(?,?,?,?)", (task_id, "T", "ready", 1))
+    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
+                 (task_id, "created", '{"status":"ready"}', 1))
+    monitor.observe_ready(conn, task_id, now=2, activation_epoch="disabled")
+    monitor.activate_scope(conn, profile="p1", state="active")
+    health = monitor.ready_health_snapshot(conn, config={"aged_ready": {}})
+    profile = health["profiles"][0]
+    assert profile["state"] == "UNKNOWN"
+    assert profile["running_wip"] == profile["ready_count"] == profile["eligible_count"] == "UNKNOWN"
+    assert profile["cap"] == "UNKNOWN"
+    assert health["owners"] and health["owners"][0]["total"] == "UNKNOWN"

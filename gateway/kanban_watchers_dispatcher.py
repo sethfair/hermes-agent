@@ -143,8 +143,6 @@ class _KanbanDispatcher:
             "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
             "AND state IN ('pending','active','faulted') ORDER BY id"
         ).fetchall()
-        if len(scopes) > 1:
-            return None
         scope = scopes[0] if scopes else None
         if scope is None:
             return None
@@ -160,7 +158,10 @@ class _KanbanDispatcher:
             configured_id = ""
         revision = info.commit or info.base_version
         profile = scope["profile"]
-        aged = (cfg.get("aged_ready") or {}) if isinstance(cfg, dict) else {}
+        try:
+            aged = monitor.parse_aged_ready_config(cfg.get("aged_ready") or {}) if isinstance(cfg, dict) else {}
+        except ValueError:
+            return None
         aged_profiles = aged.get("dispatch_profiles", cfg.get("dispatch_profiles", ()))
         dispatch_profiles = tuple(sorted({str(item).strip() for item in aged_profiles or () if str(item).strip()}))
         if not dispatch_profiles:
