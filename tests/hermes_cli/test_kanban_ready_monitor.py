@@ -200,7 +200,7 @@ def test_resolver_schedule_is_bounded_and_redacted():
     conn.execute("INSERT INTO kanban_ready_episodes(id,task_id,ready_generation,opened_at,first_observed_at,last_observed_at) VALUES(?,?,?,?,?,?)", ("ep-r", "task", 1, 10, 10, 10))
     missing = monitor.project_escalation_intents(conn, "ep-r", bindings={})
     assert missing["diagnostic"] == "resolver_missing"
-    complete = monitor.project_escalation_intents(conn, "ep-r", bindings={"owner_id": "owner", "manager_id": "manager", "ack_authority_id": "ack"}, owner_retry_seconds=(10, 20), manager_retry_seconds=(30,))
+    complete = monitor.project_escalation_intents(conn, "ep-r", bindings={"owner_ref": "owner", "manager_ref": "manager", "acknowledgement_authority_refs": ["ack"]}, owner_retry_seconds=(10, 20), manager_retry_seconds=(30,))
     assert [row["state"] for row in complete["intents"]].count("due") == 1
     assert all(row["state"] == "planned" for row in complete["intents"][1:])
     assert "owner_id" not in repr(complete)
@@ -257,14 +257,16 @@ def test_writer_context_requires_unique_configured_member_and_exact_partition():
 
 def test_aged_ready_parser_is_strict_about_types_bounds_and_roster_shape():
     valid = {"aged_ready": {"min_age_seconds": 1, "min_eligible_misses": 1,
-                            "controller_stale_seconds": 1, "owner_retry_seconds": [0],
-                            "manager_retry_seconds": [0], "expected_writer_scopes": {},
+                            "controller_stale_seconds": 1, "owner_retry_seconds": [1],
+                            "manager_retry_seconds": [1], "expected_writer_scopes": {},
                             "resolver_bindings": {}}}
     parsed = monitor.parse_aged_ready_config(valid)
     assert parsed["min_age_seconds"] == 1
     for bad in ({"aged_ready": {"surprise": 1}},
                 {"aged_ready": {"min_age_seconds": True}},
                 {"aged_ready": {"owner_retry_seconds": [2, 1]}},
+                {"aged_ready": {"owner_retry_seconds": [0]}},
+                {"aged_ready": {"resolver_bindings": {"p": {"owner_ref": "o"}}}},
                 {"aged_ready": {"expected_writer_scopes": []}}):
         try:
             monitor.parse_aged_ready_config(bad)
@@ -288,3 +290,20 @@ def test_public_health_marks_numeric_scope_facts_unknown_when_roster_is_incomple
     assert profile["running_wip"] == profile["ready_count"] == profile["eligible_count"] == "UNKNOWN"
     assert profile["cap"] == "UNKNOWN"
     assert health["owners"] and health["owners"][0]["total"] == "UNKNOWN"
+    card = health["cards"][0]
+    assert all(card[key] == "UNKNOWN" for key in ("ready_age_seconds", "eligible_miss_count", "eligible_count", "freshness"))
+
+
+def test_complete_roster_provisionally_admits_current_tick_and_advances_episode():
+    conn = _db(); task_id = "complete-roster"
+    conn.execute("INSERT INTO tasks(id,title,status,created_at,assignee) VALUES(?,?,?,?,?)", (task_id, "T", "ready", 1, "p1"))
+    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)", (task_id, "created", '{"status":"ready"}', 1))
+    writer = str(uuid.uuid4()); generation = str(uuid.uuid4())
+    scope = monitor.activate_scope(conn, profile="p1", state="active", legacy_exclusion_proof_state="proven", roster_generation=generation, roster_digest="rd")
+    ctx = monitor.MonitorWriterContext(scope["board_scope_id"], "p1", writer, "boot", scope["activation_epoch"], generation, "rd", "rev", 1, monitor.COMPATIBILITY_IDENTITY, "", ("p1",), 1, 1)
+    config = {"aged_ready": {"controller_id": writer, "dispatch_profiles": ["p1"], "expected_writer_scopes": {scope["board_scope_id"]: {"roster_generation": generation, "members": [{"writer_ref": writer, "profiles": ["p1"], "protocol_version": 1, "compatible_revisions": [monitor.COMPATIBILITY_IDENTITY]}]}}}}
+    tick = ctx.for_tick(); monitor.publish_controller_observation(conn, controller=tick)
+    attempt = monitor.begin_dispatch_attempt(conn, controller=tick, surface="test", config=config, now=10)
+    assert monitor.record_dispatch_tick(conn, controller=tick, attempt_id=attempt["id"], decisions=[{"task_id": task_id, "decision": "eligible_missed"}], config=config, now=10)
+    state = conn.execute("SELECT eligible_miss_count,episode_id FROM kanban_ready_state WHERE task_id=?", (task_id,)).fetchone()
+    assert state["eligible_miss_count"] == 1 and state["episode_id"]

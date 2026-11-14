@@ -82,7 +82,7 @@ def _strict_int(value: Any, name: str, *, minimum: int, maximum: int = 2_147_483
 def _retry_list(value: Any, name: str) -> tuple[int, ...]:
     if not isinstance(value, list) or not value or len(value) > 8:
         raise ValueError(f"invalid aged_ready {name}")
-    result = tuple(_strict_int(item, name, minimum=0, maximum=86_400) for item in value)
+    result = tuple(_strict_int(item, name, minimum=1, maximum=86_400) for item in value)
     if tuple(sorted(set(result))) != result:
         raise ValueError(f"invalid aged_ready {name}")
     return result
@@ -112,7 +112,20 @@ def parse_aged_ready_config(value: Any) -> dict[str, Any]:
     bindings = result.get("resolver_bindings", {})
     if not isinstance(bindings, Mapping) or any(not isinstance(v, Mapping) for v in bindings.values()):
         raise ValueError("invalid aged_ready resolver_bindings")
-    result["resolver_bindings"] = {str(k): dict(v) for k, v in bindings.items()}
+    parsed_bindings = {}
+    for profile, raw in bindings.items():
+        if set(raw) != {"owner_ref", "manager_ref", "acknowledgement_authority_refs"}:
+            raise ValueError("invalid aged_ready resolver_bindings")
+        if any(not isinstance(raw[key], str) or not raw[key].strip() for key in ("owner_ref", "manager_ref")):
+            raise ValueError("invalid aged_ready resolver_bindings")
+        refs = raw["acknowledgement_authority_refs"]
+        if (not isinstance(refs, list) or not refs
+                or any(not isinstance(ref, str) or not ref.strip() for ref in refs)
+                or len(set(refs)) != len(refs)):
+            raise ValueError("invalid aged_ready resolver_bindings")
+        parsed_bindings[str(profile)] = {"owner_ref": raw["owner_ref"], "manager_ref": raw["manager_ref"],
+                                         "acknowledgement_authority_refs": tuple(refs)}
+    result["resolver_bindings"] = parsed_bindings
     return result
 
 
@@ -152,10 +165,16 @@ def _manual_import_ready(value: Any) -> bool:
     return bool(data and data.get("parked") is False)
 
 
+def _manual_promotion_ready(value: Any) -> bool:
+    data = _payload(value)
+    return bool(data and isinstance(data.get("actor"), str) and data["actor"].strip()
+                and "reason" in data)
+
+
 READY_ENTRY_CLASSIFIERS: dict[str, ReadyEntryClassifier] = {
     "created": ReadyEntryClassifier("created", lambda p: _payload(p) is not None and _payload(p).get("status") == "ready"),
     "promoted": ReadyEntryClassifier("promoted", _absent_or_ready),
-    "promoted_manual": ReadyEntryClassifier("promoted_manual", _absent_or_ready),
+    "promoted_manual": ReadyEntryClassifier("promoted_manual", _manual_promotion_ready),
     "unblocked": ReadyEntryClassifier("unblocked", _absent_or_ready),
     "changes_requested": ReadyEntryClassifier("changes_requested", lambda p: _payload(p) is not None and _payload(p).get("status") == "ready"),
     "review_reopened": ReadyEntryClassifier("review_reopened", _absent_or_ready),
@@ -397,7 +416,9 @@ def parse_expected_writer_scopes(value: Any) -> dict[str, dict[str, Any]]:
             except (TypeError, ValueError) as exc:
                 raise ValueError("invalid writer protocol") from exc
             compatible = member.get("compatible_revisions")
-            if protocol != PROTOCOL_VERSION or not isinstance(compatible, list) or not compatible:
+            if (protocol != PROTOCOL_VERSION or not isinstance(compatible, list) or not compatible
+                    or any(not isinstance(item, str) or not item.strip() for item in compatible)
+                    or len(set(compatible)) != len(compatible)):
                 raise ValueError("invalid writer compatibility")
             refs.add(str(member["writer_ref"])); profiles.update(member_profiles)
             canonical.append({"writer_ref": str(member["writer_ref"]), "profiles": member_profiles,
@@ -607,9 +628,13 @@ def has_protected_scope(conn: sqlite3.Connection) -> bool:
     ).fetchone() is not None
 
 
-def ensure_ready_decisions(conn: sqlite3.Connection, result: Any, reason: str) -> None:
+def ensure_ready_decisions(conn: sqlite3.Connection, result: Any, reason: str, profile: str | None = None) -> None:
     seen = {entry["task_id"] for entry in result.monitor_decisions}
-    for row in conn.execute("SELECT id, assignee FROM tasks WHERE status='ready' AND claim_lock IS NULL"):
+    sql = "SELECT id, assignee FROM tasks WHERE status='ready' AND claim_lock IS NULL"
+    args = ()
+    if profile is not None:
+        sql += " AND assignee=?"; args = (profile,)
+    for row in conn.execute(sql, args):
         if row["id"] not in seen:
             result.monitor_decisions.append({"task_id": row["id"], "decision": "unassigned" if not row["assignee"] else reason})
 
@@ -694,7 +719,8 @@ def record_dispatch_tick(conn: sqlite3.Connection, *, controller: MonitorWriterC
     except ValueError:
         aged = None
     projection_allowed = bool(scope and aged and _projection_proven(
-        conn, scope, now=now, stale_after_seconds=aged["controller_stale_seconds"], config=aged))
+        conn, scope, now=now, stale_after_seconds=aged["controller_stale_seconds"], config=aged,
+        current_attempt_id=attempt_id))
     for decision in decisions:
         task_id = str(decision["task_id"])
         duplicate = conn.execute(
@@ -867,10 +893,10 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
     if not episode or episode["state"] != "open":
         return {"episode_id": episode_id, "state": "closed", "intents": []}
     binding = dict(bindings or {})
-    missing = next((key for key in ("owner_id", "manager_id", "ack_authority_id") if not binding.get(key)), None)
+    missing = next((key for key in ("owner_ref", "manager_ref", "acknowledgement_authority_refs") if not binding.get(key)), None)
     if missing:
-        code = {"owner_id": "resolver_missing", "manager_id": "manager_missing",
-                "ack_authority_id": "ack_authority_missing"}[missing]
+        code = {"owner_ref": "resolver_missing", "manager_ref": "manager_missing",
+                "acknowledgement_authority_refs": "ack_authority_missing"}[missing]
         changed = conn.execute("UPDATE kanban_ready_episodes SET resolver_stage=?, outcome=? WHERE id=? AND (resolver_stage != ? OR outcome IS NOT ?)",
                                ("unavailable", code, episode_id, "unavailable", code)).rowcount
         if changed:
@@ -880,10 +906,12 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
     digest = _binding_digest(binding)
     old = episode["authority_set_digest"] if "authority_set_digest" in episode.keys() else None
     routing = int(episode["routing_generation"] or 0) + (1 if old and old != digest else 0)
+    prior_stage = episode["resolver_stage"] or "unavailable"
     if old and old != digest:
         conn.execute("UPDATE kanban_ready_escalation_intents SET state='superseded' WHERE episode_id=? AND state IN ('due','planned')", (episode_id,))
         conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_resolver_changed', ?, ? FROM kanban_ready_episodes WHERE id=?",
-                     (json.dumps({"episode_id": episode_id, "routing_generation": routing}), now, episode_id))
+                     (json.dumps({"episode_id": episode_id, "routing_generation": routing, "from_stage": prior_stage,
+                                  "to_stage": "owner", "resolver_digest": digest}), now, episode_id))
     conn.execute("UPDATE kanban_ready_episodes SET resolver_stage='owner', routing_generation=?, authority_set_digest=? WHERE id=?",
                  (routing, digest, episode_id))
     schedule = [("owner", i + 1, 0 if i == 0 else delay, "due" if i == 0 else "planned")
@@ -891,19 +919,24 @@ def project_escalation_intents(conn: sqlite3.Connection, episode_id: str, *, bin
     schedule += [("manager", i + 1, delay, "planned") for i, delay in enumerate(manager_retry_seconds)]
     for stage, ordinal, delay, state in schedule:
         conn.execute("INSERT OR IGNORE INTO kanban_ready_escalation_intents "
-                     "(id,episode_id,routing_generation,stage,ordinal,scheduled_at,state,authority_set_digest) VALUES(?,?,?,?,?,?,?,?)",
-                     (f"intent_{secrets.token_hex(10)}", episode_id, routing, stage, ordinal, now + delay, state, digest))
+                     "(id,episode_id,routing_generation,stage,ordinal,scheduled_at,state,resolver_ref_digest,authority_set_digest) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (f"intent_{secrets.token_hex(10)}", episode_id, routing, stage, ordinal, now + delay, state,
+                      _digest(str(binding["owner_ref" if stage == "owner" else "manager_ref"])), digest))
     conn.execute("UPDATE kanban_ready_episodes SET intent_count=(SELECT COUNT(*) FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=?) WHERE id=?", (episode_id, routing, episode_id))
     if not old or old != digest:
-        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_intent_due', ?, ? FROM kanban_ready_episodes WHERE id=?",
-                     (json.dumps({"episode_id": episode_id, "routing_generation": routing}), now, episode_id))
+        for row in conn.execute("SELECT id,stage,ordinal,resolver_ref_digest FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=?", (episode_id, routing)):
+            conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT task_id, 'aged_ready_intent_due', ?, ? FROM kanban_ready_episodes WHERE id=?",
+                         (json.dumps({"episode_id": episode_id, "intent_id": row["id"], "from_stage": prior_stage,
+                                      "to_stage": row["stage"], "ordinal": row["ordinal"],
+                                      "resolver_digest": row["resolver_ref_digest"], "authority_digest": digest}), now, episode_id))
     rows = conn.execute("SELECT stage,ordinal,scheduled_at,state FROM kanban_ready_escalation_intents WHERE episode_id=? AND routing_generation=? ORDER BY CASE stage WHEN 'owner' THEN 0 ELSE 1 END, ordinal", (episode_id, routing)).fetchall()
     return {"episode_id": episode_id, "routing_generation": routing, "resolver_stage": "owner", "resolver_digest": digest,
             "intents": [dict(row) for row in rows]}
 
 
 def _projection_proven(conn: sqlite3.Connection, scope: sqlite3.Row, *, now: int,
-                       stale_after_seconds: int, config: Mapping[str, Any] | None) -> bool:
+                       stale_after_seconds: int, config: Mapping[str, Any] | None,
+                       current_attempt_id: str | None = None) -> bool:
     if not config or scope["state"] != "active" or scope["legacy_exclusion_proof_state"] != "proven":
         return False
     aged = config.get("aged_ready", config)
@@ -936,15 +969,15 @@ def _projection_proven(conn: sqlite3.Connection, scope: sqlite3.Row, *, now: int
     ).fetchone():
         return False
     attempts = conn.execute(
-        "SELECT writer_ref_digest, controller_generation, state FROM kanban_dispatch_attempts "
+        "SELECT id, writer_ref_digest, controller_generation, state FROM kanban_dispatch_attempts "
         "WHERE board_scope_id=? AND profile=? AND activation_epoch=?",
         (scope["board_scope_id"], scope["profile"], scope["activation_epoch"]),
     ).fetchall()
-    if any(row["state"] in ("open", "aborted") for row in attempts):
+    if any(row["state"] in ("open", "aborted") and row["id"] != current_attempt_id for row in attempts):
         return False
     fresh_pairs = {(row["writer_ref_digest"], row["controller_generation"]) for row in fresh}
     admitted = {(row["writer_ref_digest"], row["controller_generation"])
-                for row in attempts if row["state"] == "complete"}
+                for row in attempts if row["state"] == "complete" or row["id"] == current_attempt_id}
     if not fresh_pairs <= admitted or {writer for writer, _generation in fresh_pairs} != expected_digests:
         return False
     # Every protected running card must carry a live admission correlated to
@@ -968,20 +1001,26 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
     except ValueError:
         config = None
     cards = []
+    proven_profiles = {scope["profile"] for scope in conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL")
+                       if config and _projection_proven(conn, scope, now=now, stale_after_seconds=config["controller_stale_seconds"], config=config)}
     for row in conn.execute("SELECT * FROM kanban_ready_state ORDER BY task_id"):
         fresh = now - int(row["last_observed_at"]) <= stale_after_seconds
+        known = row["profile"] in proven_profiles
         episode = conn.execute("SELECT state,outcome,resolver_stage,routing_generation FROM kanban_ready_episodes WHERE id=?", (row["episode_id"],)).fetchone() if row["episode_id"] else None
         cards.append({"task_id": row["task_id"], "ready_generation": row["ready_generation"],
                       "run_generation": row["run_generation"],
-                      "ready_age_seconds": max(0, now - row["ready_since"]) if row["ready_since"] is not None else None,
+                      "ready_age_seconds": max(0, now - row["ready_since"]) if known and row["ready_since"] is not None else "UNKNOWN",
                       "decision": row["decision"], "guard_reason": row["guard_reason"],
                       "guard_fingerprint": row["guard_fingerprint"], "eligible_miss_count": row["eligible_miss_count"],
                       "episode_state": episode["state"] if episode else None, "episode_outcome": episode["outcome"] if episode else None,
                       "resolver_stage": episode["resolver_stage"] if episode else None,
                       "routing_generation": episode["routing_generation"] if episode else None,
-                      "controller_digest": row["controller_ref_digest"], "controller_generation": row["controller_generation"],
-                      "profile": row["profile"], "freshness": "FRESH" if fresh else "UNKNOWN",
-                      "cap": "UNKNOWN", "eligible_count": row["eligible_miss_count"], "suppressed_count": "UNKNOWN"})
+                      "controller_digest": row["controller_ref_digest"] if known else "UNKNOWN",
+                      "controller_generation": row["controller_generation"] if known else "UNKNOWN",
+                      "profile": row["profile"], "freshness": "FRESH" if known and fresh else "UNKNOWN",
+                      "cap": "UNKNOWN", "eligible_count": row["eligible_miss_count"] if known else "UNKNOWN",
+                      "eligible_miss_count": row["eligible_miss_count"] if known else "UNKNOWN",
+                      "suppressed_count": "UNKNOWN"})
     scopes = conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL").fetchall()
     profiles = []
     for scope in scopes:
@@ -1016,9 +1055,11 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
                          "controller_digests": sorted({row["writer_ref_digest"] for row in fresh}), "state": state})
     activation = "OFF" if not scopes else ("UNKNOWN" if any(p["state"] != "FRESH" for p in profiles) else "FRESH")
     owners = []
-    for row in conn.execute("SELECT COALESCE(assignee, '') AS owner, COUNT(*) AS total FROM tasks GROUP BY COALESCE(assignee, '')"):
+    for row in conn.execute("SELECT resolver_ref_digest AS owner, COUNT(*) AS total FROM kanban_ready_escalation_intents WHERE stage='owner' GROUP BY resolver_ref_digest"):
         owners.append({"owner": row["owner"] or "UNKNOWN", "total": row["total"] if activation == "FRESH" else "UNKNOWN",
-                       "eligible_count": "UNKNOWN" if activation != "FRESH" else row["total"], "suppressed_count": "UNKNOWN"})
+                       "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"})
+    if not owners and activation != "FRESH":
+        owners.append({"owner": "UNKNOWN", "total": "UNKNOWN", "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"})
     return {"cards": cards, "activation": activation, "profiles": profiles, "owners": owners,
             "eligible_count": sum(p["eligible_count"] for p in profiles if isinstance(p["eligible_count"], int)) if activation == "FRESH" else "UNKNOWN",
             "suppressed_count": sum(p["suppressed_count"] for p in profiles if isinstance(p["suppressed_count"], int)) if activation == "FRESH" else "UNKNOWN",

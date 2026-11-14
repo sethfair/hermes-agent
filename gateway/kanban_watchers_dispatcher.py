@@ -241,9 +241,10 @@ class _KanbanDispatcher:
             # HERMES_KANBAN_DB every enumerated slug must resolve to the pinned
             # file, or the dispatcher reads per-slug DBs nobody writes.
             from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_ready_monitor as monitor
             with _kb.pin_first_board_resolution():
                 conn = _kbc().connect(board=slug)
-                context = self._monitor_context(conn)
+                context = monitor.runtime_contexts(conn, self.writer_ref, self.controller_generation)
                 return _kbd().dispatch_once(conn, board=slug, monitor_context=context, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):

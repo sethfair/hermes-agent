@@ -2007,14 +2007,25 @@ def dispatch_once(
     reconcile_orphans: bool = True,
     monitor_context=None,
 ) -> DispatchResult:
-    """Run one dispatcher tick under the board's single-writer lock.
+    if isinstance(monitor_context, (tuple, list)):
+        merged = DispatchResult()
+        for context in monitor_context:
+            part = dispatch_once(conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+                                 max_spawn=max_spawn, max_in_progress=max_in_progress, failure_limit=failure_limit,
+                                 stale_timeout_seconds=stale_timeout_seconds, board=board,
+                                 default_assignee=default_assignee, max_in_progress_per_profile=max_in_progress_per_profile,
+                                 reconcile_orphans=reconcile_orphans, monitor_context=context)
+            for name in ("reclaimed", "promoted"):
+                setattr(merged, name, getattr(merged, name) + getattr(part, name))
+            for name in ("reconciled_orphans", "reaped_terminal_workers", "spawned", "skipped_unassigned",
+                         "auto_assigned_default", "skipped_nonspawnable", "skipped_per_profile_capped",
+                         "crashed", "auto_blocked", "timed_out", "stale", "respawn_guarded", "rate_limited",
+                         "monitor_decisions"):
+                getattr(merged, name).extend(getattr(part, name))
+            merged.monitor_scope_refused |= part.monitor_scope_refused
+            merged.monitor_attempt_id = part.monitor_attempt_id
+        return merged
 
-    Wraps :func:`_dispatch_once_locked` in the non-blocking :func:`_dispatch_tick_lock`
-    so two dispatchers on one ``kanban.db`` never race a write tick on WAL
-    frames. The loser returns an empty ``DispatchResult`` with
-    ``skipped_locked=True`` and writes nothing; the lock is keyed on the
-    resolved DB path so unrelated boards tick in parallel.
-    """
     def _locked_tick() -> DispatchResult:
         from hermes_cli import kanban_ready_monitor as monitor
         try:
@@ -2060,6 +2071,7 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
             monitor_attempt_id=attempt_id,
             monitor_context=tick_context,
+            monitor_profile=tick_context.profile if tick_context is not None else None,
         )
         if attempt_id is not None:
             monitor.record_dispatch_tick(
@@ -2346,12 +2358,8 @@ def _dispatch_once_locked(
     reconcile_orphans: bool = True,
     monitor_attempt_id: Optional[str] = None,
     monitor_context=None,
+    monitor_profile: Optional[str] = None,
 ) -> DispatchResult:
-    """One dispatcher tick: reclaim stale/crashed running tasks, promote
-    todo -> ready, then atomically claim each spawnable ready/review row and
-    call ``spawn_fn(task, workspace_path, board) -> Optional[int]``, recording
-    the PID so later ticks catch crashes before the TTL. Cap semantics:
-    :func:`_tick_spawn_budget`."""
     result = DispatchResult()
     from hermes_cli import kanban_ready_monitor as monitor
     _run_reclaim_phase(
@@ -2368,17 +2376,16 @@ def _dispatch_once_locked(
             monitor.reconcile_truthful_hold(conn, episode["task_id"])
         monitor.ensure_ready_decisions(
             conn, result, "memory_pressure" if result.memory_pressure else "board_cap",
+            profile=monitor_profile,
         )
         return result
 
     ready_rows = _lane_rows(conn, "ready")
-    # Review rows are enumerated up front so the budget split can see whether
-    # review work exists at all.
+    if monitor_profile is not None:
+        ready_rows = [row for row in ready_rows if row["assignee"] == monitor_profile]
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
-    # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
-    # skipped_unassigned — "busy, retry later" differs from "needs routing".
-    # Resolved BEFORE the review reservation so the reservation can see which
-    # review rows the lane loop would refuse this tick.
+    if monitor_profile is not None:
+        review_rows = [row for row in review_rows if row["assignee"] == monitor_profile]
     per_profile_cap = max_in_progress_per_profile if (
         # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
@@ -2395,10 +2402,6 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
-    # Review-lane reservation: the ready loop runs first and would otherwise
-    # consume the ENTIRE shared budget, starving reviews under a sustained ready
-    # backlog. When spawnable review work exists and there is any budget, hold
-    # one slot back.
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
@@ -2442,7 +2445,7 @@ def _dispatch_once_locked(
             spawned += 1
     for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'"):
         monitor.reconcile_truthful_hold(conn, episode["task_id"])
-    monitor.ensure_ready_decisions(conn, result, "shared_budget_exhausted")
+    monitor.ensure_ready_decisions(conn, result, "shared_budget_exhausted", profile=monitor_profile)
     return result
 
 
@@ -2914,7 +2917,7 @@ def run_daemon(
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
             with contextlib.closing(_kbc.connect()) as conn:
                 from hermes_cli import kanban_ready_monitor as monitor
-                monitor_context = monitor.runtime_context(conn, writer_ref, controller_generation)
+                monitor_context = monitor.runtime_contexts(conn, writer_ref, controller_generation)
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
