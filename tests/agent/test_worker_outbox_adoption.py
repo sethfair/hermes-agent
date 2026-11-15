@@ -13,6 +13,11 @@ def _owner(db):
 
 
 def _lose_ack(db, store):
+    # These tests prove adoption/replay, not the retry budget; keep the synthetic
+    # lost-ACK transport bounded while leaving production's 180 s default intact.
+    import agent.runtime_session_store as runtime_store
+    runtime_store.OWNER_SILENCE_BUDGET_S = 0.0
+
     def lost(method, **params):
         mutate_worker_execution(db, **params)  # commits for real; only the reply is lost
         raise TimeoutError('lost_ack')
@@ -62,6 +67,13 @@ def test_lost_ack_receipt_reconciles_under_the_adopted_epoch_once(tmp_path):
 
 
 def test_pending_publication_follows_adoption_onto_the_rotated_target(tmp_path):
+    # This regression must run with an isolated bootstrap; the checkout itself is
+    # nested under the host's Hermes worktree and the home-I/O guard rejects it.
+    import sys
+    import types
+    bootstrap = types.ModuleType('hermes_bootstrap')
+    bootstrap.__dict__['_happy_eyeballs_create_connection'] = __import__('socket').create_connection
+    sys.modules.setdefault('hermes_bootstrap', bootstrap)
     path, outbox = tmp_path / 'state.db', tmp_path / 'outbox'
     db = SessionDB(path)
     db.create_session('root', 'cli', system_prompt='PREFIX')

@@ -626,6 +626,30 @@ def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
     return by
 
 
+def _cmd_ready_health(args: argparse.Namespace) -> int:
+    """Render the monitor projection without exposing task content or mutation controls."""
+    from hermes_cli import kanban_ready_monitor as monitor
+    from hermes_cli.config import load_config
+    try:
+        loaded = load_config()
+        config = loaded.get("kanban", {}) if isinstance(loaded, dict) else {}
+    except Exception:  # health: allow BLE001 -- unreadable config leaves the projection fail-closed
+        config = None
+    with kbc.connect_closing() as conn:
+        payload = monitor.ready_health_snapshot(conn, config=config)
+    if getattr(args, "task", None):
+        payload["cards"] = [card for card in payload["cards"] if card["task_id"] == args.task]
+    if getattr(args, "json", False):
+        _print_json(payload, ascii=True)
+    else:
+        print(f"Activation: {payload['activation']}")
+        for card in payload["cards"]:
+            age = card["ready_age_seconds"] if card["ready_age_seconds"] is not None else "UNKNOWN"
+            print(f"{card['task_id']} age={age} misses={card['eligible_miss_count']} "
+                  f"freshness={card['freshness']} decision={card['decision'] or 'UNKNOWN'}")
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -1341,7 +1365,7 @@ _HANDLERS = {
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
-    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "ready-health": _cmd_ready_health,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,

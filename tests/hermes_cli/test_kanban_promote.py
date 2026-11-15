@@ -61,6 +61,8 @@ def test_promote_stuck_todo_succeeds(conn):
     ok, err = kb.promote_task(conn, child, actor="tester")
     assert ok and err is None
     assert kb.get_task(conn, child).status == "ready"
+    event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='promoted_manual'", (child,)).fetchone()
+    assert event and event[0] == '{"actor": "tester", "reason": null}'
 
 
 def test_promote_refuses_undone_parent_and_names_the_real_remedy(conn):
