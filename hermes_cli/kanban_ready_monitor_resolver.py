@@ -34,6 +34,7 @@ def host_wip_census(conn: sqlite3.Connection, config: Mapping[str, Any], *, now:
 
     expected = config.get("expected_writer_scopes", {})
     pending = set(expected)
+    seen = set()
     census = []
 
     def collect(board_conn: sqlite3.Connection) -> None:
@@ -41,7 +42,12 @@ def host_wip_census(conn: sqlite3.Connection, config: Mapping[str, Any], *, now:
             "SELECT board_scope_id FROM kanban_board_identity WHERE singleton=1"
         ).fetchone()
         board = identity[0] if identity else None
-        if board not in pending:
+        if board in seen: return
+        seen.add(board)
+        if board not in expected:
+            profiles = set(config["dispatch_profiles"])
+            census.append((board, {}, {p: 0 for p in profiles}, {p: False for p in profiles},
+                           {p: ("unmapped_board",) for p in profiles}))
             return
         profiles = {str(profile) for member in expected[board]["members"]
                     for profile in member["profiles"]}
@@ -74,6 +80,10 @@ def host_wip_census(conn: sqlite3.Connection, config: Mapping[str, Any], *, now:
             finally:
                 other.close()
         except (OSError, sqlite3.Error):
+            if path.exists():
+                profiles = set(config["dispatch_profiles"])
+                census.append((None, {}, {p: 0 for p in profiles}, {p: False for p in profiles},
+                               {p: ("unreadable_board",) for p in profiles}))
             continue
     for board in sorted(pending):
         profiles = {str(profile) for member in expected[board]["members"] for profile in member["profiles"]}
