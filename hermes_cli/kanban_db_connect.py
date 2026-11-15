@@ -783,8 +783,11 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _kb.ensure_board_identity_schema(conn)
+                _migrate_add_optional_columns(
+                    conn,
+                    identity_board=_trusted_board_for_path(path, board) or _kb.DEFAULT_BOARD,
+                )
                 _bind_action_receipt_board(conn, path, board)
-                _migrate_add_optional_columns(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -967,7 +970,9 @@ def _bind_action_receipt_board(
         )
 
 
-def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+def _migrate_add_optional_columns(
+    conn: sqlite3.Connection, *, identity_board: str = "default",
+) -> None:
     """Add columns introduced after v1 to legacy DBs (called via ``init_db``)."""
     cols = _column_names(conn, "tasks")
     for name, ddl in _BASE_TASK_COLUMNS + _EARLY_TASK_COLUMNS:
@@ -979,7 +984,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # disabled.  Create them after the nullable CAS column exists because the
     # trigger references that column.
     from hermes_cli.kanban_ready_monitor import ensure_schema as ensure_ready_monitor_schema
-    ensure_ready_monitor_schema(conn)
+    ensure_ready_monitor_schema(conn, identity_board=identity_board)
     if _table_exists(conn, "kanban_ready_episodes"):
         _add_column_if_missing(conn, "kanban_ready_episodes", "authority_set_digest", "authority_set_digest TEXT")
 

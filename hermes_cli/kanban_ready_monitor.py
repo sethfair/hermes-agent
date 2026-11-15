@@ -354,7 +354,7 @@ END;
 """
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: sqlite3.Connection, *, identity_board: str = "default") -> None:
     conn.execute("DROP TRIGGER IF EXISTS kanban_ready_claim_admission")
     conn.executescript(MONITOR_SCHEMA_SQL)
     ensure_board_identity_schema(conn)
@@ -384,8 +384,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO kanban_board_identity "
                 "(singleton, board, board_scope_id, created_at, identity_version) "
-                "VALUES (1, 'default', ?, ?, 1)",
-                (scope_id, created_at),
+                "VALUES (1, ?, ?, ?, 1)",
+                (identity_board, scope_id, created_at),
             )
         else:
             conn.execute(
