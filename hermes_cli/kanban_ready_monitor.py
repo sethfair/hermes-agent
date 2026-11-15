@@ -5,6 +5,8 @@ observation is a controller fact; it is not evidence that a worker was sent.
 """
 from __future__ import annotations
 
+from hermes_cli.kanban_db_receipts_schema import ensure_board_identity_schema
+
 import hashlib
 import json
 import secrets
@@ -355,6 +357,7 @@ END;
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TRIGGER IF EXISTS kanban_ready_claim_admission")
     conn.executescript(MONITOR_SCHEMA_SQL)
+    ensure_board_identity_schema(conn)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_ready_episodes)")}
     if "authority_set_digest" not in columns:
         conn.execute("ALTER TABLE kanban_ready_episodes ADD COLUMN authority_set_digest TEXT")
