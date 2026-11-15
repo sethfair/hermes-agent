@@ -133,12 +133,17 @@ def ensure_board_identity_schema(conn: sqlite3.Connection) -> None:
     for name, definition in (("board_scope_id", "TEXT"), ("created_at", "INTEGER"), ("identity_version", "INTEGER")):
         if name not in columns:
             conn.execute(f"ALTER TABLE kanban_board_identity ADD COLUMN {name} {definition}")
-    row = conn.execute("SELECT singleton, board_scope_id FROM kanban_board_identity WHERE singleton = 1").fetchone()
+    row = conn.execute(
+        "SELECT singleton, board_scope_id, created_at, identity_version "
+        "FROM kanban_board_identity WHERE singleton = 1"
+    ).fetchone()
     if row is None:
         return
     scope = row["board_scope_id"] if isinstance(row, sqlite3.Row) else row[1]
+    created_at = row["created_at"] if isinstance(row, sqlite3.Row) else row[2]
+    identity_version = row["identity_version"] if isinstance(row, sqlite3.Row) else row[3]
     now = int(time.time())
     if not scope:
         conn.execute("UPDATE kanban_board_identity SET board_scope_id=?, created_at=COALESCE(created_at, ?), identity_version=COALESCE(identity_version, 1) WHERE singleton=1", (str(uuid.uuid4()), now))
-    else:
+    elif created_at is None or identity_version is None:
         conn.execute("UPDATE kanban_board_identity SET created_at=COALESCE(created_at, ?), identity_version=COALESCE(identity_version, 1) WHERE singleton=1", (now,))

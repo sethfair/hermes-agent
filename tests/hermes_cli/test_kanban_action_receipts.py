@@ -769,7 +769,9 @@ def test_board_a_rejects_valid_board_b_context_without_mutation(conn, tmp_path):
     raw_other = sqlite3.connect(other_path)
     raw_other.executescript(kb.SCHEMA_SQL)
     raw_other.execute(
-        "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, 'other')"
+        "INSERT INTO kanban_board_identity "
+        "(singleton, board, board_scope_id, created_at, identity_version) "
+        "VALUES (1, 'other', '00000000-0000-4000-8000-000000000002', 1, 1)"
     )
     raw_other.commit()
     raw_other.close()

@@ -783,8 +783,8 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _kb.ensure_board_identity_schema(conn)
-                _migrate_add_optional_columns(conn)
                 _bind_action_receipt_board(conn, path, board)
+                _migrate_add_optional_columns(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)

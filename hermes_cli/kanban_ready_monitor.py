@@ -375,10 +375,24 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE kanban_controller_observations ADD COLUMN {name} {definition}")
     row = conn.execute("SELECT board_scope_id FROM kanban_board_identity WHERE singleton=1").fetchone()
     if row is None:
-        conn.execute(
-            "INSERT INTO kanban_board_identity VALUES (1, ?, ?, 1)",
-            (str(uuid.uuid4()), int(time.time())),
-        )
+        scope_id = str(uuid.uuid4())
+        created_at = int(time.time())
+        identity_columns = {
+            item["name"] for item in conn.execute("PRAGMA table_info(kanban_board_identity)")
+        }
+        if "board" in identity_columns:
+            conn.execute(
+                "INSERT INTO kanban_board_identity "
+                "(singleton, board, board_scope_id, created_at, identity_version) "
+                "VALUES (1, 'default', ?, ?, 1)",
+                (scope_id, created_at),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO kanban_board_identity "
+                "(singleton, board_scope_id, created_at, identity_version) VALUES (1, ?, ?, 1)",
+                (scope_id, created_at),
+            )
     conn.commit()
 
 

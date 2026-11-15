@@ -173,7 +173,9 @@ class TestPathResolution:
         with sqlite3.connect(db_path) as raw:
             raw.executescript(kb.SCHEMA_SQL)
             raw.execute(
-                "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, 'imported')"
+                "INSERT INTO kanban_board_identity "
+                "(singleton, board, board_scope_id, created_at, identity_version) "
+                "VALUES (1, 'imported', '00000000-0000-4000-8000-000000000001', 1, 1)"
             )
             raw.commit()
 
