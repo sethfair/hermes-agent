@@ -80,11 +80,10 @@ def host_wip_census(conn: sqlite3.Connection, config: Mapping[str, Any], *, now:
             finally:
                 other.close()
         except (OSError, sqlite3.Error):
-            if path.exists():
+            if kb.board_metadata_path(meta["slug"]).exists():
                 profiles = set(config["dispatch_profiles"])
                 census.append((None, {}, {p: 0 for p in profiles}, {p: False for p in profiles},
                                {p: ("unreadable_board",) for p in profiles}))
-            continue
     for board in sorted(pending):
         profiles = {str(profile) for member in expected[board]["members"] for profile in member["profiles"]}
         census.append((board, {}, {profile: 0 for profile in profiles},
