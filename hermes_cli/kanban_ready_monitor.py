@@ -1070,9 +1070,18 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
         config = parse_aged_ready_config(config or {})
     except ValueError:
         config = None
+    from hermes_cli.kanban_ready_monitor_resolver import host_wip_census, owner_wip_totals
+    census = host_wip_census(conn, config, now=now) if config else []
+    profile_counts: dict[str, int] = {}
+    profile_complete: dict[str, bool] = {}
+    for _board, _epochs, counts, complete, _failures in census:
+        for profile, count in counts.items():
+            profile_counts[profile] = profile_counts.get(profile, 0) + count
+            profile_complete[profile] = profile_complete.get(profile, True) and complete[profile]
     cards = []
     proven_profiles = {scope["profile"] for scope in conn.execute("SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL")
-                       if config and _projection_proven(conn, scope, now=now, stale_after_seconds=config["controller_stale_seconds"], config=config)}
+                       if config and profile_complete.get(scope["profile"], False) and _projection_proven(
+                           conn, scope, now=now, stale_after_seconds=config["controller_stale_seconds"], config=config)}
     for row in conn.execute("SELECT * FROM kanban_ready_state ORDER BY task_id"):
         fresh = now - int(row["last_observed_at"]) <= stale_after_seconds
         known = row["profile"] in proven_profiles
@@ -1101,7 +1110,8 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
         fresh = [row for row in observations if now - int(row["last_seen_at"]) <= stale_after_seconds]
         states = {row["state"] for row in fresh}
         proven = bool(config and _projection_proven(conn, scope, now=now,
-                                    stale_after_seconds=config["controller_stale_seconds"], config=config))
+                                    stale_after_seconds=config["controller_stale_seconds"], config=config)
+                      and profile_complete.get(scope["profile"], False))
         conflicting_generations = len({row["controller_generation"] for row in fresh}) > 1
         if conflicting_generations:
             state = "CONFLICT"
@@ -1111,8 +1121,7 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
             state = "STALE"
         else:
             state = "FRESH"
-        running = (conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' AND assignee=?", (scope["profile"],)).fetchone()[0]
-                   if proven else "UNKNOWN")
+        running = profile_counts.get(scope["profile"], 0) if proven else "UNKNOWN"
         ready = (conn.execute("SELECT COUNT(*) FROM tasks WHERE status='ready' AND assignee=?", (scope["profile"],)).fetchone()[0]
                  if proven else "UNKNOWN")
         eligible = (conn.execute("SELECT COUNT(*) FROM kanban_ready_state WHERE profile=? AND decision='eligible_missed'", (scope["profile"],)).fetchone()[0]
@@ -1124,10 +1133,10 @@ def ready_health_snapshot(conn: sqlite3.Connection, *, now: int | None = None,
                          "run_generation": max((int(row["controller_generation"] is not None) for row in fresh), default="UNKNOWN"),
                          "controller_digests": sorted({row["writer_ref_digest"] for row in fresh}), "state": state})
     activation = "OFF" if not scopes else ("UNKNOWN" if any(p["state"] != "FRESH" for p in profiles) else "FRESH")
-    from hermes_cli.kanban_ready_monitor_resolver import owner_wip_totals
     owners = [{**row, "total": row["total"] if activation == "FRESH" else "UNKNOWN",
                "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"}
-              for row in owner_wip_totals(conn, config["resolver_bindings"] if config else {})]
+              for row in owner_wip_totals(conn, config["resolver_bindings"] if config else {},
+                                          profile_counts=profile_counts, completeness=profile_complete)]
     if not owners and activation != "FRESH":
         owners.append({"owner": "UNKNOWN", "total": "UNKNOWN", "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"})
     return {"cards": cards, "activation": activation, "profiles": profiles, "owners": owners,

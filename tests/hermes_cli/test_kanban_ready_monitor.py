@@ -370,3 +370,70 @@ def test_complete_roster_provisionally_admits_current_tick_and_advances_episode(
         "owner": monitor._digest(owner), "total": 0, "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"}]
     monitor.record_writer_faults(conn, "incompatible_writer_context")
     assert monitor.ready_health_snapshot(conn, now=10, config=config)["profiles"][0]["state"] == "UNKNOWN"
+
+
+def _host_wip_fixture(tmp_path, monkeypatch, *, missing=False):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    boards = []
+    for slug in ("one", "two"):
+        kb.create_board(slug)
+        conn = kbc.connect(board=slug)
+        board = conn.execute("SELECT board_scope_id FROM kanban_board_identity").fetchone()[0]
+        boards.append((conn, board))
+    writer = str(uuid.uuid4()); generation = str(uuid.uuid4()); owner = str(uuid.uuid4())
+    scopes = {board: {"roster_generation": generation, "members": [{
+        "writer_ref": writer, "profiles": ["p1"], "protocol_version": 1,
+        "compatible_revisions": [monitor.COMPATIBILITY_IDENTITY]}]} for _conn, board in boards}
+    if missing:
+        scopes[str(uuid.uuid4())] = scopes[boards[0][1]]
+    config = {"dispatch_profiles": ["p1"], "aged_ready": {"observation_enabled": True,
+        "controller_id": writer, "expected_writer_scopes": scopes, "resolver_bindings": {"p1": {
+        "owner_ref": owner, "manager_ref": str(uuid.uuid4()),
+        "acknowledgement_authority_refs": [str(uuid.uuid4())]}}}}
+    parsed = monitor.parse_aged_ready_config(config)
+    for index, (conn, board) in enumerate(boards):
+        digest = parsed["expected_writer_scopes"][board]["roster_digest"]
+        scope = monitor.activate_scope(conn, profile="p1", state="active",
+            legacy_exclusion_proof_state="proven", roster_generation=generation, roster_digest=digest)
+        ctx = monitor.MonitorWriterContext(board, "p1", writer, "boot", scope["activation_epoch"],
+            generation, digest, "rev", dispatch_profiles=("p1",)).for_tick()
+        monitor.publish_controller_observation(conn, controller=ctx)
+        attempt = monitor.begin_dispatch_attempt(conn, controller=ctx, surface="test", config=config, now=10)
+        task = f"running-{index}"
+        conn.execute("INSERT INTO tasks(id,title,status,created_at,assignee) VALUES(?,?,?,?,?)", (task, task, "ready", 1, "p1"))
+        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)", (task, "created", '{"status":"ready"}', 1))
+        token = monitor.arm_claim_admission(conn, attempt_id=attempt["id"], task_id=task, ready_generation=1, run_generation=0)
+        conn.commit()
+        with kb.write_txn(conn):
+            assert kb._claim_and_open_run(conn, task, "ready", "test", 10, 10, admission_id=token)
+        assert monitor.record_dispatch_tick(conn, controller=ctx, attempt_id=attempt["id"], decisions=[], config=config, now=10)
+    return boards, config, monitor._digest(owner)
+
+
+def test_health_aggregates_owner_wip_across_configured_boards(tmp_path, monkeypatch):
+    boards, config, owner = _host_wip_fixture(tmp_path, monkeypatch)
+    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
+    assert health["profiles"][0]["running_wip"] == 2
+    assert health["owners"] == [{"owner": owner, "total": 2,
+        "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"}]
+
+
+def test_missing_contributing_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch):
+    boards, config, owner = _host_wip_fixture(tmp_path, monkeypatch, missing=True)
+    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
+    assert health["profiles"][0]["running_wip"] == "UNKNOWN"
+    assert health["owners"] == [{"owner": owner, "total": "UNKNOWN",
+        "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"}]
+
+
+def test_unreadable_contributing_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch):
+    boards, config, owner = _host_wip_fixture(tmp_path, monkeypatch)
+    boards[1][0].execute("DROP TABLE kanban_monitor_scope_activation")
+    boards[1][0].commit()
+    boards[1][0].close()
+    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
+    census = resolver.host_wip_census(boards[0][0], monitor.parse_aged_ready_config(config), now=10)
+    assert any(row[4]["p1"] == ("unreadable_board",) for row in census)
+    assert health["profiles"][0]["running_wip"] == "UNKNOWN"
+    assert health["owners"][0] == {"owner": owner, "total": "UNKNOWN",
+        "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"}
