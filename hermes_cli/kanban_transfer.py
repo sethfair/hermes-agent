@@ -257,10 +257,25 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
 
     with kb.write_txn(conn):
         _scrub_local_state(conn)
+        # Import is the one authorized identity replacement: the copied board
+        # must receive this machine's fresh scope before it becomes visible.
+        conn.execute("DROP TRIGGER kanban_board_identity_immutable_update")
+        conn.execute("DROP TRIGGER kanban_board_identity_immutable_delete")
         conn.execute("DELETE FROM kanban_board_identity")
         conn.execute(
-            "INSERT INTO kanban_board_identity(singleton,board_scope_id,created_at,identity_version) VALUES(1,?,?,1)",
-            (str(uuid.uuid4()), now),
+            "INSERT INTO kanban_board_identity(singleton,board,board_scope_id,created_at,identity_version) "
+            "VALUES(1,?,?,?,1)",
+            (slug, str(uuid.uuid4()), now),
+        )
+        conn.execute(
+            "CREATE TRIGGER kanban_board_identity_immutable_update "
+            "BEFORE UPDATE ON kanban_board_identity "
+            "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER kanban_board_identity_immutable_delete "
+            "BEFORE DELETE ON kanban_board_identity "
+            "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
         )
 
         dropped = rehomed = 0
