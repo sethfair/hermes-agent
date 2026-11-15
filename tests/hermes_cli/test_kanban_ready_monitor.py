@@ -426,15 +426,16 @@ def test_missing_contributing_board_makes_profile_and_owner_wip_unknown(tmp_path
         "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"}]
 
 
-def test_unlisted_or_metadata_only_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch):
+def test_unlisted_malformed_or_metadata_only_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch):
     boards, config, _owner = _host_wip_fixture(tmp_path, monkeypatch)
     kb.create_board("three"); extra = kbc.connect(board="three")
     extra.execute("INSERT INTO tasks(id,title,status,created_at,assignee) VALUES(?,?,?,?,?)", ("third-running", "T", "running", 1, "p1")); extra.commit()
-    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
-    assert health["profiles"][0]["running_wip"] == health["owners"][0]["total"] == "UNKNOWN"
-    extra.close(); kb.kanban_db_path("three").unlink()
-    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
-    assert health["profiles"][0]["running_wip"] == health["owners"][0]["total"] == "UNKNOWN"
+    meta = kb.board_metadata_path("three")
+    for raw in ('{"archived":"false"}', '{"archived":1}', "{", "[]"):
+        meta.write_text(raw); census = resolver.host_wip_census(boards[0][0], monitor.parse_aged_ready_config(config), now=10); health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
+        assert any(row[4]["p1"] == ("unmapped_board",) for row in census) and health["profiles"][0]["running_wip"] == health["owners"][0]["total"] == "UNKNOWN"
+    extra.close(); meta.write_text('{"archived":false}'); kb.kanban_db_path("three").unlink()
+    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config); assert health["profiles"][0]["running_wip"] == health["owners"][0]["total"] == "UNKNOWN"
 
 
 def test_unreadable_contributing_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch):

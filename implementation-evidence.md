@@ -1,10 +1,8 @@
 # Implementation evidence
-
 Plan: `/home/macpro/.hermes/kanban/attachments/t_59d54268/corrected-aged-ready-alert-escalation-plan-r2.md`
 Plan SHA-256: `d574e25882aacd8a48d8a8e62400d1686e188959b296f49122c85b390ef9d3a6`
 Pinned/base HEAD: `f92d19d6d2f0c7e3aa7d0f656b2e023d43316ac4`
 Owner: Owen (sole integrator); executor branch: `feat/aged-ready-core-monitoring`
-
 ## RED/GREEN log
 
 | Increment | Phase | Command | Exit | Commit/tree |
@@ -27,7 +25,6 @@ run reached pytest and observed the planned absent-interface failure.
 | B-2 | GREEN | `scripts/run_tests.sh tests/hermes_cli/test_kanban_db_init.py tests/hermes_cli/test_kanban_db_repair.py -k 'schema or migration or init'` | 0 | 3 passed in the selected files |
 | B-3 | GREEN | `scripts/run_tests.sh tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_per_profile_cap.py` | 0 | 4 passed |
 | B-2/3 | GREEN | `python -m compileall -q hermes_cli/kanban_ready_monitor.py hermes_cli/kanban_db.py hermes_cli/kanban_db_connect.py hermes_cli/kanban_db_dispatch.py hermes_cli/kanban_transfer.py tests/hermes_cli/test_kanban_ready_monitor.py tests/hermes_cli/test_kanban_ready_monitor_dispatch.py` | 0 | Compile check passed |
-
 The combined nine-file runner invocation was interrupted by the runner leaving an orphaned
 subprocess while the transfer file was executing; it is not claimed as passing evidence. The
 individual transfer and dispatcher/database commands above are the attributable regressions.
