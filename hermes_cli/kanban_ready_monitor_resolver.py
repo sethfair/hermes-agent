@@ -37,12 +37,12 @@ def host_wip_census(conn: sqlite3.Connection, config: Mapping[str, Any], *, now:
     seen = set()
     census = []
 
-    def collect(board_conn: sqlite3.Connection) -> None:
+    def collect(board_conn: sqlite3.Connection, *, metadata_valid: bool = True) -> None:
         identity = board_conn.execute(
             "SELECT board_scope_id FROM kanban_board_identity WHERE singleton=1"
         ).fetchone()
         board = identity[0] if identity else None
-        if board in seen: return
+        if board in seen and metadata_valid: return
         seen.add(board)
         if board not in expected:
             profiles = set(config["dispatch_profiles"])
@@ -51,6 +51,12 @@ def host_wip_census(conn: sqlite3.Connection, config: Mapping[str, Any], *, now:
             return
         profiles = {str(profile) for member in expected[board]["members"]
                     for profile in member["profiles"]}
+        if not metadata_valid:
+            census.append((board, {}, {profile: 0 for profile in profiles},
+                           {profile: False for profile in profiles},
+                           {profile: ("invalid_board_metadata",) for profile in profiles}))
+            pending.discard(board)
+            return
         try:
             scopes = {row["profile"]: row for row in board_conn.execute(
                 "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL")}
@@ -67,16 +73,24 @@ def host_wip_census(conn: sqlite3.Connection, config: Mapping[str, Any], *, now:
             complete = {profile: False for profile in profiles}
             failures = {profile: ("unreadable_board",) for profile in profiles}
         census.append((board, epochs, counts, complete, failures))
-        pending.remove(board)
+        pending.discard(board)
 
     collect(conn)
     for meta in kb.list_boards(include_archived=False):
         path = Path(meta["db_path"])
+        metadata_path = kb.board_metadata_path(meta["slug"])
+        metadata_valid = meta["slug"] == kb.DEFAULT_BOARD and not metadata_path.exists()
+        if not metadata_valid:
+            try:
+                raw = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                metadata_valid = isinstance(raw, dict) and isinstance(raw.get("archived", False), bool)
+            except (OSError, json.JSONDecodeError):
+                metadata_valid = False
         try:
             other = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
             other.row_factory = sqlite3.Row
             try:
-                collect(other)
+                collect(other, metadata_valid=metadata_valid)
             finally:
                 other.close()
         except (OSError, sqlite3.Error):

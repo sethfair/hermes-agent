@@ -4,6 +4,8 @@ import sqlite3
 import json
 import uuid
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 
@@ -426,11 +428,24 @@ def test_missing_contributing_board_makes_profile_and_owner_wip_unknown(tmp_path
         "eligible_count": "UNKNOWN", "suppressed_count": "UNKNOWN"}]
 
 
-def test_unlisted_malformed_or_metadata_only_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch):
+@pytest.mark.parametrize("raw", ('{"archived":"false"}', '{"archived":1}', "{", "[]"))
+@pytest.mark.parametrize(("slug", "index"), (("one", 0), ("two", 1)))
+def test_configured_malformed_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch, raw, slug, index):
+    boards, config, _owner = _host_wip_fixture(tmp_path, monkeypatch)
+    kb.board_metadata_path(slug).write_text(raw)
+    census = resolver.host_wip_census(boards[0][0], monitor.parse_aged_ready_config(config), now=10)
+    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
+    assert any(row[0] == boards[index][1] and row[4]["p1"] == ("invalid_board_metadata",) for row in census)
+    assert health["profiles"][0]["running_wip"] == health["owners"][0]["total"] == "UNKNOWN"
+
+
+def test_unlisted_valid_malformed_or_metadata_only_board_makes_profile_and_owner_wip_unknown(tmp_path, monkeypatch):
     boards, config, _owner = _host_wip_fixture(tmp_path, monkeypatch)
     kb.create_board("three"); extra = kbc.connect(board="three")
     extra.execute("INSERT INTO tasks(id,title,status,created_at,assignee) VALUES(?,?,?,?,?)", ("third-running", "T", "running", 1, "p1")); extra.commit()
     meta = kb.board_metadata_path("three")
+    health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
+    assert health["profiles"][0]["running_wip"] == health["owners"][0]["total"] == "UNKNOWN"
     for raw in ('{"archived":"false"}', '{"archived":1}', "{", "[]"):
         meta.write_text(raw); census = resolver.host_wip_census(boards[0][0], monitor.parse_aged_ready_config(config), now=10); health = monitor.ready_health_snapshot(boards[0][0], now=10, config=config)
         assert any(row[4]["p1"] == ("unmapped_board",) for row in census) and health["profiles"][0]["running_wip"] == health["owners"][0]["total"] == "UNKNOWN"
