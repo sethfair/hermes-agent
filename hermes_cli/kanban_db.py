@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from hermes_cli.kanban_db_receipts_schema import ACTION_RECEIPT_SCHEMA_SQL
+from hermes_cli.kanban_db_receipts_schema import ACTION_RECEIPT_SCHEMA_SQL, ensure_board_identity_schema
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than

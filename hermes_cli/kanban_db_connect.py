@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from dataclasses import field
 from agent.deadline import poll_until
@@ -781,6 +782,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
+                _kb.ensure_board_identity_schema(conn)
                 _migrate_add_optional_columns(conn)
                 _bind_action_receipt_board(conn, path, board)
                 _INITIALIZED_PATHS.add(resolved)
@@ -950,8 +952,8 @@ def _bind_action_receipt_board(
     row = conn.execute("SELECT board FROM kanban_board_identity WHERE singleton = 1").fetchone()
     if row is None:
         conn.execute(
-            "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, ?)",
-            (trusted or _kb.DEFAULT_BOARD,),
+            "INSERT INTO kanban_board_identity (singleton, board, board_scope_id, created_at, identity_version) VALUES (1, ?, ?, ?, 1)",
+            (trusted or _kb.DEFAULT_BOARD, str(uuid.uuid4()), int(time.time())),
         )
     elif trusted is not None and row["board"] != trusted:
         # A fenced worker may be routed through a pinned DB whose physical path

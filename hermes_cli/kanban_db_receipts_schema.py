@@ -1,9 +1,16 @@
 """Additive schema for authenticated Kanban action receipts."""
 
+import sqlite3
+import time
+import uuid
+
 ACTION_RECEIPT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kanban_board_identity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    board TEXT NOT NULL UNIQUE
+    board TEXT NOT NULL UNIQUE,
+    board_scope_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    identity_version INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS service_principals (
     board TEXT NOT NULL,
@@ -115,3 +122,23 @@ CREATE TABLE IF NOT EXISTS advisory_notices (
     FOREIGN KEY (projection_comment_id) REFERENCES task_comments(id) ON DELETE RESTRICT
 );
 """
+
+
+def ensure_board_identity_schema(conn: sqlite3.Connection) -> None:
+    """Upgrade the v1 receipt identity row without changing its board binding."""
+    rows = conn.execute("PRAGMA table_info(kanban_board_identity)").fetchall()
+    if not rows:
+        return
+    columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
+    for name, definition in (("board_scope_id", "TEXT"), ("created_at", "INTEGER"), ("identity_version", "INTEGER")):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE kanban_board_identity ADD COLUMN {name} {definition}")
+    row = conn.execute("SELECT singleton, board_scope_id FROM kanban_board_identity WHERE singleton = 1").fetchone()
+    if row is None:
+        return
+    scope = row["board_scope_id"] if isinstance(row, sqlite3.Row) else row[1]
+    now = int(time.time())
+    if not scope:
+        conn.execute("UPDATE kanban_board_identity SET board_scope_id=?, created_at=COALESCE(created_at, ?), identity_version=COALESCE(identity_version, 1) WHERE singleton=1", (str(uuid.uuid4()), now))
+    else:
+        conn.execute("UPDATE kanban_board_identity SET created_at=COALESCE(created_at, ?), identity_version=COALESCE(identity_version, 1) WHERE singleton=1", (now,))
