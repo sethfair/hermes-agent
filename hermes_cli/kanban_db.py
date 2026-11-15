@@ -116,21 +116,6 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
-def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
-    """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
-    empty/None = inherit the profile's own effort (NULL). Anything else raises —
-    a typo'd level must not quietly hand the task back to the profile default."""
-    from hermes_constants import VALID_REASONING_EFFORTS
-
-    value = str(effort or "").strip().lower()
-    if not value:
-        return None
-    if value == "none" or value in VALID_REASONING_EFFORTS:
-        return value
-    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
-    raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
-
-
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
@@ -874,7 +859,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    dispatch_admission_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2120,25 +2106,35 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     ).fetchall()
     return [(row["id"], row["status"]) for row in rows]
 
-
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
+    *, event_extra: Optional[dict] = None, admission_id: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    if admission_id is not None and source_status == "ready":
+        from hermes_cli import kanban_ready_monitor as monitor
+        task = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()
+        previous_run = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        generation = monitor.ready_generation(conn, task_id)
+        if not task or not generation or not monitor.validate_claim_admission(
+                conn, admission_id, task_id, task["assignee"] or "", generation[0], int(previous_run)):
+            return None
     cur = conn.execute(
         f"""
         UPDATE tasks
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   dispatch_admission_id = ?
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
         """,
-        (lock, expires, now, task_id),
+        (lock, expires, now, admission_id, task_id),
     )
     if cur.rowcount != 1:
         return None
@@ -2165,12 +2161,15 @@ def _claim_and_open_run(
         conn, task_id, "claimed",
         {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
     )
+    if source_status == "ready":
+        from hermes_cli import kanban_ready_monitor as monitor
+        monitor.close_for_native_ready_claim(conn, task_id, run_id, now=now)
     return run_id
 
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, admission_id: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2195,7 +2194,7 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now, admission_id=admission_id)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -4185,6 +4184,7 @@ from hermes_cli.kanban_db_workspace import (
     _managed_scratch_path_info,
     _scratch_workspace,
 )
+from hermes_cli.kanban_db_policy import normalize_reasoning_effort
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,

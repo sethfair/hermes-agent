@@ -138,6 +138,20 @@ They also coexist inside one run. A kanban task executes in an isolated managed 
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Read-only aged-Ready health
+
+Hermes includes a default-off, metadata-only aged-Ready monitor. It records Ready generations,
+eligible dispatch misses, controller freshness, and bounded escalation intent facts without sending
+messages or changing cards. Native `ready → running` claims close an episode atomically; truthful
+holds such as `blocked`, `review`, `scheduled`, `done`, or `archived` close it as a hold. Comments,
+assignment changes, stale observations, and intent creation do not close an episode.
+
+Use `hermes kanban ready-health --json` or the dashboard `GET /ready-health` and
+`GET /ready-episodes/{episode_id}` endpoints. Unknown or stale controller state remains `UNKNOWN`;
+it is never treated as zero WIP. The monitor has no delivery, acknowledgement, activation, install,
+restart, or Office action API. Enablement and any resolver/roster binding are separate operational
+gates and are not implied by installing Hermes.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,

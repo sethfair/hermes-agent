@@ -91,6 +91,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    if res.monitor_scope_refused:
+        if getattr(args, "json", False):
+            _print_json({"ok": False, "error": "monitor_scope_refused", "reason": "missing_writer_context"}, ascii=True)
+        else:
+            print("Dispatch refused: protected monitor scope requires an admitted writer context")
+        return 2
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)

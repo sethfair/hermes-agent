@@ -923,6 +923,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in _BASE_TASK_COLUMNS + _EARLY_TASK_COLUMNS:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
+    _add_column_if_missing(conn, "tasks", "dispatch_admission_id", "dispatch_admission_id TEXT")
+
+    # Monitor tables are additive and intentionally inert while the feature is
+    # disabled.  Create them after the nullable CAS column exists because the
+    # trigger references that column.
+    from hermes_cli.kanban_ready_monitor import ensure_schema as ensure_ready_monitor_schema
+    ensure_ready_monitor_schema(conn)
+    if _table_exists(conn, "kanban_ready_episodes"):
+        _add_column_if_missing(conn, "kanban_ready_episodes", "authority_set_digest", "authority_set_digest TEXT")
 
     # Re-snapshot: DBs partially migrated by older releases may already carry
     # later columns (e.g. ``consecutive_failures``), keeping the legacy-column
@@ -1137,8 +1146,13 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     if not drifted:
         return
 
+    trigger = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='kanban_ready_claim_admission'"
+    ).fetchone()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if trigger and trigger[0]:
+            conn.execute("DROP TRIGGER kanban_ready_claim_admission")
         for table in drifted:
             create_sql, index_sqls = _REBUILD_SPECS[table]
             old_cols = [c["name"] for c in conn.execute(f"PRAGMA table_info({table})")]
@@ -1161,6 +1175,8 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP TABLE {table}_legacy")
             for index_sql in index_sqls:
                 conn.execute(index_sql)
+        if trigger and trigger[0]:
+            conn.execute(trigger[0])
         conn.execute("COMMIT")
     except Exception:
         with contextlib.suppress(sqlite3.OperationalError):
