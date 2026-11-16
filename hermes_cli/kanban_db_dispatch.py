@@ -160,9 +160,27 @@ class DispatchResult:
     monitor_scope_refused: bool = False
     monitor_attempt_id: Optional[str] = None
     monitor_decisions: list[dict[str, Any]] = field(default_factory=list)
+    control_state: str = "running"
+    control_error: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+
+
+class DispatchControlHeld(RuntimeError):
+    def __init__(self, result: DispatchResult):
+        super().__init__(result.control_state)
+        self.result = result
+
+
+def _dispatch_control_result(conn: sqlite3.Connection) -> Optional[DispatchResult]:
+    """Return a fail-closed no-work result when board admission is not running."""
+    from hermes_cli.kanban_control import read_control
+
+    state = read_control(conn)
+    if state.state == "running":
+        return None
+    return DispatchResult(control_state=state.state, control_error=state.error_code)
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -2012,6 +2030,17 @@ def dispatch_once(
                 else (() if monitor_context is None else (monitor_context,)))
 
     def _locked_tick() -> DispatchResult:
+        held = _dispatch_control_result(conn)
+        if held is not None:
+            return _dispatch_once_locked(
+                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+                max_spawn=max_spawn, max_in_progress=max_in_progress,
+                failure_limit=failure_limit, stale_timeout_seconds=stale_timeout_seconds,
+                board=board, default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconcile_orphans=reconcile_orphans, skip_reclaim=_skip_reclaim,
+                control_hold=held,
+            )
         from hermes_cli import kanban_ready_monitor as monitor
         try:
             from hermes_cli.config import load_config
@@ -2074,7 +2103,17 @@ def dispatch_once(
         # dispatcher fallback.  Protected boards must never bypass their lock
         # and admission fence when the path cannot be resolved.
         from hermes_cli import kanban_ready_monitor as monitor
-        if monitor.has_protected_scope(conn):
+        held = _dispatch_control_result(conn)
+        if held is not None:
+            result = _dispatch_once_locked(
+                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+                max_spawn=max_spawn, max_in_progress=max_in_progress,
+                failure_limit=failure_limit, stale_timeout_seconds=stale_timeout_seconds,
+                board=board, default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconcile_orphans=reconcile_orphans, control_hold=held,
+            )
+        elif monitor.has_protected_scope(conn):
             monitor.record_writer_faults(conn, "writer_scope_incomplete")
             result = DispatchResult(monitor_scope_refused=True)
         else:

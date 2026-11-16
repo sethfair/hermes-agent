@@ -8,10 +8,39 @@ their monkeypatch seams after the extraction.
 from __future__ import annotations
 
 import sqlite3
+from functools import wraps
 from typing import Any, Mapping, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db_dispatch import DispatchResult
+
+
+class _DispatchHeld(RuntimeError):
+    def __init__(self, result):
+        super().__init__(result.control_state)
+        self.result = result
+
+
+def _returns_control_hold(func):
+    """Return a typed held tick after safe recovery bookkeeping completes."""
+    @wraps(func)
+    def wrapped(conn, *args, **kwargs):
+        try:
+            return func(conn, *args, **kwargs)
+        except _DispatchHeld as exc:
+            return exc.result
+        except _dispatch.DispatchControlHeld as exc:
+            return exc.result
+    return wrapped
+
+
+def _raise_if_control_held(conn, result, known_hold=None) -> None:
+    held = known_hold or _dispatch._dispatch_control_result(conn)
+    if held is None:
+        return
+    result.control_state = held.control_state
+    result.control_error = held.control_error
+    raise _DispatchHeld(result)
 
 
 def _run_reclaim_phase(
@@ -126,6 +155,7 @@ def _monitor_partition(partitions, profile, attempt_id, context):
     return (partitions or {}).get(profile) or (attempt_id, context)
 
 
+@_returns_control_hold
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -145,6 +175,7 @@ def _dispatch_once_locked(
     monitor_profile: Optional[str] = None,
     monitor_partitions: Optional[dict[str, tuple[str, Any]]] = None,
     skip_reclaim: bool = False,
+    control_hold: Optional[DispatchResult] = None,
 ) -> DispatchResult:
     result = _dispatch.DispatchResult()
     from hermes_cli import kanban_ready_monitor as monitor
@@ -153,6 +184,7 @@ def _dispatch_once_locked(
             conn, result, stale_timeout_seconds=stale_timeout_seconds,
             failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
         )
+    _raise_if_control_held(conn, result, control_hold)
     may_spawn, spawn_budget = _dispatch._tick_spawn_budget(
         conn, result, max_spawn=max_spawn,
         max_in_progress=max_in_progress, board=board,

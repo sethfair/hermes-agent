@@ -8,10 +8,32 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from typing import Optional, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Literal, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+
+
+ClaimReason = Literal[
+    "kanban_paused",
+    "kanban_control_unknown",
+    "parents_not_done",
+    "admission_refused",
+    "claim_lost",
+]
+
+
+@dataclass(frozen=True)
+class ClaimAttemptResult:
+    task: Optional[Task]
+    reason: Optional[ClaimReason] = None
+
+
+class _ClaimRollback(RuntimeError):
+    def __init__(self, reason: ClaimReason):
+        super().__init__(reason)
+        self.reason: ClaimReason = reason
 
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -38,9 +60,10 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, admission_id: Optional[str] = None,
+    admission_validated: bool = False,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``."""
-    if admission_id is not None and source_status == "ready":
+    if admission_id is not None and source_status == "ready" and not admission_validated:
         from hermes_cli import kanban_ready_monitor as monitor
         task = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()
         previous_run = conn.execute(
@@ -97,44 +120,111 @@ def _claim_and_open_run(
     return run_id
 
 
+def _control_refusal(conn: sqlite3.Connection) -> Optional[ClaimReason]:
+    from hermes_cli.kanban_control import read_control
+
+    state = read_control(conn)
+    if state.state == "paused":
+        return "kanban_paused"
+    if state.state != "running":
+        return "kanban_control_unknown"
+    return None
+
+
+def claim_task_result(
+    conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None, monitor_attempt_id: Optional[str] = None,
+    admission_id: Optional[str] = None,
+) -> ClaimAttemptResult:
+    """Return the immutable outcome of the deciding Ready claim transaction."""
+    if monitor_attempt_id is not None and admission_id is not None:
+        raise ValueError("monitor_attempt_id and admission_id are mutually exclusive")
+    now = int(time.time())
+    lock = claimer or _kb._claimer_id()
+    expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
+    try:
+        with _kb.write_txn(conn):
+            refusal = _control_refusal(conn)
+            if refusal is not None:
+                return ClaimAttemptResult(task=None, reason=refusal)
+            if not _kb._parents_satisfied(conn, task_id):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'", (task_id,),
+                )
+                _kb._append_event(
+                    conn, task_id, "claim_rejected", {"reason": "parents_not_done"},
+                )
+                return ClaimAttemptResult(task=None, reason="parents_not_done")
+            _kb._reclaim_dangling_run(
+                conn, task_id, statuses=("ready",), now=now,
+                note="invariant recovery on re-claim",
+            )
+            admission_validated = False
+            if monitor_attempt_id is not None:
+                from hermes_cli import kanban_ready_monitor as monitor
+
+                task = conn.execute(
+                    "SELECT assignee FROM tasks WHERE id=?", (task_id,),
+                ).fetchone()
+                generation = monitor.ready_generation(conn, task_id)
+                previous_run = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0]
+                if task is None or generation is None:
+                    return ClaimAttemptResult(task=None, reason="claim_lost")
+                try:
+                    admission_id = monitor.arm_claim_admission(
+                        conn, attempt_id=monitor_attempt_id, task_id=task_id,
+                        ready_generation=generation[0], run_generation=int(previous_run),
+                    )
+                except ValueError:
+                    return ClaimAttemptResult(task=None, reason="admission_refused")
+                if not monitor.validate_claim_admission(
+                    conn, admission_id, task_id, task["assignee"] or "",
+                    generation[0], int(previous_run),
+                ):
+                    raise _ClaimRollback("admission_refused")
+                admission_validated = True
+            run_id = _kb._claim_and_open_run(
+                conn, task_id, "ready", lock, expires, now,
+                admission_id=admission_id, admission_validated=admission_validated,
+            )
+            if run_id is None:
+                if admission_id is not None:
+                    raise _ClaimRollback("claim_lost")
+                return ClaimAttemptResult(task=None, reason="claim_lost")
+            claimed = _kb.get_task(conn, task_id)
+    except _ClaimRollback as exc:
+        return ClaimAttemptResult(task=None, reason=exc.reason)
+    _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
+    return ClaimAttemptResult(task=claimed)
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, admission_id: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``."""
-    now = int(time.time())
-    lock = claimer or _kb._claimer_id()
-    expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
-    with _kb.write_txn(conn):
-        if not _kb._parents_satisfied(conn, task_id):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
-            )
-            _kb._append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
-            return None
-        _kb._reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-        )
-        run_id = _kb._claim_and_open_run(
-            conn, task_id, "ready", lock, expires, now, admission_id=admission_id,
-        )
-        if run_id is None:
-            return None
-        claimed = _kb.get_task(conn, task_id)
-    _kb._fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
-    return claimed
+    """Compatibility wrapper returning only the claimed Ready task."""
+    return claim_task_result(
+        conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
+        admission_id=admission_id,
+    ).task
 
 
-def claim_review_task(
+def claim_review_task_result(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
-) -> Optional[Task]:
-    """Atomic ``review -> running``; a new run tracks the reviewer."""
+) -> ClaimAttemptResult:
+    """Return the immutable outcome of the deciding Review claim transaction."""
     now = int(time.time())
     lock = claimer or _kb._claimer_id()
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
     with _kb.write_txn(conn):
+        refusal = _control_refusal(conn)
+        if refusal is not None:
+            return ClaimAttemptResult(task=None, reason=refusal)
         if not _kb._parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -145,14 +235,24 @@ def claim_review_task(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
-            return None
+            return ClaimAttemptResult(task=None, reason="parents_not_done")
         run_id = _kb._claim_and_open_run(
             conn, task_id, "review", lock, expires, now,
             event_extra={"source_status": "review"},
         )
         if run_id is None:
-            return None
-        return _kb.get_task(conn, task_id)
+            return ClaimAttemptResult(task=None, reason="claim_lost")
+        return ClaimAttemptResult(task=_kb.get_task(conn, task_id))
+
+
+def claim_review_task(
+    conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Compatibility wrapper returning only the claimed Review task."""
+    return claim_review_task_result(
+        conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
+    ).task
 
 
 from hermes_cli import kanban_db as _kb

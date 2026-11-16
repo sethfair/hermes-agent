@@ -4033,10 +4033,13 @@ from hermes_cli.kanban_db_connect import (
     write_txn,
 )
 from hermes_cli.kanban_db_claim import (
+    ClaimAttemptResult,
     _claim_and_open_run,
     _parents_satisfied,
     claim_review_task,
+    claim_review_task_result,
     claim_task,
+    claim_task_result,
     unsatisfied_parents,
 )
 from hermes_cli.kanban_db_workspace import (

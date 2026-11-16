@@ -8,6 +8,67 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as dispatch
 from hermes_cli import kanban_ready_monitor as monitor
+from hermes_cli import kanban_control
+
+
+def test_paused_dispatch_stops_before_housekeeping_or_admission():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    monitor.ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO tasks(id,title,status,created_at,assignee) "
+        "VALUES('queued','Queued','ready',1,'p1')",
+    )
+    conn.execute(
+        "INSERT INTO tasks(id,title,status,created_at,assignee,claim_lock,claim_expires) "
+        "VALUES('running','Running','running',1,'p1','existing-worker',1)",
+    )
+    conn.commit()
+    kanban_control.pause_board(conn, changed_by="operator")
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "task_runs", "kanban_dispatch_attempts", "kanban_claim_admissions",
+            "kanban_writer_faults",
+        )
+    }
+
+    result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: 123)
+
+    assert result.control_state == "paused"
+    assert result.spawned == []
+    assert conn.execute("SELECT status FROM tasks WHERE id='queued'").fetchone()[0] == "ready"
+    running = conn.execute(
+        "SELECT status, claim_lock, claim_expires FROM tasks WHERE id='running'",
+    ).fetchone()
+    assert tuple(running) == ("ready", None, None)
+    after = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in before
+    }
+    assert after == before
+
+
+def test_unknown_control_schema_fails_dispatch_closed():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    monitor.ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO tasks(id,title,status,created_at,assignee) "
+        "VALUES('queued','Queued','ready',1,'p1')",
+    )
+    conn.execute("DROP TABLE kanban_dispatch_control")
+    conn.execute("CREATE TABLE kanban_dispatch_control (id INTEGER PRIMARY KEY, state TEXT)")
+    conn.commit()
+
+    result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: 123)
+
+    assert result.control_state == "unknown"
+    assert result.control_error == "control_schema_invalid"
+    assert result.spawned == []
+    assert conn.execute("SELECT status FROM tasks WHERE id='queued'").fetchone()[0] == "ready"
 
 
 def test_protected_board_refuses_one_shot_dispatch_before_housekeeping():
