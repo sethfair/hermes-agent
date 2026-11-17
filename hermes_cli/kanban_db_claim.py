@@ -60,7 +60,7 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, admission_id: Optional[str] = None,
-    admission_validated: bool = False,
+    admission_validated: bool = False, expect_assignee: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``."""
     if admission_id is not None and source_status == "ready" and not admission_validated:
@@ -84,8 +84,9 @@ def _claim_and_open_run(
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
+           AND (? IS NULL OR assignee = ?)
         """,
-        (lock, expires, now, admission_id, task_id),
+        (lock, expires, now, admission_id, task_id, expect_assignee, expect_assignee),
     )
     if cur.rowcount != 1:
         return None
@@ -134,7 +135,7 @@ def _control_refusal(conn: sqlite3.Connection) -> Optional[ClaimReason]:
 def claim_task_result(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, monitor_attempt_id: Optional[str] = None,
-    admission_id: Optional[str] = None,
+    admission_id: Optional[str] = None, expect_assignee: Optional[str] = None,
 ) -> ClaimAttemptResult:
     """Return the immutable outcome of the deciding Ready claim transaction."""
     if monitor_attempt_id is not None and admission_id is not None:
@@ -190,6 +191,7 @@ def claim_task_result(
             run_id = _kb._claim_and_open_run(
                 conn, task_id, "ready", lock, expires, now,
                 admission_id=admission_id, admission_validated=admission_validated,
+                expect_assignee=expect_assignee,
             )
             if run_id is None:
                 if admission_id is not None:
@@ -205,17 +207,18 @@ def claim_task_result(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, admission_id: Optional[str] = None,
+    expect_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Compatibility wrapper returning only the claimed Ready task."""
     return claim_task_result(
         conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
-        admission_id=admission_id,
+        admission_id=admission_id, expect_assignee=expect_assignee,
     ).task
 
 
 def claim_review_task_result(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
 ) -> ClaimAttemptResult:
     """Return the immutable outcome of the deciding Review claim transaction."""
     now = int(time.time())
@@ -239,6 +242,7 @@ def claim_review_task_result(
         run_id = _kb._claim_and_open_run(
             conn, task_id, "review", lock, expires, now,
             event_extra={"source_status": "review"},
+            expect_assignee=expect_assignee,
         )
         if run_id is None:
             return ClaimAttemptResult(task=None, reason="claim_lost")
@@ -247,11 +251,12 @@ def claim_review_task_result(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Compatibility wrapper returning only the claimed Review task."""
     return claim_review_task_result(
         conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
+        expect_assignee=expect_assignee,
     ).task
 
 

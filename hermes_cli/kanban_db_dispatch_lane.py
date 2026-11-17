@@ -42,15 +42,18 @@ def _guard_decision(reason: str) -> str:
 
 
 def _claim_lane_task(
-    conn: Any, task_id: str, lane: str, ttl_seconds: Optional[int],
+    conn: Any, task_id: str, lane: str, assignee: str, ttl_seconds: Optional[int],
     monitor_attempt_id: Optional[str], monitor_context: Any,
 ) -> Any:
     if lane == "ready":
         return _kb.claim_task_result(
             conn, task_id, ttl_seconds=ttl_seconds,
             monitor_attempt_id=monitor_attempt_id if monitor_context is not None else None,
+            expect_assignee=assignee,
         )
-    return _kb.claim_review_task_result(conn, task_id, ttl_seconds=ttl_seconds)
+    return _kb.claim_review_task_result(
+        conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee,
+    )
 
 
 def _count_spawn(
@@ -117,7 +120,7 @@ def _dispatch_lane_task(
         _count_spawn(assignee, per_profile_cap, per_profile_running)
         return True
     attempt = _claim_lane_task(
-        conn, task_id, lane, ttl_seconds, monitor_attempt_id, monitor_context,
+        conn, task_id, lane, assignee, ttl_seconds, monitor_attempt_id, monitor_context,
     )
     claimed = attempt.task
     if claimed is None:

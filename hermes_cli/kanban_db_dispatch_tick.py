@@ -245,16 +245,14 @@ def _dispatch_once_locked(
             continue
         row_assignee = row["assignee"]
         if not row_assignee:
-            if not default_assignee or not _dispatch._apply_default_assignee(
-                conn, row["id"], default_assignee, dry_run=dry_run,
-            ):
-                result.skipped_unassigned.append(row["id"])
+            row_assignee = _dispatch._kbda.fill_default_assignee(
+                conn, row["id"], default_assignee, result, dry_run=dry_run,
+            )
+            if not row_assignee:
                 result.monitor_decisions.append(
                     {"task_id": row["id"], "decision": "unassigned"}
                 )
                 continue
-            row_assignee = default_assignee
-            result.auto_assigned_default.append(row["id"])
         attempt_id, context = _dispatch._monitor_partition(
             monitor_partitions, row_assignee, monitor_attempt_id, monitor_context,
         )
