@@ -285,12 +285,25 @@ _SPECS = [
         _arg("--task", help="Only show diagnostics for one task id"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
+    _cmd("ready-health", [_arg("--task"), _json_flag()],
+         help="Show read-only aged-Ready health and freshness"),
     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
+    _cmd("pause", [
+        _arg("--reason", help="Audit reason for pausing new Kanban pickups"),
+        _arg("--by", help="Audit actor (default: current Hermes profile)"),
+        _json_flag(),
+    ], help="Pause new task pickups on the current board"),
+    _cmd("resume", [
+        _arg("--reason", help="Audit reason for resuming new Kanban pickups"),
+        _arg("--by", help="Audit actor (default: current Hermes profile)"),
+        _json_flag(),
+    ], help="Resume new task pickups on the current board"),
+    _cmd("pause-status", [_json_flag()], help="Show Kanban pickup control across selected boards"),
     _cmd("comment", [
         _TASK_ID,
         _arg("text", nargs="+", help="Comment body"),

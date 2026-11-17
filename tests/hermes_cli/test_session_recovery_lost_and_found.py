@@ -217,14 +217,29 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without a sqlite3 CLI the refusal must say exactly what to install."""
+    """Without a sqlite3 CLI the refusal must say exactly what to install.
+
+    The absence is simulated at the PATH lookup, not by stubbing
+    ``find_sqlite3_cli``: the recovery lane reads the refusal reason that the
+    real probe records, so a stub would leave a reason from an earlier probe in
+    this process (this module probes the host CLI at import). On a host whose
+    sqlite3 is WAL-reset-vulnerable, such as Ubuntu's 3.45.1/3.46.1, the stale
+    reason produced the unsafe-shell message instead of this one (WRI-2402).
+    """
     source = tmp_path / "schemaless.db"
     output = tmp_path / "schemaless-recovered.db"
     _make_schema_unreadable_source(source)
 
     import hermes_cli.session_lost_and_found as laf
 
-    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    real_which = shutil.which
+    monkeypatch.setattr(
+        laf.shutil,
+        "which",
+        lambda name, *args, **kwargs: None
+        if name == "sqlite3"
+        else real_which(name, *args, **kwargs),
+    )
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,
@@ -236,6 +251,50 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     assert "sessions" in message and "messages" in message
     assert "sqlite3" in message
     assert ".recover" in message
+    assert "not safe" not in message
+    assert not output.exists()
+
+
+def test_unreadable_schema_with_vulnerable_cli_refuses_with_wal_reset_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A .recover-capable but WAL-reset-vulnerable CLI must still be refused,
+    and the refusal must name the unsafe version instead of offering salvage
+    (#100368). Pinned here independently of whichever sqlite3 the host has."""
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "schemaless-recovered.db"
+    _make_schema_unreadable_source(source)
+
+    import hermes_cli.session_lost_and_found as laf
+
+    real_which = shutil.which
+    monkeypatch.setattr(
+        laf.shutil,
+        "which",
+        lambda name, *args, **kwargs: "/usr/bin/sqlite3"
+        if name == "sqlite3"
+        else real_which(name, *args, **kwargs),
+    )
+    monkeypatch.setattr(laf, "_cli_supports_recover", lambda _binary: True)
+    monkeypatch.setattr(laf, "_parse_sqlite3_cli_version", lambda _binary: (3, 46, 1))
+
+    def no_salvage(*_args, **_kwargs):
+        raise AssertionError("a WAL-reset-vulnerable CLI must never run .recover")
+
+    monkeypatch.setattr(laf, "run_cli_lost_and_found_recover", no_salvage)
+    with pytest.raises(SessionRecoverySourceError) as excinfo:
+        recover_session_database(
+            source,
+            output,
+            work_dir=tmp_path,
+            allow_partial=True,
+        )
+    message = str(excinfo.value)
+    assert "sessions" in message and "messages" in message
+    assert "not safe" in message
+    assert "3.46.1" in message
+    assert "WAL-reset" in message
     assert not output.exists()
 
 

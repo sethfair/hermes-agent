@@ -30,6 +30,8 @@ from hermes_cli.kanban_output import (
     _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
+from hermes_cli.kanban_claim_cli import _cmd_claim
+from hermes_cli.kanban_control_cli import _cmd_pause, _cmd_pause_status, _cmd_resume
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
@@ -632,6 +634,30 @@ def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
     return by
 
 
+def _cmd_ready_health(args: argparse.Namespace) -> int:
+    """Render the monitor projection without exposing task content or mutation controls."""
+    from hermes_cli import kanban_ready_monitor as monitor
+    from hermes_cli.config import load_config
+    try:
+        loaded = load_config()
+        config = loaded.get("kanban", {}) if isinstance(loaded, dict) else {}
+    except Exception:  # health: allow BLE001 -- unreadable config leaves the projection fail-closed
+        config = None
+    with kbc.connect_closing() as conn:
+        payload = monitor.ready_health_snapshot(conn, config=config)
+    if getattr(args, "task", None):
+        payload["cards"] = [card for card in payload["cards"] if card["task_id"] == args.task]
+    if getattr(args, "json", False):
+        _print_json(payload, ascii=True)
+    else:
+        print(f"Activation: {payload['activation']}")
+        for card in payload["cards"]:
+            age = card["ready_age_seconds"] if card["ready_age_seconds"] is not None else "UNKNOWN"
+            print(f"{card['task_id']} age={age} misses={card['eligible_miss_count']} "
+                  f"freshness={card['freshness']} decision={card['decision'] or 'UNKNOWN'}")
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -736,21 +762,6 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
     return _ok_or_err(ok, f"No such link: {args.parent_id} -> {args.child_id}",
                       f"Unlinked {args.parent_id} -> {args.child_id}")
-
-
-def _cmd_claim(args: argparse.Namespace) -> int:
-    with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
-        if task is None:
-            existing = kb.get_task(conn, args.task_id)
-            if existing is None:
-                return _err(f"no such task: {args.task_id}")
-            return _err(f"cannot claim {args.task_id}: status={existing.status} "
-                        f"lock={existing.claim_lock or '(none)'}")
-        workspace = kbw.resolve_workspace(task)
-        kbw.set_workspace_path(conn, task.id, str(workspace))
-    print(f"Claimed {task.id}\nWorkspace: {workspace}")
-    return 0
 
 
 def _cmd_comment(args: argparse.Namespace) -> int:
@@ -1295,21 +1306,22 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         )
         if value
     }
-    user_id, user_id_alt = _caller_identity_for_target(
-        args.platform, args.chat_id, args.thread_id, args.user_id, getattr(args, "user_id_alt", None))
+    from hermes_cli.kanban_notify_thread import resolve_subscribe_thread
     with kbc.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             return _err(f"no such task: {args.task_id}")
+        thread_id = resolve_subscribe_thread(conn, args)
+        user_id, user_id_alt = _caller_identity_for_target(
+            args.platform, args.chat_id, thread_id, args.user_id, getattr(args, "user_id_alt", None))
         kbn.add_notify_sub(
             conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-            chat_type=args.chat_type, thread_id=args.thread_id, user_id=user_id,
+            chat_type=args.chat_type, thread_id=thread_id, user_id=user_id,
             user_id_alt=user_id_alt,
             notifier_profile=args.notifier_profile or _profile_author(),
             delivery_mode=getattr(args, "delivery_mode", None),
             delivery_metadata=delivery_metadata or None,
         )
-    print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
-          + f" to {args.task_id}")
+    print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{thread_id}" if thread_id else "") + f" to {args.task_id}")
     return 0
 
 
@@ -1335,9 +1347,10 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_notify_thread import resolve_unsubscribe_thread
     with kbc.connect_closing() as conn:
         ok = kbn.remove_notify_sub(conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-                                  thread_id=args.thread_id)
+                                  thread_id=resolve_unsubscribe_thread(conn, args))
     return _ok_or_err(ok, "(no such subscription)", f"Unsubscribed from {args.task_id}")
 
 
@@ -1458,8 +1471,9 @@ _HANDLERS = {
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
-    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "ready-health": _cmd_ready_health,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+    "pause": _cmd_pause, "resume": _cmd_resume, "pause-status": _cmd_pause_status,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "provenance": _cmd_provenance,

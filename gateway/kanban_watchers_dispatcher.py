@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -132,6 +133,56 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        self.writer_ref = f"gateway-{uuid.uuid4()}"
+        self.controller_generation = str(uuid.uuid4())
+
+    def _monitor_context(self, conn: sqlite3.Connection):
+        """Build one process-generation context from the opened board scope."""
+        from hermes_cli import kanban_ready_monitor as monitor
+        scopes = conn.execute(
+            "SELECT * FROM kanban_monitor_scope_activation WHERE disabled_at IS NULL "
+            "AND state IN ('pending','active','faulted') ORDER BY id"
+        ).fetchall()
+        scope = scopes[0] if scopes else None
+        if scope is None:
+            return None
+        from hermes_cli.version_info import get_version_info
+        info = get_version_info()
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config().get("kanban", {})
+            configured_id = ((cfg.get("aged_ready") or {}).get("controller_id") or "").strip()
+        # health: allow BLE001 -- config load is a long-lived dispatcher boundary
+        except Exception:
+            cfg = {}
+            configured_id = ""
+        revision = info.commit or info.base_version
+        profile = scope["profile"]
+        try:
+            aged = monitor.parse_aged_ready_config(cfg) if isinstance(cfg, dict) else {}
+        except ValueError:
+            return None
+        aged_profiles = aged.get("dispatch_profiles", cfg.get("dispatch_profiles", ()))
+        dispatch_profiles = tuple(sorted({str(item).strip() for item in aged_profiles or () if str(item).strip()}))
+        if not dispatch_profiles:
+            dispatch_profiles = (profile,)
+        # Multi-writer rosters identify the writer by partition, not by one
+        # board-global controller id.
+        if not configured_id:
+            for member in ((aged.get("expected_writer_scopes", {}).get(scope["board_scope_id"], {}) or {}).get("members", ())):
+                if profile in (member.get("profiles") or ()):
+                    configured_id = str(member.get("writer_ref") or "")
+                    dispatch_profiles = tuple(sorted(str(p) for p in member.get("profiles", ()) if str(p).strip()))
+                    break
+        return monitor.MonitorWriterContext(
+            board_scope_id=scope["board_scope_id"], profile=profile,
+            writer_ref=configured_id or self.writer_ref,
+            controller_generation=self.controller_generation, activation_epoch=scope["activation_epoch"],
+            roster_generation=scope["roster_generation"], roster_digest=scope["roster_digest"],
+            installed_revision=revision, dispatch_profiles=dispatch_profiles,
+            min_age_seconds=int(aged.get("min_age_seconds", 1800)),
+            min_eligible_misses=int(aged.get("min_eligible_misses", 3)),
+        )
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -190,9 +241,11 @@ class _KanbanDispatcher:
             # HERMES_KANBAN_DB every enumerated slug must resolve to the pinned
             # file, or the dispatcher reads per-slug DBs nobody writes.
             from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_ready_monitor as monitor
             with _kb.pin_first_board_resolution():
                 conn = _kbc().connect(board=slug)
-                return _kbd().dispatch_once(conn, board=slug, **kwargs)
+                context = monitor.runtime_contexts(conn, self.writer_ref, self.controller_generation)
+                return _kbd().dispatch_once(conn, board=slug, monitor_context=context, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

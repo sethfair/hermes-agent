@@ -142,7 +142,7 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
             if not normed or normed in seen or not _dir_holds_board(child):
                 continue
             meta = read_board_metadata(normed)
-            if meta.get("archived") and not include_archived:
+            if meta.get("archived") is True and not include_archived:
                 continue
             entries.append(meta)
             seen.add(normed)

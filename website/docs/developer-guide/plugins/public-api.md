@@ -67,6 +67,8 @@ with a name allows that one name only.
 | `tools.browser_supervisor_capture` | whole module | developer-guide / plugins docs |
 | `tools.computer_use.backend` | whole module | developer-guide / plugins docs |
 | `tools.registry` | whole module | developer-guide / plugins docs |
+| `hermes_cli.kanban_control` | `control_status` | Kanban dashboard plugin pickup-control contract |
+| `hermes_cli.kanban_control` | `set_control_scope` | Kanban dashboard plugin pickup-control contract |
 | `agent.context_references` | whole module | PluginContext (hermes_cli/plugins_context.py) |
 | `agent.plugin_llm` | whole module | PluginContext (hermes_cli/plugins_context.py) |
 | `agent.transcription_provider` | whole module | PluginContext (hermes_cli/plugins_context.py) |
@@ -99,6 +101,7 @@ with a name allows that one name only.
 | `tools.clarify_gateway` | `SKIPPED` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `tools.url_safety` | `is_safe_url` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `tools.url_safety` | `create_ssrf_safe_async_client` | adding-platform-adapters.md § Public helpers for platform plugins |
+| `tools.url_safety` | `create_ssrf_safe_client` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `gateway.platforms._http_client_limits` | `platform_httpx_limits` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `hermes_cli.gateway_setup_wizard` | `print_setup_header` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `hermes_cli.gateway_setup_wizard` | `confirm_reconfigure` | adding-platform-adapters.md § Public helpers for platform plugins |
@@ -127,3 +130,11 @@ with a name allows that one name only.
 | `agent.file_safety` | `get_write_denied_error` | plugins/index.md § Check file paths and read YAML with Hermes's own helpers |
 | `hermes_yaml` | `safe_load` | plugins/index.md § Check file paths and read YAML with Hermes's own helpers |
 | `hermes_yaml` | `safe_dump` | plugins/index.md § Check file paths and read YAML with Hermes's own helpers |
+| `hermes_cli.urllib_security` | `open_credentialed_url` | plugins/index.md § Send a credentialed HTTP request without leaking it on redirect |
+| `agent.retry_utils` | `parse_retry_after_seconds` | plugins/index.md § Read a Retry-After header the way Hermes does |
+| `hermes_cli.chat_launch` | `hermes_command` | user-guide/features/plugins.md § A plugin with its own chat client |
+| `hermes_cli.chat_launch` | `print_exit_summary` | user-guide/features/plugins.md § A plugin with its own chat client |
+| `hermes_cli.gateway_chat` | `shell_client_env` | user-guide/features/plugins.md § A plugin with its own chat client |
+| `hermes_cli.session_worktree` | `create` | user-guide/features/plugins.md § A plugin with its own chat client |
+| `hermes_cli.session_worktree` | `restore` | user-guide/features/plugins.md § A plugin with its own chat client |
+| `hermes_cli.session_worktree` | `finish` | user-guide/features/plugins.md § A plugin with its own chat client |

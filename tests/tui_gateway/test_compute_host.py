@@ -5,7 +5,10 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+
+_BOOT_CEILING_SECS = 120.0
 
 
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
@@ -21,10 +24,56 @@ def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
 
 
 def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
-    try:
-        return out.get(timeout=timeout)
-    except queue.Empty as exc:
-        raise AssertionError("timed out waiting for compute host JSON") from exc
+    """Next non-heartbeat frame within ``timeout``; ``hb`` frames are not replies."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            frame = out.get(timeout=max(deadline - time.monotonic(), 0.0))
+        except queue.Empty as exc:
+            raise AssertionError("timed out waiting for compute host JSON") from exc
+        if frame.get("type") != "hb":
+            return frame
+
+
+def _read_hello(out: queue.Queue[dict], proc: subprocess.Popen) -> dict:
+    """Wait for the ``hello`` frame, which is emitted only after the child's cold import of
+    ``tui_gateway.server`` (2-10s+ on a loaded 4-worker runner). Boot is a different budget
+    from the 2s frame round trip, so wait for it event-based: fail as soon as the child
+    exits, with a generous ceiling only to bound a hang. The host heartbeats (``hb``) every
+    15s from construction, before that import finishes, so a slow boot sees ``hb`` frames
+    first; the supervisor ignores them while waiting and so do we."""
+    deadline = time.monotonic() + _BOOT_CEILING_SECS
+    while time.monotonic() < deadline:
+        try:
+            frame = out.get(timeout=0.2)
+        except queue.Empty:
+            if proc.poll() is not None:
+                stderr = proc.stderr.read() if proc.stderr else ""
+                raise AssertionError(
+                    f"compute host exited before hello: rc={proc.returncode}\n{stderr[-2000:]}")
+            continue
+        if frame.get("type") != "hb":
+            return frame
+    raise AssertionError("timed out waiting for compute host hello")
+
+
+class _AliveProc:
+    def poll(self) -> None:
+        return None
+
+
+def test_read_hello_skips_heartbeats_that_precede_hello():
+    out: queue.Queue[dict] = queue.Queue()
+    for frame in ({"type": "hb"}, {"type": "hb"}, {"type": "hello", "host_pid": 1}):
+        out.put(frame)
+    assert _read_hello(out, _AliveProc())["type"] == "hello"  # type: ignore[arg-type]
+
+
+def test_read_json_line_skips_heartbeats_before_reply():
+    out: queue.Queue[dict] = queue.Queue()
+    out.put({"type": "hb"})
+    out.put({"type": "shutdown.ack"})
+    assert _read_json_line(out)["type"] == "shutdown.ack"
 
 
 @pytest.mark.platforms("linux")
@@ -45,11 +94,7 @@ def test_compute_host_line_json_hello_and_shutdown():
     assert proc.stdin is not None
     out = _stdout_queue(proc)
     try:
-        # The hello waits behind the child's cold imports: hold it to the supervisor's own
-        # budget, not a tighter one that only a quiet machine meets (~1.3s idle, 5s+ loaded).
-        from tui_gateway.host_supervisor import _HELLO_TIMEOUT_SECS
-
-        hello = _read_json_line(out, timeout=_HELLO_TIMEOUT_SECS)
+        hello = _read_hello(out, proc)
         assert hello["type"] == "hello"
         assert hello["host_pid"] == proc.pid
 

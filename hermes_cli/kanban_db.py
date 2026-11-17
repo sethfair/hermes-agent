@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_control import CONTROL_SCHEMA_SQL
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -116,21 +117,6 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
-
-
-def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
-    """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
-    empty/None = inherit the profile's own effort (NULL). Anything else raises —
-    a typo'd level must not quietly hand the task back to the profile default."""
-    from hermes_constants import VALID_REASONING_EFFORTS
-
-    value = str(effort or "").strip().lower()
-    if not value:
-        return None
-    if value == "none" or value in VALID_REASONING_EFFORTS:
-        return value
-    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
-    raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -902,7 +888,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    dispatch_admission_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1009,6 +996,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+SCHEMA_SQL += CONTROL_SCHEMA_SQL
 
 
 # --- ID generation ---
@@ -2197,141 +2185,6 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
 
 # --- Claim / complete / block ---
-
-def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
-    ).fetchone() is None
-
-
-def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
-    """``(parent_id, status)`` for every direct parent :func:`_parents_satisfied`
-    still counts as open (``done`` / ``archived`` release the child), in id
-    order, so a refusal or a board view can name the blockers instead of the
-    caller guessing. Read-only."""
-    rows = conn.execute(
-        "SELECT p.id, p.status FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
-        "ORDER BY p.id", (task_id,),
-    ).fetchall()
-    return [(row["id"], row["status"]) for row in rows]
-
-
-def _claim_and_open_run(
-    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
-) -> Optional[int]:
-    """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
-    cur = conn.execute(
-        f"""
-        UPDATE tasks
-           SET status        = 'running',
-               claim_lock    = ?,
-               claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
-         WHERE id = ?
-           AND status = '{source_status}'
-           AND claim_lock IS NULL
-        """,
-        (lock, expires, now, task_id),
-    )
-    if cur.rowcount != 1:
-        return None
-    trow = conn.execute(
-        "SELECT assignee, max_runtime_seconds, current_step_key "
-        "FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    run_cur = conn.execute(
-        """
-        INSERT INTO task_runs (
-            task_id, profile, step_key, status,
-            claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-        """,
-        (
-            task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
-        ),
-    )
-    run_id = run_cur.lastrowid
-    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
-    _append_event(
-        conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
-    )
-    return run_id
-
-
-def claim_task(
-    conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
-) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
-
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
-    """
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        # Single enforcement point: never ready -> running with an undone
-        # parent, whichever writer set 'ready'. Demote to 'todo';
-        # recompute_ready re-promotes when the parents finish.
-        if not _parents_satisfied(conn, task_id):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
-            )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
-            return None
-        # Close a leaked prior run so the CAS below doesn't strand it.
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-        )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
-        if run_id is None:
-            return None
-        claimed = get_task(conn, task_id)
-    _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
-    return claimed
-
-
-def claim_review_task(
-    conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
-) -> Optional[Task]:
-    """Atomic ``review -> running`` (None when lost). Parents are re-checked
-    (one may have reopened meanwhile) and a NEW run tracks the reviewer
-    separately from the implementer."""
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        if not _parents_satisfied(conn, task_id):
-            demoted = conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
-            )
-            if demoted.rowcount == 1:
-                _append_event(
-                    conn, task_id, "dependency_wait",
-                    {"reason": "parent_reopened", "source_status": "review"},
-                )
-            return None
-        run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
-        )
-        if run_id is None:
-            return None
-        return get_task(conn, task_id)
 
 
 def _retry_status_for_run(
@@ -3872,61 +3725,30 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+from hermes_cli.kanban_db_triage import (
+    TriageReleaseGuardConnection,
+    TriageReleaseGuardResult,
+    TriageReleaseReceipt,
+    _release_triage_task,
+    guarded_specify_triage_task,
+)
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
 ) -> bool:
-    """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
-    """
-    if title is not None and not title.strip():
-        raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
-        existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
-            (task_id,),
-        ).fetchone()
-        if existing is None:
-            return False
-        sets: list[str] = ["status = 'todo'"]
-        params: list[Any] = []
-        changed_fields: list[str] = []
-        if title is not None and title.strip() != (existing["title"] or ""):
-            sets.append("title = ?")
-            params.append(title.strip())
-            changed_fields.append("title")
-        if body is not None and (body or "") != (existing["body"] or ""):
-            sets.append("body = ?")
-            params.append(body)
-            changed_fields.append("body")
-        if assignee is not None and assignee != (existing["assignee"] or None):
-            sets.append("assignee = ?")
-            params.append(assignee)
-            changed_fields.append("assignee")
-        params.append(task_id)
-        cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'", tuple(params),
-        )
-        if cur.rowcount != 1:
-            return False
-        if changed_fields and author and author.strip():
-            # Not add_comment (own txn + 'commented' event); 'specified' below records it.
-            _insert_comment(
-                conn, task_id, author.strip(),
-                "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
-                int(time.time()),
-            )
-        _append_event(
-            conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
-        )
-    # Own IMMEDIATE txn (outside the one above): a parent-free specified task
-    # flips to 'ready' now instead of idling until the next tick.
-    recompute_ready(conn)
-    return True
+    """Backward-compatible unguarded specification and Triage release."""
+    # No guard, so no scoped authorizer: any connection kind works and its own
+    # authorizer is left untouched.
+    receipt = _release_triage_task(
+        conn, task_id, guard=None, title=title, body=body, assignee=assignee, author=author,
+    )
+    if receipt.released:
+        # Own IMMEDIATE txn (outside the release one): a parent-free specified task
+        # flips to 'ready' now instead of idling until the next tick.
+        recompute_ready(conn)
+    return receipt.released
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
@@ -4355,12 +4177,23 @@ from hermes_cli.kanban_db_connect import (
     init_db,
     write_txn,
 )
+from hermes_cli.kanban_db_claim import (
+    ClaimAttemptResult,
+    _claim_and_open_run,
+    _parents_satisfied,
+    claim_review_task,
+    claim_review_task_result,
+    claim_task,
+    claim_task_result,
+    unsatisfied_parents,
+)
 from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
 )
+from hermes_cli.kanban_db_policy import normalize_reasoning_effort
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
