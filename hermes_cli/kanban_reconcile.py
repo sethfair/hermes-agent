@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import tempfile
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -524,6 +525,24 @@ def reconcile(source: Path, target: Path, seed_file: Path, output: Path, *, appl
             except sqlite3.OperationalError:
                 pass
         dest.commit()
+        # Generated boards must be immediately usable by current dispatcher
+        # callers even when the preserved target predates the optional monitor.
+        # Install only that production-owned runtime schema after reconciliation
+        # so its admission trigger cannot alter import semantics.
+        from hermes_cli.kanban_ready_monitor import ensure_schema as ensure_monitor_schema
+        had_board_identity = dest.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_board_identity'"
+        ).fetchone() is not None and dest.execute(
+            "SELECT 1 FROM kanban_board_identity WHERE singleton=1"
+        ).fetchone() is not None
+        ensure_monitor_schema(dest)
+        if not had_board_identity:
+            scope_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "hermes-kanban:" + target_snapshot_sha))
+            dest.execute(
+                "UPDATE kanban_board_identity SET board_scope_id=?, created_at=0, identity_version=1 WHERE singleton=1",
+                (scope_id,),
+            )
+            dest.commit()
     ready = build_ready(output, gid=gid, nonce=nonce)
     report.update({"dry_run": False, "generation_id": gid, "generation_nonce": nonce, "ready_sha256": sha256_file(output / "READY.json"), "manifest_digest": ready["manifest_digest"]})
     _atomic_json(output / "import-journal.json", {"import_id": import_id, "generation_id": gid, "state": "prepared"})
