@@ -42,7 +42,7 @@ def _guard_decision(reason: str) -> str:
 
 
 def _claim_lane_task(
-    conn: Any, task_id: str, lane: str, ttl_seconds: Optional[int],
+    conn: Any, task_id: str, lane: str, assignee: str, ttl_seconds: Optional[int],
     monitor_attempt_id: Optional[str], monitor_context: Any,
 ) -> Any:
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
@@ -60,8 +60,11 @@ def _claim_lane_task(
         )
         conn.commit()
     if lane == "ready":
-        return claim(conn, task_id, ttl_seconds=ttl_seconds, admission_id=admission_id)
-    return claim(conn, task_id, ttl_seconds=ttl_seconds)
+        return claim(
+            conn, task_id, ttl_seconds=ttl_seconds,
+            admission_id=admission_id, expect_assignee=assignee,
+        )
+    return claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
 
 
 def _count_spawn(
@@ -127,7 +130,9 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee, per_profile_cap, per_profile_running)
         return True
-    claimed = _claim_lane_task(conn, task_id, lane, ttl_seconds, monitor_attempt_id, monitor_context)
+    claimed = _claim_lane_task(
+        conn, task_id, lane, assignee, ttl_seconds, monitor_attempt_id, monitor_context,
+    )
     if claimed is None:
         if lane == "ready":
             _decision(result, task_id, "eligible_missed")
