@@ -45,26 +45,15 @@ def _claim_lane_task(
     conn: Any, task_id: str, lane: str, assignee: str, ttl_seconds: Optional[int],
     monitor_attempt_id: Optional[str], monitor_context: Any,
 ) -> Any:
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    admission_id = None
-    if lane == "ready" and monitor_attempt_id and monitor_context is not None:
-        from hermes_cli import kanban_ready_monitor as monitor
-
-        generation = monitor.ready_generation(conn, task_id)
-        run_generation = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id=?", (task_id,)
-        ).fetchone()[0]
-        admission_id = monitor.arm_claim_admission(
-            conn, attempt_id=monitor_attempt_id, task_id=task_id,
-            ready_generation=generation[0] if generation else 0, run_generation=int(run_generation),
-        )
-        conn.commit()
     if lane == "ready":
-        return claim(
+        return _kb.claim_task_result(
             conn, task_id, ttl_seconds=ttl_seconds,
-            admission_id=admission_id, expect_assignee=assignee,
+            monitor_attempt_id=monitor_attempt_id if monitor_context is not None else None,
+            expect_assignee=assignee,
         )
-    return claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
+    return _kb.claim_review_task_result(
+        conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee,
+    )
 
 
 def _count_spawn(
@@ -130,11 +119,21 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee, per_profile_cap, per_profile_running)
         return True
-    claimed = _claim_lane_task(
+    attempt = _claim_lane_task(
         conn, task_id, lane, assignee, ttl_seconds, monitor_attempt_id, monitor_context,
     )
+    claimed = attempt.task
     if claimed is None:
-        if lane == "ready":
+        if attempt.reason == "kanban_paused":
+            result.control_state = "paused"
+            _decision(result, task_id, "control_hold", attempt.reason)
+            raise _dispatch.DispatchControlHeld(result)
+        elif attempt.reason == "kanban_control_unknown":
+            result.control_state = "unknown"
+            result.control_error = "control_state_invalid"
+            _decision(result, task_id, "control_hold", attempt.reason)
+            raise _dispatch.DispatchControlHeld(result)
+        elif lane == "ready":
             _decision(result, task_id, "eligible_missed")
         return False
     workspace, branch_name, workspace_error = _dispatch._resolve_lane_workspace(claimed, board)
