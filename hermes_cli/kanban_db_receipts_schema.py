@@ -124,15 +124,41 @@ CREATE TABLE IF NOT EXISTS advisory_notices (
 """
 
 
-def ensure_board_identity_schema(conn: sqlite3.Connection) -> None:
+def ensure_board_identity_schema(
+    conn: sqlite3.Connection, *, identity_board: str = "default"
+) -> None:
     """Upgrade the v1 receipt identity row without changing its board binding."""
     rows = conn.execute("PRAGMA table_info(kanban_board_identity)").fetchall()
     if not rows:
         return
     columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
-    for name, definition in (("board_scope_id", "TEXT"), ("created_at", "INTEGER"), ("identity_version", "INTEGER")):
+    board_added = "board" not in columns
+    for name, definition in (
+        ("board", "TEXT"),
+        ("board_scope_id", "TEXT"),
+        ("created_at", "INTEGER"),
+        ("identity_version", "INTEGER"),
+    ):
         if name not in columns:
             conn.execute(f"ALTER TABLE kanban_board_identity ADD COLUMN {name} {definition}")
+    if board_added:
+        immutable_update = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name='kanban_board_identity_immutable_update'"
+        ).fetchone()
+        if immutable_update is not None:
+            conn.execute("DROP TRIGGER kanban_board_identity_immutable_update")
+        conn.execute(
+            "UPDATE kanban_board_identity SET board = ? "
+            "WHERE singleton = 1 AND board IS NULL",
+            (identity_board,),
+        )
+        if immutable_update is not None:
+            conn.execute(
+                "CREATE TRIGGER kanban_board_identity_immutable_update "
+                "BEFORE UPDATE ON kanban_board_identity "
+                "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
+            )
     row = conn.execute(
         "SELECT singleton, board_scope_id, created_at, identity_version "
         "FROM kanban_board_identity WHERE singleton = 1"

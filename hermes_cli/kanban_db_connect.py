@@ -782,10 +782,13 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
-                _kb.ensure_board_identity_schema(conn)
+                identity_board = _trusted_board_for_path(path, board) or _kb.DEFAULT_BOARD
+                _kb.ensure_board_identity_schema(
+                    conn, identity_board=identity_board
+                )
                 _migrate_add_optional_columns(
                     conn,
-                    identity_board=_trusted_board_for_path(path, board) or _kb.DEFAULT_BOARD,
+                    identity_board=identity_board,
                 )
                 _bind_action_receipt_board(conn, path, board)
                 _INITIALIZED_PATHS.add(resolved)

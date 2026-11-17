@@ -357,7 +357,7 @@ END;
 def ensure_schema(conn: sqlite3.Connection, *, identity_board: str = "default") -> None:
     conn.execute("DROP TRIGGER IF EXISTS kanban_ready_claim_admission")
     conn.executescript(MONITOR_SCHEMA_SQL)
-    ensure_board_identity_schema(conn)
+    ensure_board_identity_schema(conn, identity_board=identity_board)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_ready_episodes)")}
     if "authority_set_digest" not in columns:
         conn.execute("ALTER TABLE kanban_ready_episodes ADD COLUMN authority_set_digest TEXT")

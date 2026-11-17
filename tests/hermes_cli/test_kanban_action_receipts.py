@@ -1034,6 +1034,60 @@ def test_exact_base_schema_migrates_idempotently_across_reconnects(tmp_path):
     assert inventories[0] == inventories[1] == inventories[2]
 
 
+def test_immediate_base_identity_migrates_with_immutable_scope_and_default_off(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    db_path = home / "kanban" / "boards" / "acme" / "kanban.db"
+    db_path.parent.mkdir(parents=True)
+    kb._INITIALIZED_PATHS.clear()
+    fixture = Path(__file__).parents[1] / "fixtures" / "kanban_pre_action_receipts.sql"
+    scope_id = "00000000-0000-4000-8000-000000000024"
+    with sqlite3.connect(db_path) as raw:
+        raw.executescript(fixture.read_text(encoding="utf-8"))
+        raw.executescript(
+            """
+            CREATE TABLE kanban_board_identity (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                board_scope_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                identity_version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TRIGGER kanban_board_identity_immutable_update
+            BEFORE UPDATE ON kanban_board_identity
+            BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END;
+            CREATE TRIGGER kanban_board_identity_immutable_delete
+            BEFORE DELETE ON kanban_board_identity
+            BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END;
+            """
+        )
+        raw.execute(
+            "INSERT INTO kanban_board_identity VALUES (1, ?, 1700000000, 1)",
+            (scope_id,),
+        )
+
+    for _ in range(2):
+        kbc.init_db(db_path, board="acme")
+        with closing(kbc.connect(db_path, board="acme")) as migrated:
+            identity = migrated.execute(
+                "SELECT board, board_scope_id, created_at, identity_version "
+                "FROM kanban_board_identity WHERE singleton = 1"
+            ).fetchone()
+            assert tuple(identity) == ("acme", scope_id, 1700000000, 1)
+            assert action_receipts_mode(migrated, board="acme") == "off"
+            with pytest.raises(sqlite3.IntegrityError, match="immutable_board_identity"):
+                migrated.execute(
+                    "UPDATE kanban_board_identity SET board_scope_id = 'changed' "
+                    "WHERE singleton = 1"
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="immutable_board_identity"):
+                migrated.execute(
+                    "DELETE FROM kanban_board_identity WHERE singleton = 1"
+                )
+
+
 def test_action_and_notice_malformed_schema_versions_fail_closed(conn):
     _task_id, action_context, action_request = _live_transition_setup(conn)
     action_request = replace(action_request, projection=None, operation_id="op-bad-action-schema")

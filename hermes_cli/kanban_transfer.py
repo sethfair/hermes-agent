@@ -50,6 +50,16 @@ ARCHIVE_FORMAT_VERSION = 1
 # alone rather than having their history rewritten.
 _DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled")
 _COUNTED_TABLES = ("tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments")
+_AUTHENTICATED_BOARD_TABLES = (
+    "service_principals",
+    "configured_callers",
+    "principal_registry_events",
+    "kanban_capabilities",
+    "kanban_capability_events",
+    "operation_keys",
+    "action_receipts",
+    "advisory_notices",
+)
 
 
 def _placeholders(items) -> str:
@@ -239,6 +249,33 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _refuse_authenticated_board_rebinding(db_path: Path, target: str) -> None:
+    """Fail before publication when import would strand board-keyed authority."""
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        bound_boards: set[str] = set()
+        for table in _AUTHENTICATED_BOARD_TABLES:
+            if table not in tables:
+                continue
+            bound_boards.update(
+                str(row[0])
+                for row in conn.execute(
+                    f"SELECT DISTINCT board FROM {table} WHERE board IS NOT NULL"
+                ).fetchall()
+            )
+    if bound_boards and bound_boards != {target}:
+        sources = ", ".join(sorted(bound_boards))
+        raise ValueError(
+            f"authenticated board state for {sources!r} cannot be imported as "
+            f"{target!r}; import under its original unused slug"
+        )
+
+
 def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine; returns ``(stats, warnings)``.
 
@@ -350,6 +387,11 @@ def import_board(
                 "explicitly with --as <slug>"
             )
         target = _available_slug(requested)
+
+        # Receipt and principal history is authoritative and board-keyed. Until
+        # import has an explicit history-preserving rekey protocol, reject a
+        # rename/collision before creating target metadata or moving any files.
+        _refuse_authenticated_board_rebinding(staged_db, target)
 
         staged_meta = _read_board_metadata(extracted / "board.json")
 
