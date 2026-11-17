@@ -230,6 +230,20 @@ _HARDLINE_PATTERNS_NO_WHATIF = [
     (re.compile(_WHATIF_STRICT[d], _RE_FLAGS), d, q) if d in _WHATIF_STRICT else (r, d, q)
     for r, d, q in HARDLINE_PATTERNS_COMPILED
 ]
+# Flat command lists made only of bare words, switches, whitespace and semicolons need none of the
+# shell projection machinery below. In particular, PowerShell treats every bare CR as a statement
+# boundary; sending a long CR-delimited list through every quote/substitution projection repeated
+# several full linear walks. Keep this lane deliberately narrow: any quoting, escaping, path,
+# redirection, grouping, variable expansion, carrier/wrapper, or compound-shell keyword uses the
+# general parser. Semicolons are unambiguous separators in this grammar and become the newline
+# already understood by ``_CMDPOS``; CR stays intact for the Windows command-position rules.
+_FLAT_HARDLINE_COMMAND_RE = re.compile(r"[A-Za-z0-9 \t\r\n;-]*\Z")
+_FLAT_HARDLINE_COMPLEX_WORD_RE = re.compile(
+    r"\b(?:if|then|else|elif|do|while|until|eval|source|sh|bash|zsh|ksh|dash|env|exec|nohup|setsid|time|"
+    r"command|builtin|nice|timeout|stdbuf|ionice|chrt|taskset|chroot|sudo|doas|xargs|su|runuser|"
+    r"powershell|pwsh|cmd)\b",
+    re.IGNORECASE,
+)
 # Commands that hand a quoted argument to another shell to EXECUTE: quoted text is code, not
 # prose, so quote-masked hardline rules scan the raw string.
 _SHELL_CARRIER_NAMES = frozenset({"eval", "sh", "bash", "zsh", "ksh", "dash", "source", "."})
@@ -386,6 +400,20 @@ def detect_hardline_command(command: str) -> tuple:
     return verdict
 
 
+def _flat_hardline_verdict(command: str) -> tuple | None:
+    """Classify the narrow flat grammar directly, or return ``None`` for the full parser."""
+    if not _FLAT_HARDLINE_COMMAND_RE.fullmatch(command) or _FLAT_HARDLINE_COMPLEX_WORD_RE.search(command):
+        return None
+    variant = command.replace(";", "\n").lower()
+    patterns = HARDLINE_PATTERNS_COMPILED
+    if "whatif" in variant and not whatif_preview_is_real(command):
+        patterns = _HARDLINE_PATTERNS_NO_WHATIF
+    for pattern_re, description, _quote_masked in patterns:
+        if pattern_re.search(variant):
+            return (True, description)
+    return (False, None)
+
+
 # Where a command may start, for the fallback below: separators, grouping, substitution openers,
 # quotes (so `sh -c "mkfs …"` exposes its payload) and the compound-command keywords. The
 # quote-free variant keeps quotes out (they are deleted) and `${` intact, so `rm -rf ${HOME}` holds.
@@ -429,6 +457,8 @@ def hardline_scan_incomplete(command: str) -> bool:
 def _detect_hardline_command(command: str) -> tuple:
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
+    if (flat_verdict := _flat_hardline_verdict(command)) is not None:
+        return flat_verdict
     # The malformed-quoting verdict needs the author's quote state. Normalization strips escapes
     # (`\"` -> `"`), so a shell-valid pattern like `grep -o "[^\"]*"` lexed as unterminated and was
     # reported as a hardline block (118 of 125 hardline blocks in one week of real use, every one a
