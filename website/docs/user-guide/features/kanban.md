@@ -138,6 +138,37 @@ They also coexist inside one run. A kanban task executes in an isolated managed 
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Pause new Kanban pickups
+
+Use the standalone Kanban control when you need queued cards to stay queued while
+already-running workers finish normally:
+
+```bash
+hermes kanban pause --reason "maintenance"
+hermes kanban pause-status --json
+hermes kanban resume --reason "maintenance complete"
+```
+
+With no `--board`, these commands operate convergently on every active,
+non-archived board in deterministic order. Add the existing global
+`--board <slug>` option before the subcommand to target one board, for example
+`hermes kanban --board docs pause`. Status output includes each board's state,
+revision, actor, reason, and observation time. A mixed or partly failed
+multi-board operation reports `partial`; unreadable or invalid control state
+reports `unknown`. Neither is treated as running, and retrying the desired state
+safely converges boards that did not change on the first attempt.
+
+This control blocks only new Ready and Review claims. It does not terminate or
+alter existing Running workers, stop unrelated cron or scheduled jobs, or change
+global Hermes sessions. Dispatcher recovery still releases crashed or expired
+workers back to their queue and promotes newly eligible Todo cards, but it does
+not start replacements while paused.
+
+`hermes kanban pause` is separate from the global `hermes pause` emergency
+control. Before downgrading to a Hermes version that predates this feature,
+resume every board and read back `running`; older code does not understand the
+durable Kanban pause table.
+
 ### Read-only aged-Ready health
 
 Hermes includes a default-off, metadata-only aged-Ready monitor. It records Ready generations,
@@ -1282,6 +1313,13 @@ target is that same chat (and topic), a missing `--user-id` is filled with the s
 `group_sessions_per_user` (the default), that keeps the wake in the participant's own session instead
 of a second, shared one. Subscriptions to any other chat or topic never take the caller's id, and
 neither does one given an explicit `--user-id-alt`.
+
+Without `--thread-id`, the subscription targets the caller's own topic when it subscribes its own chat
+from inside a gateway session. Otherwise it takes the thread of this task's existing subscription to the
+same chat; when several exist, it takes the lowest thread id and names the others on stderr. A Telegram
+DM target with nothing to infer from warns that the ping goes to the DM root.
+`notify-unsubscribe` without `--thread-id` removes the matching row the same way: the chat's root-lane
+subscription when there is one, else the caller's own topic, else the chat's only threaded subscription.
 
 **Discord threads under `profile_routes`:** when the gateway multiplexes profiles and routes a *channel*
 to a profile, a subscription created from the CLI for a *thread* in that channel needs the thread's route

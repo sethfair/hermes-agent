@@ -29,6 +29,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli._startup_fast import project_root_str
 
 _log = logging.getLogger(__name__)
 
@@ -160,9 +161,27 @@ class DispatchResult:
     monitor_scope_refused: bool = False
     monitor_attempt_id: Optional[str] = None
     monitor_decisions: list[dict[str, Any]] = field(default_factory=list)
+    control_state: str = "running"
+    control_error: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+
+
+class DispatchControlHeld(RuntimeError):
+    def __init__(self, result: DispatchResult):
+        super().__init__(result.control_state)
+        self.result = result
+
+
+def _dispatch_control_result(conn: sqlite3.Connection) -> Optional[DispatchResult]:
+    """Return a fail-closed no-work result when board admission is not running."""
+    from hermes_cli.kanban_control import read_control
+
+    state = read_control(conn)
+    if state.state == "running":
+        return None
+    return DispatchResult(control_state=state.state, control_error=state.error_code)
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -1706,19 +1725,19 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
-    """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
-    imported (local import avoids a cycle; callers fall back to trusting the
-    assignee).
+    """``profile_exists`` from ``hermes_cli.profiles``; ``None`` when it cannot be
+    imported and no allowlist is set (callers then trust the assignee).
 
-    When ``kanban.dispatch_profiles`` is set (#110995) the returned predicate
-    additionally requires the assignee to be listed, fail-closed — so a card
-    assigned to ``default`` is only claimable by homes that opted into it.
-    Foreign assignees land in the existing ``skipped_nonspawnable`` bucket.
-    """
+    With ``kanban.dispatch_profiles`` set (#110995) the predicate also requires the
+    assignee to be listed, fail-closed: a ``default`` card is only claimable by homes that
+    opted in, and a set allowlist whose gate cannot be built claims nothing (#147531)."""
     try:
         from hermes_cli.profiles import normalize_profile_name, profile_exists
     except Exception:
-        return None
+        if _dispatch_profile_allowlist(str) is None:
+            return None
+        _kb._log.warning("kanban: hermes_cli.profiles unimportable — claiming no cards", exc_info=True)
+        return lambda _name: False
     allowlist = _dispatch_profile_allowlist(normalize_profile_name)
     if allowlist is None:
         return profile_exists
@@ -1783,15 +1802,14 @@ def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
 
 
 def dispatch_profile_allowlist_summary() -> str:
-    """Human-readable resolution of ``kanban.dispatch_profiles`` for this home.
-
-    Surfaced by ``hermes kanban diagnostics`` so an operator on a shared board
-    can see what a home believes it may claim (#113620): ``any`` (key absent),
-    the sorted allowed names, or ``none (fail-closed: ...)``.
-    """
+    """What this home may claim, for ``hermes kanban diagnostics`` (#113620): ``any``
+    (key absent; also when profiles cannot import, as the gate then stays open too),
+    the sorted allowed names, or ``none (fail-closed: ...)``, as `_profile_exists_fn`."""
     try:
         from hermes_cli.profiles import normalize_profile_name
     except Exception as exc:
+        if _dispatch_profile_allowlist(str) is None:
+            return "any"
         return f"none (fail-closed: profiles unavailable: {exc})"
     allowlist = _dispatch_profile_allowlist(normalize_profile_name)
     if allowlist is None:
@@ -1822,7 +1840,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
     "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
-    back to "any assigned" when ``profile_exists`` is unimportable.
+    back to "any assigned" when profiles cannot import and no allowlist is set.
     """
     return _has_spawnable(conn, "ready")
 
@@ -2012,6 +2030,17 @@ def dispatch_once(
                 else (() if monitor_context is None else (monitor_context,)))
 
     def _locked_tick() -> DispatchResult:
+        held = _dispatch_control_result(conn)
+        if held is not None:
+            return _dispatch_once_locked(
+                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+                max_spawn=max_spawn, max_in_progress=max_in_progress,
+                failure_limit=failure_limit, stale_timeout_seconds=stale_timeout_seconds,
+                board=board, default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconcile_orphans=reconcile_orphans, skip_reclaim=_skip_reclaim,
+                control_hold=held,
+            )
         from hermes_cli import kanban_ready_monitor as monitor
         try:
             from hermes_cli.config import load_config
@@ -2074,7 +2103,17 @@ def dispatch_once(
         # dispatcher fallback.  Protected boards must never bypass their lock
         # and admission fence when the path cannot be resolved.
         from hermes_cli import kanban_ready_monitor as monitor
-        if monitor.has_protected_scope(conn):
+        held = _dispatch_control_result(conn)
+        if held is not None:
+            result = _dispatch_once_locked(
+                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+                max_spawn=max_spawn, max_in_progress=max_in_progress,
+                failure_limit=failure_limit, stale_timeout_seconds=stale_timeout_seconds,
+                board=board, default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconcile_orphans=reconcile_orphans, control_hold=held,
+            )
+        elif monitor.has_protected_scope(conn):
             monitor.record_writer_faults(conn, "writer_scope_incomplete")
             result = DispatchResult(monitor_scope_refused=True)
         else:
@@ -2154,282 +2193,6 @@ def _spawn_lane_worker(
             )
         _log.debug("kanban dispatcher: worker spawn failed for %s", claimed.id, exc_info=True)
         return False, exc, infrastructure
-
-
-def _apply_default_assignee(
-    conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
-) -> bool:
-    """Persist ``kanban.default_assignee`` on an unassigned ready row.
-
-    Mutating the row keeps board state honest: the task is legitimately owned
-    by the default, not "unassigned but secretly routed". ``dry_run`` reports
-    without writing. Returns False when the write failed.
-    """
-    if dry_run:
-        return True
-    try:
-        with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                "AND (assignee IS NULL OR assignee = '')",
-                (assignee, task_id),
-            )
-            _kb._append_event(
-                conn, task_id, "assigned",
-                {"assignee": assignee, "source": "kanban.default_assignee"},
-            )
-    except Exception:
-        _kb._log.debug(
-            "kanban dispatch: failed to apply default_assignee=%r to task %s",
-            assignee, task_id, exc_info=True,
-        )
-        return False
-    return True
-
-
-def _run_reclaim_phase(
-    conn: sqlite3.Connection,
-    result: DispatchResult,
-    *,
-    stale_timeout_seconds: int,
-    failure_limit: int,
-    reconcile_orphans: bool,
-    board: Optional[str] = None,
-) -> None:
-    """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
-    reap_worker_zombies()
-    result.reaped_terminal_workers = reap_terminal_workers(conn)
-    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
-    if reconcile_orphans:
-        result.reconciled_orphans = reconcile_orphaned_running(conn)
-    result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn, board=board)
-    # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
-    # went back to ``ready`` and the respawn guard defers them until quota clears.
-    result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
-    result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
-
-
-def _tick_spawn_budget(
-    conn: sqlite3.Connection,
-    result: DispatchResult,
-    *,
-    max_spawn: Optional[int],
-    max_in_progress: Optional[int],
-    board: Optional[str],
-) -> tuple[bool, Optional[int]]:
-    """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
-
-    ``max_spawn`` is a live per-board concurrency cap (running + this tick's
-    spawns), not a per-tick budget — a per-tick reading would grow concurrency
-    by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
-    every other board count against the same budget, else N boards multiply the
-    cap by N — exactly the fan-out the memory-derived default exists to prevent.
-    """
-    # Count already-running tasks so max_spawn enforces concurrency, not a
-    # per-tick budget: "running" tasks stay running until the worker makes a terminal
-    # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
-    running_count = 0
-    spawn_budget: Optional[int] = None
-    if max_spawn is not None or max_in_progress is not None:
-        running_count = count_running_tasks(conn)
-
-    # Both ready and review loops consume from the same budget.
-    if max_spawn is not None:
-        if running_count >= max_spawn:
-            return False, None
-        spawn_budget = max_spawn - running_count
-
-    if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
-        if total_running >= max_in_progress:
-            return False, None
-        remaining = max_in_progress - total_running
-        if spawn_budget is None or spawn_budget > remaining:
-            spawn_budget = remaining
-
-    # Memory-pressure guard: a static cap can't see the host's actual state.
-    # critical -> spawn nothing this tick; elevated -> at most one new worker.
-    # Reclaim/promotion already ran, so bookkeeping stays live; deferred tasks
-    # wait for a later tick. "unknown" imposes no restriction.
-    pressure = _memory_pressure_level()
-    if pressure == "critical":
-        result.memory_pressure = pressure
-        _kb._log.warning(
-            "kanban dispatch: system memory pressure is critical; "
-            "spawning no new workers this tick (deferred, not dropped)"
-        )
-        return False, None
-    if pressure == "elevated":
-        result.memory_pressure = pressure
-        if spawn_budget is None or spawn_budget > 1:
-            _kb._log.warning(
-                "kanban dispatch: system memory pressure is elevated; "
-                "limiting to at most 1 new worker this tick"
-            )
-            spawn_budget = 1
-    return True, spawn_budget
-
-
-def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
-    return conn.execute(
-        "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
-
-
-def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
-    """``kanban.default_assignee`` when it names a real profile this home may
-    claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
-    gate). Otherwise ``None`` so an unassigned shared-board card is never
-    written to. When the profiles module isn't importable trust the
-    operator's config: the downstream check still buckets a missing profile
-    as nonspawnable."""
-    name = (default_assignee or "").strip() or None
-    if name:
-        profile_exists = _profile_exists_fn()
-        if profile_exists is not None and not profile_exists(name):
-            return None
-    return name
-
-
-def _monitor_profiles(partitions: Optional[Mapping[str, Any]], profile: Optional[str]) -> set[str]:
-    return set(partitions or ()) or ({profile} if profile else set())
-
-
-def _ensure_partition_decisions(conn, result, reason: str, profiles: set[str]) -> None:
-    from hermes_cli import kanban_ready_monitor as monitor
-    for profile in profiles or {None}:
-        monitor.ensure_ready_decisions(conn, result, reason, profile=profile)
-
-
-def _monitor_partition(partitions, profile, attempt_id, context):
-    return (partitions or {}).get(profile) or (attempt_id, context)
-
-
-def _dispatch_once_locked(
-    conn: sqlite3.Connection,
-    *,
-    spawn_fn=None,
-    ttl_seconds: Optional[int] = None,
-    dry_run: bool = False,
-    max_spawn: Optional[int] = None,
-    max_in_progress: Optional[int] = None,
-    failure_limit: int = DEFAULT_FAILURE_LIMIT,
-    stale_timeout_seconds: int = 0,
-    board: Optional[str] = None,
-    default_assignee: Optional[str] = None,
-    max_in_progress_per_profile: Optional[int] = None,
-    reconcile_orphans: bool = True,
-    monitor_attempt_id: Optional[str] = None,
-    monitor_context=None,
-    monitor_profile: Optional[str] = None,
-    monitor_partitions: Optional[dict[str, tuple[str, Any]]] = None,
-    skip_reclaim: bool = False,
-) -> DispatchResult:
-    result = DispatchResult()
-    from hermes_cli import kanban_ready_monitor as monitor
-    if not skip_reclaim:
-        _run_reclaim_phase(
-            conn, result, stale_timeout_seconds=stale_timeout_seconds,
-            failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
-        )
-    may_spawn, spawn_budget = _tick_spawn_budget(
-        conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
-    )
-    if conn.in_transaction:
-        conn.commit()
-    if not may_spawn:
-        for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'"):
-            monitor.reconcile_truthful_hold(conn, episode["task_id"])
-        _ensure_partition_decisions(
-            conn, result, "memory_pressure" if result.memory_pressure else "board_cap",
-            _monitor_profiles(monitor_partitions, monitor_profile),
-        )
-        return result
-
-    ready_rows = _lane_rows(conn, "ready")
-    allowed_profiles = _monitor_profiles(monitor_partitions, monitor_profile)
-    if allowed_profiles:
-        ready_rows = [row for row in ready_rows if row["assignee"] in allowed_profiles]
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
-    if allowed_profiles:
-        review_rows = [row for row in review_rows if row["assignee"] in allowed_profiles]
-    per_profile_cap = max_in_progress_per_profile if (
-        # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
-        # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
-        # workloads from melting a single profile's local model / API quota / browser pool while leaving
-        # other profiles idle.
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
-    ) else None
-    per_profile_running: dict[str, int] = {}
-    if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
-        conn, review_rows,
-        per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-    ):
-        ready_budget = max(spawn_budget - 1, 0)
-    lane_kwargs: dict[str, Any] = dict(
-        dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
-        failure_limit=failure_limit, spawn_fn=spawn_fn,
-        per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-    )
-    default_assignee = _resolve_default_assignee(default_assignee)
-    spawned = 0
-    for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
-            result.monitor_decisions.append({"task_id": row["id"], "decision": "shared_budget_exhausted"})
-            continue
-        row_assignee = row["assignee"]
-        if not row_assignee:
-            # Honour kanban.default_assignee so an unassigned task doesn't
-            # park in 'ready' forever.
-            if not default_assignee or not _apply_default_assignee(
-                conn, row["id"], default_assignee, dry_run=dry_run,
-            ):
-                result.skipped_unassigned.append(row["id"])
-                result.monitor_decisions.append({"task_id": row["id"], "decision": "unassigned"})
-                continue
-            row_assignee = default_assignee
-            result.auto_assigned_default.append(row["id"])
-        attempt_id, context = _monitor_partition(
-            monitor_partitions, row_assignee, monitor_attempt_id, monitor_context)
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready",
-                               monitor_attempt_id=attempt_id, monitor_context=context,
-                               **lane_kwargs):
-            spawned += 1
-
-    for row in review_rows:
-        if spawn_budget is not None and spawned >= spawn_budget:
-            continue
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
-            continue
-        attempt_id, context = _monitor_partition(
-            monitor_partitions, row["assignee"], monitor_attempt_id, monitor_context)
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review",
-                               monitor_attempt_id=attempt_id, monitor_context=context,
-                               **lane_kwargs):
-            spawned += 1
-    for episode in conn.execute("SELECT task_id FROM kanban_ready_episodes WHERE state='open'"):
-        monitor.reconcile_truthful_hold(conn, episode["task_id"])
-    _ensure_partition_decisions(
-        conn, result, "shared_budget_exhausted",
-        _monitor_profiles(monitor_partitions, monitor_profile),
-    )
-    return result
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
@@ -2663,9 +2426,8 @@ def _open_worker_log(task: Task, board: Optional[str]):
     log_dir = _kb.worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
-    from hermes_cli.kanban_worker_log import rotate_worker_log, worker_log_rotation_config
-    rotate_worker_log(log_path, *worker_log_rotation_config())
-    return open(log_path, "ab")
+    from hermes_cli.kanban_worker_log import open_worker_log
+    return open_worker_log(log_path)
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
@@ -2816,13 +2578,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The worker is `-m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
-    # bootstrap. The routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
-    # children must not see our tree), so a PYTHONPATH-launched dispatcher spawned a child that
-    # died on `No module named 'hermes_cli'` before it ever reached the owner. Same pin as cron's
-    # external worker (#112729): applied to the sanitized env, after every other decision stands.
+    # The worker is `-m hermes_cli.kanban_worker_client` with no console-script bootstrap, and the scrub
+    # above strips our PYTHONPATH entries, so a PYTHONPATH-launched dispatcher's child died on
+    # `No module named 'hermes_cli'` (#112729). Pinned last, after every other env decision.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
+    env = pin_hermes_tree_on_pythonpath(env, Path(project_root_str()))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -2923,5 +2683,16 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_default_assignee as _kbda
 from hermes_cli import kanban_db_workspace as _kbw
 from hermes_cli.kanban_db_dispatch_lane import _any_spawnable_review, _dispatch_lane_task
+from hermes_cli.kanban_db_dispatch_tick import (
+    _dispatch_once_locked,
+    _ensure_partition_decisions,
+    _lane_rows,
+    _monitor_partition,
+    _monitor_profiles,
+    _resolve_default_assignee,
+    _run_reclaim_phase,
+    _tick_spawn_budget,
+)
