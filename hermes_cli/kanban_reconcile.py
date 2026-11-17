@@ -17,12 +17,21 @@ from hermes_cli.kanban_generation import (
 )
 
 CHILD_TABLES = ("task_comments", "task_runs", "task_events", "task_attachments")
-SUPPORTED_TABLES = {
-    "tasks", "task_links", "task_comments", "task_runs", "task_events",
-    "task_attachments", "kanban_notify_subs", "kanban_generation_meta",
-    "task_holds", "projects", "workspaces", "claims",
-    "recovery_imports", "recovery_row_provenance", "recovery_attachment_blobs",
-    "recovery_attachment_resolution",
+RUNTIME_EXTENSION_OBJECTS = {
+    "tables": {
+        "kanban_dispatch_control", "kanban_dispatch_control_events",
+        "kanban_board_identity", "kanban_monitor_scope_activation",
+        "kanban_dispatch_attempts", "kanban_claim_admissions",
+        "kanban_writer_faults", "kanban_controller_observations",
+        "kanban_ready_state", "kanban_ready_episodes",
+        "kanban_ready_escalation_intents", "kanban_ready_tick_observations",
+    },
+    "indexes": {
+        "idx_monitor_scope_current", "idx_ready_episode_task",
+        "idx_monitor_fault_scope", "idx_monitor_admission_attempt",
+    },
+    "views": set(),
+    "triggers": {"kanban_ready_claim_admission"},
 }
 SUPPORTED_INDEXES = {
     "task_links_parent", "recovery_provenance_lookup",
@@ -183,15 +192,27 @@ def _normalized_schema(conn: sqlite3.Connection) -> dict[str, Any]:
 
 def _validate_source_schema(conn: sqlite3.Connection) -> None:
     actual = _normalized_schema(conn)
-    unknown = sorted(set(actual["tables"]) - SUPPORTED_TABLES)
+    canonical = _canonical_schema_objects()
+    extensions = _extension_schema_objects()
+    expected = {
+        kind: {name: value for name, value in canonical["schema"][kind].items()
+               if name not in extensions[kind]}
+        for kind in ("tables", "indexes", "views", "triggers")
+    }
+    unknown = sorted(set(actual["tables"]) - set(expected["tables"]) - set(extensions["tables"]))
     if unknown:
         raise GenerationError("unsupported persistent table: " + ",".join(unknown))
-    canonical = _canonical_schema_objects()
-    expected = canonical["schema"]
+    for kind in ("tables", "indexes", "views", "triggers"):
+        for name in set(actual[kind]) & set(extensions[kind]):
+            if actual[kind][name] != extensions[kind][name]:
+                raise GenerationError(f"canonical schema mismatch: {kind[:-1]} {name}")
     # Recovery tables are deliberately absent from source/target inputs; they
     # are added only after both inputs have passed this gate.
     optional = {"task_links_parent": MIGRATED_INDEX_SQL["task_links_parent"].lower()}
-    actual_indexes = dict(actual["indexes"])
+    actual_indexes = {
+        name: value for name, value in actual["indexes"].items()
+        if name not in extensions["indexes"]
+    }
     for name, sql in list(actual_indexes.items()):
         if name in optional and " ".join(sql.split()).lower() != " ".join(optional[name].split()).lower():
             raise GenerationError(f"canonical schema mismatch: index {name}")
@@ -204,16 +225,24 @@ def _validate_source_schema(conn: sqlite3.Connection) -> None:
     for name, expected_sql in expected["indexes"].items():
         if actual_indexes[name] != expected_sql:
             raise GenerationError(f"canonical schema mismatch: index {name}")
-    if set(actual["tables"]) != set(expected["tables"]):
+    actual_tables = {
+        name: value for name, value in actual["tables"].items()
+        if name not in extensions["tables"]
+    }
+    if set(actual_tables) != set(expected["tables"]):
         raise GenerationError("canonical schema mismatch: table presence")
     for name, definition in expected["tables"].items():
-        if actual["tables"][name] != definition:
+        if actual_tables[name] != definition:
             raise GenerationError(f"canonical schema mismatch: table {name}")
-    if actual["views"] != expected["views"] or actual["triggers"] != expected["triggers"]:
+    actual_views = {name: value for name, value in actual["views"].items()
+                    if name not in extensions["views"]}
+    actual_triggers = {name: value for name, value in actual["triggers"].items()
+                       if name not in extensions["triggers"]}
+    if actual_views != expected["views"] or actual_triggers != expected["triggers"]:
         raise GenerationError("canonical schema mismatch: views or triggers")
 
 
-def _canonical_schema_objects() -> dict[str, set[str]]:
+def _canonical_schema_objects() -> dict[str, Any]:
     """Return the object names from a fresh native schema, never a hand copy.
 
     Reconciliation accepts the documented recovery extensions and legacy
@@ -241,6 +270,32 @@ def _canonical_schema_objects() -> dict[str, set[str]]:
             continue
         conn.execute(sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1))
     return {"schema": _normalized_schema(conn)}
+
+
+def _extension_schema_objects() -> dict[str, Any]:
+    """Authenticate optional production-owned control/monitor schema objects.
+
+    These tables are installed lazily rather than by the native board base
+    schema.  Reconciliation preserves the target copy but never imports source
+    runtime state; accepting an extension therefore requires its exact current
+    production definition rather than merely its name.
+    """
+    from hermes_cli.kanban_control import CONTROL_SCHEMA_SQL
+    from hermes_cli import kanban_db as native
+    from hermes_cli import kanban_db_connect as native_connect
+    from hermes_cli.kanban_ready_monitor import MONITOR_SCHEMA_SQL
+    with sqlite3.connect(":memory:") as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(native.SCHEMA_SQL)
+        native_connect._migrate_add_optional_columns(conn)
+        conn.executescript(CONTROL_SCHEMA_SQL)
+        conn.executescript(MONITOR_SCHEMA_SQL)
+        complete = _normalized_schema(conn)
+    return {
+        kind: {name: value for name, value in complete[kind].items()
+               if name in RUNTIME_EXTENSION_OBJECTS[kind]}
+        for kind in ("tables", "indexes", "views", "triggers")
+    }
 
 
 def _capture_blob(path: Path) -> tuple[bytes, str]:

@@ -929,6 +929,27 @@ def test_canonical_native_schema_accepts_all_migrated_indexes(tmp_path, monkeypa
     assert not (disposable_home / "kanban.db").exists()
 
 
+def test_reconcile_rejects_tampered_optional_runtime_schema(tmp_path):
+    from hermes_cli.kanban_control import CONTROL_SCHEMA_SQL
+    from hermes_cli.kanban_db_connect import init_db
+    source, target = tmp_path / "source.db", tmp_path / "target.db"
+    init_db(source)
+    init_db(target)
+    with sqlite3.connect(source) as conn:
+        conn.executescript(CONTROL_SCHEMA_SQL)
+        conn.execute("ALTER TABLE kanban_dispatch_control ADD COLUMN tampered TEXT")
+        conn.execute(
+            "INSERT INTO tasks(id, title, status, created_at) VALUES ('source', 'source', 'blocked', 1)"
+        )
+    seed = tmp_path / "seed.json"
+    seed.write_text('["source"]')
+    with pytest.raises(
+        GenerationError,
+        match="canonical schema mismatch: table kanban_dispatch_control",
+    ):
+        reconcile(source, target, seed, tmp_path / "generation", apply=False)
+
+
 def test_generated_connection_holds_and_releases_reader_lease(tmp_path, monkeypatch):
     _board, generation = _published(tmp_path)
     home = tmp_path / "home"
