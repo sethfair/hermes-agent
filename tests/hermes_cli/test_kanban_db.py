@@ -512,23 +512,23 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
     an unrelated crash into a permanent auth guard on the next dispatch.
     """
     with kbc.connect() as conn:
+        crash_error = (
+            "pid 1 killed by signal 9. Worker's last output: "
+            "'env -u ANTHROPIC_API_KEY claude auth status --text'"
+        )
         crashed_id = kb.create_task(conn, title="crashed", assignee="a")
         kb.claim_task(conn, crashed_id)
         crashed_run_id = kb.get_task(conn, crashed_id).current_run_id
         conn.execute(
-            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? "
+            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=?, error=? "
             "WHERE id=?",
-            (5_000_000, crashed_run_id),
+            (5_000_000, crash_error, crashed_run_id),
         )
         conn.execute(
             "UPDATE tasks SET status='ready', current_run_id=NULL, "
             "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
             "last_failure_error=? WHERE id=?",
-            (
-                "pid 1 killed by signal 9. Worker's last output: "
-                "'env -u ANTHROPIC_API_KEY claude auth status --text'",
-                crashed_id,
-            ),
+            (crash_error, crashed_id),
         )
 
         spawn_failed_id = kb.create_task(conn, title="spawn failed", assignee="a")
