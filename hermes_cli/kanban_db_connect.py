@@ -898,10 +898,6 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
-    ("block_identity", "block_identity TEXT"),
-    # Legacy rows are classified by the dedicated migration below. Adding this
-    # as nullable prevents the fresh-row default from erasing old evidence.
-    ("block_identity_state", "block_identity_state TEXT"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
     # Default-inert fencing state for authenticated action receipts.
@@ -1013,7 +1009,6 @@ def _migrate_add_optional_columns(
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
-
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
     # so a ``CREATE INDEX`` over a missing column in SCHEMA_SQL would abort
@@ -1031,10 +1026,6 @@ def _migrate_add_optional_columns(
 
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
-
-    from hermes_cli.kanban_db_block_identity import migrate_legacy_block_identities
-
-    migrate_legacy_block_identities(conn)
 
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
