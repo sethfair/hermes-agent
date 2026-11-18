@@ -12,9 +12,12 @@ hammered. A genuine worker error still counts.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from agent import managed_worker
+from gateway.session_managed_worker import _worker_error_reason
 from hermes_cli import kanban_db_dispatch as kbd
 from tests.hermes_cli.test_kanban_owner_receipt_reclaim import NOW, _Board
 
@@ -45,6 +48,56 @@ def _booked(board, tid):
         "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,)
     ).fetchone()
     return row, run["outcome"], json.loads(run["metadata"] or "{}")
+
+
+def _worker_emitted_reason(monkeypatch, exc):
+    """Run the worker error path and consume its frame through the gateway seam."""
+    sent = []
+
+    class Channel:
+        stream = SimpleNamespace(close=lambda: None)
+
+        def send(self, kind, **payload):
+            sent.append({"type": kind, **payload})
+
+    monkeypatch.setattr(managed_worker, "WorkerChannel", lambda _stream: Channel())
+    monkeypatch.setattr(managed_worker.os, "fdopen", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(managed_worker.os, "dup2", lambda *_args: None)
+    monkeypatch.setattr(managed_worker, "hello", dict)
+    monkeypatch.setattr(managed_worker, "read_frame", lambda _stream: {})
+    monkeypatch.setattr(managed_worker, "validate_bootstrap", lambda _frame: {})
+    monkeypatch.setattr(
+        managed_worker,
+        "execute",
+        lambda _frame, _channel: (_ for _ in ()).throw(exc),
+    )
+
+    assert managed_worker.main() == 1
+    return _worker_error_reason(sent[-1])
+
+
+@pytest.mark.parametrize(
+    "tid, exc, expected_reason, expected_failures, infrastructure",
+    [
+        ("t_timeout", TimeoutError("worker_receipt_timeout"), "worker_receipt_timeout", 1, True),
+        ("t_generic", RuntimeError("worker_receipt_timeout"), "managed_worker_failed", 2, False),
+    ],
+    ids=["host-receipt-timeout", "generic-worker-failure"],
+)
+def test_worker_frame_gateway_reason_controls_dispatcher_failure_budget(
+    board, monkeypatch, tid, exc, expected_reason, expected_failures, infrastructure
+):
+    """The real worker frame must survive the gateway allowlist before crash accounting."""
+    reason = _worker_emitted_reason(monkeypatch, exc)
+    assert reason == expected_reason
+    _lose(board, tid, reason=reason, admission=None, failures=1)
+
+    kbd.detect_crashed_workers(board.conn)
+
+    row, outcome, meta = _booked(board, tid)
+    assert outcome == "crashed"
+    assert row["consecutive_failures"] == expected_failures
+    assert meta.get("infrastructure", False) is infrastructure
 
 
 @pytest.mark.parametrize("reason, admission", [
