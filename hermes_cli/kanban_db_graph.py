@@ -106,6 +106,9 @@ def decompose_triage_task(
 
     if not children:
         return None
+    from hermes_cli.kanban_db import _has_unknown_block_identity
+    if _has_unknown_block_identity(conn, task_id):
+        return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
     _validate_children_graph(children)

@@ -307,6 +307,9 @@ def _release_triage_task(
     """Release one Triage task; run ``guard`` (when given) inside the write transaction."""
     from hermes_cli import kanban_db as kb
 
+    if kb._has_unknown_block_identity(conn, task_id):
+        return TriageReleaseReceipt(False, "block_identity_unknown", kb._task_status(conn, task_id))
+
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = kb._canonical_assignee(assignee)

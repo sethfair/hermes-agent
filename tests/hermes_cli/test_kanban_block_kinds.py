@@ -20,6 +20,7 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 from __future__ import annotations
 
 import argparse
+import uuid
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_db_task_state import block_task_transition
 
 
 @pytest.fixture
@@ -58,6 +60,13 @@ def _make_running_again(conn, tid):
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
+def _typed_block(conn, task_id, *, kind, subject, reason):
+    return block_task_transition(
+        conn, task_id, actor_scope="test", operation_id=f"test:{uuid.uuid4()}",
+        kind=kind, subject=subject, reason=reason,
+    ).committed
+
+
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------
@@ -74,10 +83,10 @@ def _make_running_again(conn, tid):
 def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         tid = _running_task(conn)
-        kb.block_task(conn, tid, reason="x", kind="capability", subject="runtime")
+        _typed_block(conn, tid, reason="x", kind="capability", subject="runtime")
         kb.unblock_task(conn, tid)
         _make_running_again(conn, tid)
-        kb.block_task(conn, tid, reason="x", kind="capability", subject="runtime")
+        _typed_block(conn, tid, reason="x", kind="capability", subject="runtime")
         events = [e for e in kb.list_events(conn, tid)
                   if e.kind == "block_loop_detected"]
         assert events, "expected a block_loop_detected event"
@@ -102,7 +111,7 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
             child_id=child,
             expected_child_run_id=kb.get_task(conn, child).current_run_id,
         )
-        kb.block_task(conn, child, reason="wait", kind="dependency", subject=parent)
+        _typed_block(conn, child, reason="wait", kind="dependency", subject=parent)
         assert kb.get_task(conn, child).status == "todo"
         # Finish the parent, then let recompute_ready run.
         with kb.write_txn(conn):
@@ -162,12 +171,12 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
         for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
-            assert kb.block_task(conn, child, reason="wait", kind="dependency", subject=parent)
+            assert _typed_block(conn, child, reason="wait", kind="dependency", subject=parent)
             parked = kb.get_task(conn, child)
             assert (parked.status, parked.block_kind, parked.block_recurrences) == ("todo", "dependency", 0)
             with kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
-        assert kb.block_task(conn, child, reason="wait", kind="dependency", subject=parent)
+        assert _typed_block(conn, child, reason="wait", kind="dependency", subject=parent)
         kbd.dispatch_once(conn, spawn_fn=fake_spawn)
         assert kb.get_task(conn, child).status == "todo"
         assert child not in spawns

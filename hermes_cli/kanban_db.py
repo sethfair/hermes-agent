@@ -624,6 +624,8 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    block_identity: Optional[str] = None
+    block_identity_state: str = "none"
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -657,6 +659,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "block_identity", "block_identity_state",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -861,7 +864,21 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    block_identity       TEXT,
+    block_identity_state TEXT NOT NULL DEFAULT 'none',
     dispatch_admission_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_transition_receipts (
+    operation_id   TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL,
+    operation_kind TEXT NOT NULL,
+    request_hash   TEXT NOT NULL,
+    outcome_code   TEXT NOT NULL,
+    event_id       INTEGER,
+    committed_at   INTEGER NOT NULL,
+    operation_version INTEGER NOT NULL DEFAULT 1,
+    tuple_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1898,6 +1915,14 @@ def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     return row["status"] if row else None
 
 
+def _has_unknown_block_identity(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether an unresolved blocker identity fences this task's status."""
+    row = conn.execute(
+        "SELECT block_identity_state FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return row is not None and row["block_identity_state"] == "unknown"
+
+
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
@@ -2044,6 +2069,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if _has_unknown_block_identity(conn, task_id):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -2513,6 +2540,8 @@ def complete_task(
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
     """
+    if _has_unknown_block_identity(conn, task_id):
+        return False
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2553,7 +2582,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       block_identity = NULL,
+                       block_identity_state = 'none'
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -2979,90 +3010,33 @@ def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
-    toward the loop breaker so a forever-flaky task escalates. True on any
-    transition.
+    """Compatibility ingress; legacy callers intentionally produce UNKNOWN."""
+    from hermes_cli.kanban_db_task_state import block_task_transition, compatibility_operation_id
 
-    An already-``blocked`` card that the failure breaker parked UNTYPED
-    (``block_kind IS NULL``, no live run) is classified in place when *kind*
-    is supplied: ``block_kind``/``block_recurrences`` are set and a ``blocked``
-    audit event is appended, while status, failure evidence and the terminal
-    runs stay exactly as the breaker left them. A typed block, a card with a
-    live run, or a kind-less call on a blocked card are still refused.
-    """
-    if kind is not None and kind not in VALID_BLOCK_KINDS:
-        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    with write_txn(conn):
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
-        # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
-        # ``block_kind`` and no ``blocked`` event -- the policy is the
-        # supervisor's, not the kernel's -- but the transition guard below only
-        # matches running/ready, so that policy could never be attached later
-        # (#117363). Classify in place; never re-type or flap status. A caller
-        # asserting run ownership (``expected_run_id``) cannot own a parked
-        # card -- its run is over -- so it is refused like any stale worker.
-        if cur_row["status"] == "blocked":
-            if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
-                return False
-            classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
-                "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
-                "AND current_run_id IS NULL",
-                (kind, task_id),
-            ).rowcount
-            if classified != 1:
-                return False
-            _append_event(conn, task_id, "blocked", {
-                "kind": kind, "reason": reason, "classified_in_place": True,
-            })
-            return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
-        requested_kind = kind
-        rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
-        new_status, event_kind, set_sql, params, payload = _route_block(
-            kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
-            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
-        )
-        if rekind_reason:
-            payload["requested_kind"] = requested_kind
-            payload["rekind_reason"] = rekind_reason
-        sql = f"""
-                UPDATE tasks
-                   SET status        = '{new_status}',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       {set_sql}
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """
-        params = (*params, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
-        )
-        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
-        blocked_task = get_task(conn, task_id)
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    return True
+    outcome = block_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=compatibility_operation_id(task_id),
+        kind=kind,
+        reason=reason,
+        expected_run_id=expected_run_id,
+    )
+    return outcome.committed
+
+
+def block_task_transition(conn: sqlite3.Connection, task_id: str, **kwargs):
+    """Compatibility export for callers with an explicit actor and identity."""
+    from hermes_cli.kanban_db_task_state import block_task_transition as transition
+
+    return transition(conn, task_id, **kwargs)
+
+
+def classify_block(conn: sqlite3.Connection, task_id: str, **kwargs) -> bool:
+    """Compatibility export for actor-attributed blocker classification."""
+    from hermes_cli.kanban_db_task_state import classify_block as _classify
+
+    return _classify(conn, task_id, **kwargs)
 
 
 def _route_block(
@@ -3134,6 +3108,9 @@ def request_review(
 
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
+
+    if _has_unknown_block_identity(conn, task_id):
+        return _ret(False, "block_identity_unknown")
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
@@ -3267,6 +3244,8 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    if _has_unknown_block_identity(conn, task_id):
+        return False, "block_identity_unknown"
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -3339,6 +3318,9 @@ def promote_task(
     if cur_status is None:
         return False, f"task {task_id} not found"
 
+    if _has_unknown_block_identity(conn, task_id):
+        return False, "block_identity_unknown"
+
     if cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
@@ -3410,6 +3392,8 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    if _has_unknown_block_identity(conn, task_id):
+        return False
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3456,6 +3440,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
     not a block; only :func:`complete_task` clears them)."""
+    if _has_unknown_block_identity(conn, task_id):
+        return False
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -3596,6 +3582,8 @@ def specify_triage_task(
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
 ) -> bool:
     """Backward-compatible unguarded specification and Triage release."""
+    if _has_unknown_block_identity(conn, task_id):
+        return False
     # No guard, so no scoped authorizer: any connection kind works and its own
     # authorizer is left untouched.
     receipt = _release_triage_task(
@@ -3622,6 +3610,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
     """
+    if _has_unknown_block_identity(conn, task_id):
+        return False
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
@@ -3666,6 +3656,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
+        if _has_unknown_block_identity(conn, task_id):
+            return False
         if _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
@@ -3676,6 +3668,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        if _has_unknown_block_identity(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -3690,6 +3684,8 @@ def schedule_task(
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
+    if _has_unknown_block_identity(conn, task_id):
+        return False
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """

@@ -7,6 +7,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_graph as kbg
+from hermes_cli.kanban_db_task_state import block_task_transition
 
 
 @pytest.fixture
@@ -23,12 +24,58 @@ def test_subject_interface(home):
         tid = kb.create_task(conn, title="identity interface", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
-        assert kb.block_task(
+        assert _typed_block(
             conn,
             tid,
             kind="needs_input",
             subject="adrian/decision-a",
             reason="same",
+        )
+
+
+def test_legacy_block_ingress_commits_unknown_transition_receipt(home):
+    """Regression tracer for the legacy public block ingress.
+
+    The compatibility call has no durable actor/subject identity.  It must
+    therefore enter the typed owner as UNKNOWN while still committing the
+    task transition, event, and receipt as one operation.
+    """
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn, "legacy block tracer")
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="legacy failure",
+            kind="capability",
+        ) is True
+
+        receipt_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='task_transition_receipts'"
+        ).fetchone()
+        assert receipt_table is not None
+        row = kb.get_task(conn, tid)
+        assert (row.status, row.block_identity_state, row.block_identity) == (
+            "blocked",
+            "unknown",
+            None,
+        )
+        events = kb.list_events(conn, tid)
+        receipts = conn.execute(
+            "SELECT task_id, operation_kind, outcome_code, event_id "
+            "FROM task_transition_receipts WHERE task_id = ?",
+            (tid,),
+        ).fetchall()
+        assert [event.kind for event in events[-2:]] == [
+            "block_identity_unknown",
+            "blocked",
+        ]
+        assert len(receipts) == 1
+        assert tuple(receipts[0]) == (
+            tid,
+            "block",
+            "committed",
+            events[-1].id,
         )
 
 
@@ -38,7 +85,7 @@ def test_distinct_identity(home):
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
-        assert kb.block_task(
+        assert _typed_block(
             conn,
             tid,
             kind="needs_input",
@@ -49,7 +96,7 @@ def test_distinct_identity(home):
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
-        assert kb.block_task(
+        assert _typed_block(
             conn,
             tid,
             kind="needs_input",
@@ -67,10 +114,23 @@ def _ready_task(conn, title="identity behavior"):
     return tid
 
 
+def _typed_block(conn, task_id, *, kind, subject, reason=None, actor="test"):
+    operation_id = f"test-block:{task_id}:{kind}:{subject}:{reason}"
+    return block_task_transition(
+        conn,
+        task_id,
+        actor_scope=actor,
+        operation_id=operation_id,
+        kind=kind,
+        subject=subject,
+        reason=reason,
+    ).committed
+
+
 def test_same_identity_changed_reason_hits_existing_limit(home):
     with kbc.connect_closing() as conn:
         tid = _ready_task(conn)
-        assert kb.block_task(
+        assert _typed_block(
             conn, tid, kind="needs_input", subject="Adrian/Decision-A", reason="first prose"
         )
         first = kb.get_task(conn, tid)
@@ -78,7 +138,7 @@ def test_same_identity_changed_reason_hits_existing_limit(home):
             '{"kind":"needs_input","subject":"adrian/decision-a","v":1}'
         )
         assert kb.unblock_task(conn, tid)
-        assert kb.block_task(
+        assert _typed_block(
             conn, tid, kind="needs_input", subject="adrian/decision-a", reason="different prose"
         )
         row = kb.get_task(conn, tid)
@@ -93,7 +153,7 @@ def test_invalid_explicit_subject_is_unknown_and_redacted(home):
     secret = "Owner/decision\nBearer private-value"
     with kbc.connect_closing() as conn:
         tid = _ready_task(conn)
-        assert kb.block_task(
+        assert _typed_block(
             conn, tid, kind="needs_input", subject=secret, reason="safe explanation"
         )
         row = kb.get_task(conn, tid)
@@ -204,7 +264,7 @@ def test_dependency_identity_requires_named_open_direct_parent(home):
         child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id IN (?, ?)", (parent, child))
-        assert kb.block_task(
+        assert _typed_block(
             conn, child, kind="dependency", subject="t_deadbeef", reason="wrong parent"
         )
         row = kb.get_task(conn, child)
@@ -223,7 +283,7 @@ def test_dependency_identity_waits_for_all_parents(home):
         )
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
-        assert kb.block_task(
+        assert _typed_block(
             conn, child, kind="dependency", subject=first, reason="waiting"
         )
         parked = kb.get_task(conn, child)
@@ -241,7 +301,7 @@ def test_dependency_with_terminal_parent_becomes_unknown_sticky(home):
         assert kb.complete_task(conn, parent, summary="done")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
-        assert kb.block_task(
+        assert _typed_block(
             conn, child, kind="dependency", subject=parent, reason="stale wait"
         )
         row = kb.get_task(conn, child)
@@ -270,7 +330,7 @@ def test_unknown_todo_cannot_recompute_promote_or_claim(home):
 def test_failure_breaker_replaces_stale_known_identity_with_unknown(home):
     with kbc.connect_closing() as conn:
         tid = _ready_task(conn, "failure breaker identity")
-        assert kb.block_task(
+        assert _typed_block(
             conn,
             tid,
             kind="needs_input",
@@ -301,7 +361,7 @@ def test_failure_breaker_replaces_stale_known_identity_with_unknown(home):
 def test_completion_clears_block_identity(home):
     with kbc.connect_closing() as conn:
         tid = _ready_task(conn)
-        assert kb.block_task(
+        assert _typed_block(
             conn, tid, kind="capability", subject="missing-access", reason="waiting"
         )
         assert kb.complete_task(conn, tid, summary="operator closed the work")

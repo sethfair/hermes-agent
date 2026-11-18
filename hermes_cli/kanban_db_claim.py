@@ -145,6 +145,8 @@ def claim_task_result(
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
     try:
         with _kb.write_txn(conn):
+            if _kb._has_unknown_block_identity(conn, task_id):
+                return ClaimAttemptResult(task=None, reason="block_identity_unknown")
             refusal = _control_refusal(conn)
             if refusal is not None:
                 return ClaimAttemptResult(task=None, reason=refusal)
@@ -225,6 +227,8 @@ def claim_review_task_result(
     lock = claimer or _kb._claimer_id()
     expires = now + _kb._resolve_claim_ttl_seconds(ttl_seconds)
     with _kb.write_txn(conn):
+        if _kb._has_unknown_block_identity(conn, task_id):
+            return ClaimAttemptResult(task=None, reason="block_identity_unknown")
         refusal = _control_refusal(conn)
         if refusal is not None:
             return ClaimAttemptResult(task=None, reason=refusal)

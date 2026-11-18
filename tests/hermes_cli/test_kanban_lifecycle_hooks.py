@@ -16,6 +16,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+from hermes_cli.kanban_db_task_state import block_task_transition
 
 
 @pytest.fixture
@@ -105,7 +106,10 @@ def test_block_hook_runs_after_commit_with_write_lock_free(
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         subject = parent_id if kind == "dependency" else "owner/decision"
-        assert kb.block_task(conn, tid, reason="waiting", kind=kind, subject=subject)
+        assert block_task_transition(
+            conn, tid, actor_scope="test", operation_id=f"hook:{tid}:{kind}",
+            reason="waiting", kind=kind, subject=subject,
+        ).committed
     finally:
         conn.close()
     assert seen == [(status, event, "free")]

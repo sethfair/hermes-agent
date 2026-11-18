@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import random
 import re
 import secrets
@@ -56,7 +57,7 @@ def _resolve_busy_timeout_ms() -> int:
     return _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
 
 
-def _sqlite_connect(path: Path) -> sqlite3.Connection:
+def _sqlite_connect(path: Path, *, cached_statements: int = 128) -> sqlite3.Connection:
     """Open a Kanban SQLite connection via ``connect_tracked``: while registered,
     byte-level probes of the file are refused because an ``open()``/``close()``
     would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``)."""
@@ -68,6 +69,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
         connect_fn=sqlite3.connect,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
+        cached_statements=cached_statements,
     )
     try:
         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
@@ -81,6 +83,45 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
             conn.close()
         raise
     return conn
+
+
+@contextlib.contextmanager
+def _protected_connection(path: str | Path, *, operation: str):
+    """Yield a short-lived connection for one closed typed operation.
+
+    The connection is never returned to callers and is closed before the
+    operation outcome is delivered.  The authorizer is deliberately static;
+    ordinary connections cannot acquire this capability.
+    """
+    conn = _sqlite_connect(Path(path), cached_statements=0)
+    conn.row_factory = sqlite3.Row
+    conn.text_factory = _kb._lossy_text
+
+    writable_tables = {
+        "block": {"tasks", "task_runs", "task_events", "task_transition_receipts"},
+        "classify": {"tasks", "task_events"},
+    }.get(operation, set())
+    schema_actions = {
+        sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_VIEW, sqlite3.SQLITE_PRAGMA,
+    }
+
+    def _authorize(action, table, _column, _db_name, _trigger):
+        if action in schema_actions:
+            return sqlite3.SQLITE_DENY
+        if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
+            return sqlite3.SQLITE_OK if table in writable_tables or _trigger else sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(_authorize)
+    try:
+        yield conn
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
 
 
 def _try_lock_nb(handle) -> bool:
@@ -898,6 +939,8 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    ("block_identity", "block_identity TEXT"),
+    ("block_identity_state", "block_identity_state TEXT NOT NULL DEFAULT 'none'"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
     # Default-inert fencing state for authenticated action receipts.
@@ -1009,6 +1052,8 @@ def _migrate_add_optional_columns(
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
+    _migrate_legacy_block_identity(conn)
+
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
     # so a ``CREATE INDEX`` over a missing column in SCHEMA_SQL would abort
@@ -1062,6 +1107,90 @@ def _migrate_add_optional_columns(
 
     _rebuild_drifted_tables(conn)
     _install_action_receipt_guards(conn)
+
+    _migrate_storage_version_fences(conn)
+
+
+def _migrate_storage_version_fences(conn: sqlite3.Connection) -> None:
+    """Add operation/tuple version columns without changing legacy rows."""
+    for table, columns in {
+        "operation_keys": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
+                            ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1")),
+        "action_receipts": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
+                            ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1")),
+        "task_transition_receipts": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
+                                     ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1")),
+    }.items():
+        if not _table_exists(conn, table):
+            continue
+        present = _column_names(conn, table)
+        for name, ddl in columns:
+            if name not in present:
+                _add_column_if_missing(conn, table, name, ddl)
+
+
+def _migrate_legacy_block_identity(conn: sqlite3.Connection) -> None:
+    """Classify legacy blocker evidence conservatively and idempotently.
+
+    Historical prose is never promoted to a known identity.  Rows with a
+    blocker-shaped status, recurrence, or malformed event evidence become
+    UNKNOWN; ordinary graph-only dependency waits remain ``none``.  A single
+    redacted migration event per task makes the decision auditable without
+    copying historical reason text into the new identity fields.
+    """
+    if not _table_exists(conn, "tasks") or not _table_exists(conn, "task_events"):
+        return
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kanban_storage_migrations "
+        "(name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)"
+    )
+    if conn.execute(
+        "SELECT 1 FROM kanban_storage_migrations WHERE name = 'block_identity_v1'"
+    ).fetchone():
+        return
+    rows = conn.execute(
+        "SELECT id, status, block_kind, block_recurrences, block_identity_state "
+        "FROM tasks"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        state = row["block_identity_state"] or "none"
+        malformed = False
+        for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ?", (task_id,)
+        ):
+            payload = event["payload"]
+            if payload:
+                try:
+                    json.loads(payload)
+                except (TypeError, ValueError):
+                    malformed = True
+                    break
+        unknown = state == "unknown" or malformed or row["status"] == "blocked" \
+            or row["block_kind"] is not None or int(row["block_recurrences"] or 0) > 0
+        target = "unknown" if unknown else "none"
+        if target != state:
+            conn.execute(
+                "UPDATE tasks SET block_identity = NULL, block_identity_state = ? WHERE id = ?",
+                (target, task_id),
+            )
+        event_kind = "block_identity_unknown" if target == "unknown" else "block_identity_migrated"
+        exists = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, event_kind),
+        ).fetchone()
+        if exists is None:
+            payload = {"identity_state": target, "source": "legacy_migration"}
+            if target == "unknown":
+                payload["unknown_cause"] = "legacy_evidence"
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, event_kind, json.dumps(payload, sort_keys=True), int(time.time())),
+            )
+    conn.execute(
+        "INSERT INTO kanban_storage_migrations (name, applied_at) VALUES ('block_identity_v1', ?)",
+        (int(time.time()),),
+    )
 
 
 def _install_action_receipt_guards(conn: sqlite3.Connection) -> None:

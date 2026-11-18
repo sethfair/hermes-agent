@@ -1489,7 +1489,7 @@ def _record_task_failure(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "consecutive_failures = ?, last_failure_error = ?, block_kind = NULL, block_identity = NULL, block_identity_state = 'unknown', block_recurrences = 0 "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
@@ -1516,10 +1516,10 @@ def _record_task_failure(
             )
         if force_trip:
             # The caller applied its own bounded policy, so the counter cannot
-            # judge this block: ``recompute_ready`` holds it for an operator.
             payload["sticky"] = True
         if event_payload_extra:
             payload.update(event_payload_extra)
+        _kb._append_event(conn, task_id, "block_identity_unknown", {"identity_state": "unknown", "unknown_cause": "failure_breaker"}, run_id=run_id)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 

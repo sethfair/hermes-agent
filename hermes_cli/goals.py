@@ -1653,9 +1653,9 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
-    def _block(message: str) -> None:
+    def _block(message: str, *, kind: str, subject: str) -> None:
         try:
-            block_fn(message)
+            block_fn(message, kind=kind, subject=subject)
         except Exception as exc:
             _log(f"kanban goal loop: block_fn failed ({exc})")
 
@@ -1706,7 +1706,11 @@ def run_kanban_goal_loop(
             # re-poking an impossible goal, and never let it land in done.
             # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
             _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
-            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
+            _block(
+                f"Goal-mode judge ruled the goal unachievable: {reason}",
+                kind="capability",
+                subject="goal-loop-unachievable",
+            )
             return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
 
         if verdict == "done":
@@ -1715,7 +1719,9 @@ def run_kanban_goal_loop(
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
                 _block(
                     f"Goal-mode worker's output looked complete but it never "
-                    f"called kanban_complete after a finalize nudge ({reason})."
+                    f"called kanban_complete after a finalize nudge ({reason}).",
+                    kind="transient",
+                    subject="goal-loop-finalization",
                 )
                 return _result("blocked_budget", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
@@ -1729,7 +1735,9 @@ def run_kanban_goal_loop(
             _block(
                 f"Goal-mode worker exhausted its turn budget "
                 f"({turns_used}/{max_turns}) without completing the task. "
-                f"Last judge verdict: {_truncate(reason, 300)}"
+                f"Last judge verdict: {_truncate(reason, 300)}",
+                kind="transient",
+                subject="goal-loop-budget",
             )
             return _result("blocked_budget", "turn budget exhausted")
 
