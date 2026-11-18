@@ -37,10 +37,12 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
+from plugins.kanban.dashboard.control_api import router as control_router
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+router.include_router(control_router)
 
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
@@ -48,14 +50,12 @@ _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 # --- Connection / board helpers ---------------------------------------------
 
 def _ws_upgrade_authorized(ws: WebSocket) -> bool:
-    """Authorize a WS upgrade via the dashboard's canonical gate (``web_server_chat._ws_auth_ok``:
-    ``?token=`` / ``?ticket=`` / ``?internal=``) so this endpoint can never drift from core
-    auth; accepts when the dashboard isn't importable (bare-FastAPI test harness)."""
-    try:
-        from hermes_cli import web_server_chat as _ws
-    except Exception:
-        return True
-    return bool(_ws._ws_auth_ok(ws))
+    """Authorize a WS upgrade via the dashboard's canonical gates, the same pair every core WS
+    route runs: ``_ws_auth_ok`` (``?token=`` / ``?ticket=`` / ``?internal=``) and
+    ``_ws_request_is_allowed`` (Host/Origin + loopback-peer guard)."""
+    from hermes_cli import web_server_chat as _ws
+
+    return bool(_ws._ws_auth_ok(ws)) and bool(_ws._ws_request_is_allowed(ws))
 
 
 def _normalize_slug_or_400(slug: str) -> Optional[str]:
@@ -1244,6 +1244,42 @@ def get_stats(board: Optional[str] = Query(None)):
         return kanban_db.board_stats(conn)
 
 
+@router.get("/ready-health")
+def ready_health(board: Optional[str] = Query(None), task: Optional[str] = Query(None)):
+    """Read-only aged-Ready projection; UNKNOWN is preserved as a state."""
+    from hermes_cli import kanban_ready_monitor as monitor
+    try:
+        from hermes_cli.config import load_config
+        loaded = load_config()
+        config = loaded.get("kanban", {}) if isinstance(loaded, dict) else {}
+    except Exception:  # health: allow BLE001 -- unreadable config leaves the projection fail-closed
+        config = None
+    with _board_conn(board) as (board, conn):
+        payload = monitor.ready_health_snapshot(conn, config=config)
+    if task:
+        payload["cards"] = [card for card in payload["cards"] if card["task_id"] == task]
+    return payload
+
+
+@router.get("/ready-episodes/{episode_id}")
+def ready_episode(episode_id: str, board: Optional[str] = Query(None)):
+    """Return one redacted episode and its bounded intent facts."""
+    from hermes_cli import kanban_ready_monitor as monitor
+    with _board_conn(board) as (board, conn):
+        row = conn.execute("SELECT * FROM kanban_ready_episodes WHERE id=?", (episode_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="episode not found")
+        intents = conn.execute(
+            "SELECT stage, ordinal, scheduled_at, state, routing_generation, authority_set_digest "
+            "FROM kanban_ready_escalation_intents WHERE episode_id=? ORDER BY id", (episode_id,)
+        ).fetchall()
+        return {"episode": {key: row[key] for key in (
+            "id", "task_id", "ready_generation", "state", "outcome", "resolver_stage",
+            "routing_generation", "intent_count", "first_observed_at", "last_observed_at")},
+                "intents": [dict(item) for item in intents], "read_only": True,
+                "compatibility": monitor.COMPATIBILITY_IDENTITY}
+
+
 @router.get("/assignees")
 def get_assignees(board: Optional[str] = Query(None)):
     """Union of on-disk profiles and assignees used on the board, so a fresh
@@ -1271,6 +1307,8 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
     with _board_conn(board) as (board, conn):
         result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        if result.monitor_scope_refused:
+            raise HTTPException(status_code=409, detail="monitor_scope_refused: protected scope requires an admitted writer context")
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

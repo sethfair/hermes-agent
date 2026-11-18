@@ -75,6 +75,39 @@ def _last_run(conn, tid):
     ).fetchone()
 
 
+def test_respawn_guard_uses_latest_run_when_handoff_supersedes_stale_auth_error(kanban_home: Path) -> None:
+    """A later handoff wins even when sequential runs share an end timestamp."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review handoff", assignee="implementer")
+        kb.claim_task(conn, tid)
+        failed_run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='spawn_failed', status='failed', ended_at=?, error=? WHERE id=?",
+            (5_000_000, "provider subscription rejected", failed_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+            ("provider subscription rejected", tid),
+        )
+        conn.commit()
+
+        kb.claim_task(conn, tid)
+        handoff_run_id = kb.get_task(conn, tid).current_run_id
+        assert handoff_run_id > failed_run_id
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", expected_run_id=handoff_run_id,
+        )
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE id IN (?, ?)",
+            (5_000_000, failed_run_id, handoff_run_id),
+        )
+        conn.commit()
+
+        assert kb.get_task(conn, tid).last_failure_error == "provider subscription rejected"
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+
 # ---------------------------------------------------------------------------
 # Happy path: running -> review
 # ---------------------------------------------------------------------------

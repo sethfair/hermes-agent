@@ -273,11 +273,13 @@ def _owner_policy(board, tid, run_id):
 
 
 @pytest.mark.asyncio
-async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_it(board):
+async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_it(board, monkeypatch):
     """Through the gateway's loss handler: a Stop, a superseded generation or a cancellation
     records nothing; a real loss leaves one worker_lost event that the next tick books."""
     import asyncio
-    from types import SimpleNamespace
+    import sys
+    from types import ModuleType, SimpleNamespace
+    monkeypatch.setitem(sys.modules, "hermes_bootstrap", ModuleType("hermes_bootstrap"))
     from gateway.session_managed_worker import _record_lost_attempt
     run_id = board.running("t_owner", claim_expires_in=900, heartbeat_age=30)
     policy = _owner_policy(board, "t_owner", run_id)
