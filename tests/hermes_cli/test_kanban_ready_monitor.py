@@ -51,6 +51,54 @@ def test_schema_migration_is_additive_and_identity_is_stable():
     ).fetchone()[0] == first
 
 
+def test_schema_initializes_empty_receipt_identity():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+
+    monitor.ensure_schema(conn)
+
+    identity = conn.execute(
+        "SELECT board, board_scope_id, created_at, identity_version "
+        "FROM kanban_board_identity WHERE singleton=1"
+    ).fetchone()
+    assert identity["board"] == "default"
+    assert uuid.UUID(identity["board_scope_id"])
+    assert identity["created_at"] > 0
+    assert identity["identity_version"] == 1
+
+
+def test_schema_preserves_migrated_receipt_identity():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE kanban_board_identity ("
+        "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+        "board TEXT NOT NULL UNIQUE)"
+    )
+    conn.execute(
+        "INSERT INTO kanban_board_identity (singleton, board) VALUES (1, 'imported')"
+    )
+    conn.executescript(kb.SCHEMA_SQL)
+
+    monitor.ensure_schema(conn)
+    first = conn.execute(
+        "SELECT board, board_scope_id, created_at, identity_version "
+        "FROM kanban_board_identity WHERE singleton=1"
+    ).fetchone()
+    monitor.ensure_schema(conn)
+    second = conn.execute(
+        "SELECT board, board_scope_id, created_at, identity_version "
+        "FROM kanban_board_identity WHERE singleton=1"
+    ).fetchone()
+
+    assert tuple(first) == tuple(second)
+    assert first["board"] == "imported"
+    assert uuid.UUID(first["board_scope_id"])
+    assert first["created_at"] > 0
+    assert first["identity_version"] == 1
+
+
 def test_unadmitted_ready_claim_is_ignored_and_fault_is_durable():
     conn = _db()
     task_id = "task-ready"

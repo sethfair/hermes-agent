@@ -50,6 +50,16 @@ ARCHIVE_FORMAT_VERSION = 1
 # alone rather than having their history rewritten.
 _DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled")
 _COUNTED_TABLES = ("tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments")
+_AUTHENTICATED_BOARD_TABLES = (
+    "service_principals",
+    "configured_callers",
+    "principal_registry_events",
+    "kanban_capabilities",
+    "kanban_capability_events",
+    "operation_keys",
+    "action_receipts",
+    "advisory_notices",
+)
 
 
 def _placeholders(items) -> str:
@@ -239,6 +249,33 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _refuse_authenticated_board_rebinding(db_path: Path, target: str) -> None:
+    """Fail before publication when import would strand board-keyed authority."""
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        bound_boards: set[str] = set()
+        for table in _AUTHENTICATED_BOARD_TABLES:
+            if table not in tables:
+                continue
+            bound_boards.update(
+                str(row[0])
+                for row in conn.execute(
+                    f"SELECT DISTINCT board FROM {table} WHERE board IS NOT NULL"
+                ).fetchall()
+            )
+    if bound_boards and bound_boards != {target}:
+        sources = ", ".join(sorted(bound_boards))
+        raise ValueError(
+            f"authenticated board state for {sources!r} cannot be imported as "
+            f"{target!r}; import under its original unused slug"
+        )
+
+
 def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine; returns ``(stats, warnings)``.
 
@@ -257,10 +294,25 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
 
     with kb.write_txn(conn):
         _scrub_local_state(conn)
+        # Import is the one authorized identity replacement: the copied board
+        # must receive this machine's fresh scope before it becomes visible.
+        conn.execute("DROP TRIGGER kanban_board_identity_immutable_update")
+        conn.execute("DROP TRIGGER kanban_board_identity_immutable_delete")
         conn.execute("DELETE FROM kanban_board_identity")
         conn.execute(
-            "INSERT INTO kanban_board_identity(singleton,board_scope_id,created_at,identity_version) VALUES(1,?,?,1)",
-            (str(uuid.uuid4()), now),
+            "INSERT INTO kanban_board_identity(singleton,board,board_scope_id,created_at,identity_version) "
+            "VALUES(1,?,?,?,1)",
+            (slug, str(uuid.uuid4()), now),
+        )
+        conn.execute(
+            "CREATE TRIGGER kanban_board_identity_immutable_update "
+            "BEFORE UPDATE ON kanban_board_identity "
+            "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER kanban_board_identity_immutable_delete "
+            "BEFORE DELETE ON kanban_board_identity "
+            "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
         )
 
         dropped = rehomed = 0
@@ -336,6 +388,11 @@ def import_board(
             )
         target = _available_slug(requested)
 
+        # Receipt and principal history is authoritative and board-keyed. Until
+        # import has an explicit history-preserving rekey protocol, reject a
+        # rename/collision before creating target metadata or moving any files.
+        _refuse_authenticated_board_rebinding(staged_db, target)
+
         staged_meta = _read_board_metadata(extracted / "board.json")
 
         board_root = kb.board_dir(target)
@@ -357,6 +414,27 @@ def import_board(
         color=str(staged_meta.get("color") or ""),
         archived=False,
     )
+    # The archive carries its source board identity. Import is the one
+    # authorized physical relocation/rename boundary, so rebind that marker to
+    # the newly allocated target before normal connection validation runs.
+    imported_db = board_root / "kanban.db"
+    with sqlite3.connect(imported_db) as raw:
+        identity_exists = raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'kanban_board_identity'"
+        ).fetchone()
+        if identity_exists is not None:
+            raw.execute("BEGIN IMMEDIATE")
+            raw.execute("DROP TRIGGER IF EXISTS kanban_board_identity_immutable_update")
+            raw.execute(
+                "UPDATE kanban_board_identity SET board = ? WHERE singleton = 1",
+                (target,),
+            )
+            raw.execute(
+                "CREATE TRIGGER kanban_board_identity_immutable_update "
+                "BEFORE UPDATE ON kanban_board_identity "
+                "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
+            )
     # Bring the imported schema up to this install's version before the
     # relocation pass writes to it.
     kb.init_db(board=target)
