@@ -312,7 +312,11 @@ def _record_worker_result(context, code, last_output):
     import os
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
-    with connect_closing(board=context['board']) as conn, kb.write_txn(conn):
+    # Older owner receipts predate the redundant board field, but every
+    # admitted worker context carries the exact selected DB path.  Reopen that
+    # path so result booking remains compatible and, for generated boards,
+    # stays pinned to the generation admitted with this run.
+    with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
         if _bound_worker_matches(conn, context):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.

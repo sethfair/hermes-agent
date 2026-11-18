@@ -281,6 +281,12 @@ class _Collector:
             seen_db_paths: set[str] = set()
             for board_meta in _list_boards(kb):
                 slug = board_meta.get("slug") or kb.DEFAULT_BOARD
+                # Preserve the zero-subscription gate before any writable
+                # generation/path resolution.  Besides avoiding sidecars on a
+                # legacy board, this prevents an empty generated board from
+                # acquiring a reader lease merely for deduplication.
+                if not self._board_has_subs(slug):
+                    continue
                 try:
                     from hermes_cli import kanban_db_connect as _kbc
                     with _kbc.connect_closing(board=slug) as selected:
@@ -291,7 +297,7 @@ class _Collector:
                     logger.debug("kanban notifier: skipping duplicate board slug %s for DB %s", slug, resolved_db_path)
                     continue
                 seen_db_paths.add(resolved_db_path)
-                self.collect_board(slug)
+                self.collect_board(slug, known_has_subs=True)
         return self.deliveries
 
     def _board_has_subs(self, slug: str) -> bool:
@@ -342,9 +348,9 @@ class _Collector:
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
 
-    def collect_board(self, slug: str) -> None:
+    def collect_board(self, slug: str, *, known_has_subs: bool = False) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
-        if not self._board_has_subs(slug):
+        if not known_has_subs and not self._board_has_subs(slug):
             return
         try:
             conn = _kbc().connect(board=slug)

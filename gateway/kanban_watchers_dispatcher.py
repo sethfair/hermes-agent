@@ -230,7 +230,31 @@ class _KanbanDispatcher:
         connection or claim across each other.
         """
         conn = None
-        fingerprint = self.board_db_fingerprint(slug)
+        try:
+            fingerprint = self.board_db_fingerprint(slug)
+        except Exception as exc:  # health: allow BLE001 -- board adapters surface SQLite and generation failures here
+            if not self.is_corrupt_board_db_error(exc):
+                logger.exception("kanban dispatcher: cannot resolve board %s database", slug)
+                return None
+            # Fingerprinting itself opens a generated board under its reader
+            # lease, so corruption can surface before the dispatch connection.
+            # Retain a stable quarantine identity without opening it again.
+            path = getattr(exc, "db_path", None) or self.kb.kanban_db_path(board=slug)
+            try:
+                resolved = str(Path(path).expanduser().resolve())
+            except OSError:
+                resolved = str(path)
+            fingerprint = (resolved, None, None)
+            self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+            logger.error(
+                "kanban dispatcher: board %s database %s is not a valid "
+                "SQLite database; pausing dispatch for this board until "
+                "the file changes, the gateway restarts, or the "
+                "quarantine timer expires. Move or restore the file, "
+                "then run `hermes kanban init` if you need a fresh board.",
+                slug, fingerprint[0],
+            )
+            return None
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
