@@ -3522,85 +3522,24 @@ def specify_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
-    """Archive a task; a *running* task's host-local worker is terminated.
+    """Compatibility entrypoint for receipt-backed archival transitions."""
+    from hermes_cli.kanban_db_task_state import archive_task as _archive
 
-    Clearing ``worker_pid`` in the DB alone left the OS process running past its
-    own archive — it kept executing (and pushing work) against a task nothing
-    tracked anymore (#76196). Snapshot pid+claim inside the archive txn so the
-    kill is contingent on THIS caller winning the archive transition (a losing
-    concurrent archiver must never signal the pid); the kill itself runs after
-    commit — ``_poll_worker_exit`` can wait ~5 s and must not hold the write
-    lock. Post-release kill is safe here because ``archived`` is terminal: no
-    dispatcher can spawn a duplicate worker off the released claim. The
-    termination outcome lands as its own ``archive_worker_termination`` event so
-    the ``archived`` event stays atomic with the status flip.
-    """
-    if _has_unknown_block_identity(conn, task_id):
-        return False
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return False
-        was_running = row["status"] == "running"
-        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
-        cur = conn.execute(
-            "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
-        )
-        if cur.rowcount != 1:
-            return False
-        # Archived mid-run (dashboard): close the run so history isn't orphaned.
-        run_id = _end_run(
-            conn, task_id, outcome="reclaimed", status="reclaimed",
-            summary="task archived with run still active",
-        )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
-    if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
-        with write_txn(conn):
-            _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
-    # ``archived`` parents no longer block children; promote them now.
-    recompute_ready(conn)
-    # Reap the workspace on archive too (never-completed tasks kept it forever).
-    _cleanup_workspace(conn, task_id)
-    return True
-
-
-def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
-    conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
-        conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
+    return _archive(conn, task_id, signal_fn=signal_fn)
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
-    with write_txn(conn):
-        if _has_unknown_block_identity(conn, task_id):
-            return False
-        if _task_status(conn, task_id) != "archived":
-            return False
-        _delete_task_relations(conn, task_id)
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+    """Compatibility entrypoint for archived-only receipt-backed deletion."""
+    from hermes_cli.kanban_db_task_state import delete_archived_task as _delete_archived
+
+    return _delete_archived(conn, task_id)
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
-    with write_txn(conn):
-        if _has_unknown_block_identity(conn, task_id):
-            return False
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        _delete_task_relations(conn, task_id)
-    recompute_ready(conn)
-    return True
+    """Compatibility entrypoint for receipt-backed task deletion."""
+    from hermes_cli.kanban_db_task_state import delete_task as _delete
+
+    return _delete(conn, task_id)
 
 
 def schedule_task(

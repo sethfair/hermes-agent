@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli.kanban_task_state import (
@@ -105,12 +106,33 @@ class _ScheduleRequest:
     authority_kind: str = "block"
 
 
+@dataclass(frozen=True)
+class _ArchiveRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    operation_kind: str = "archive"
+    authority_kind: str = "archive"
+
+
+@dataclass(frozen=True)
+class _DeleteRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    archived_only: bool
+    operation_kind: str
+    authority_kind: str = "delete"
+
+
 _Request = (
     _BlockRequest
     | _ClassifyBlockRequest
     | _UnblockRequest
     | _PromoteRequest
     | _ScheduleRequest
+    | _ArchiveRequest
+    | _DeleteRequest
 )
 
 
@@ -118,6 +140,11 @@ _Request = (
 class _AppliedTransition:
     outcome: TransitionOutcome
     hook_run_id: Optional[int] = None
+    worker_pid: Optional[int] = None
+    claim_lock: Optional[str] = None
+    worker_started_at: object = None
+    was_running: bool = False
+    attachment_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,6 +152,11 @@ class _KernelResult:
     outcome: TransitionOutcome
     applied: bool
     hook_run_id: Optional[int] = None
+    worker_pid: Optional[int] = None
+    claim_lock: Optional[str] = None
+    worker_started_at: object = None
+    was_running: bool = False
+    attachment_paths: tuple[str, ...] = ()
 
 
 def _canonical_hash(value: object) -> str:
@@ -198,12 +230,31 @@ def _schedule_request_hash(request: _ScheduleRequest) -> str:
     })
 
 
+def _archive_request_hash(request: _ArchiveRequest) -> str:
+    return _canonical_hash({
+        "task_id": request.task_id,
+        "operation_kind": request.operation_kind,
+        "actor_scope": request.actor_scope,
+    })
+
+
+def _delete_request_hash(request: _DeleteRequest) -> str:
+    return _canonical_hash({
+        "task_id": request.task_id,
+        "operation_kind": request.operation_kind,
+        "actor_scope": request.actor_scope,
+        "archived_only": request.archived_only,
+    })
+
+
 _REQUEST_HASHERS = {
     _BlockRequest: _block_request_hash,
     _ClassifyBlockRequest: _classify_request_hash,
     _UnblockRequest: _unblock_request_hash,
     _PromoteRequest: _promote_request_hash,
     _ScheduleRequest: _schedule_request_hash,
+    _ArchiveRequest: _archive_request_hash,
+    _DeleteRequest: _delete_request_hash,
 }
 
 
@@ -211,10 +262,21 @@ def _request_hash(request: _Request) -> str:
     return _REQUEST_HASHERS[type(request)](request)
 
 
-def _protected_tuple_hash(conn: sqlite3.Connection, task_id: str) -> str:
+def _protected_tuple_hash(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allow_deleted: bool = False,
+) -> str:
     columns = ", ".join(_PROTECTED_TUPLE_COLUMNS)
     row = conn.execute(f"SELECT {columns} FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
+        if allow_deleted:
+            return _canonical_hash({
+                "version": _TUPLE_VERSION,
+                "task_id": task_id,
+                "deleted": True,
+            })
         raise RuntimeError("task disappeared before transition receipt")
     return _canonical_hash({
         "version": _TUPLE_VERSION,
@@ -296,7 +358,11 @@ def _insert_receipt(
     request_hash: str,
     outcome: TransitionOutcome,
 ) -> TransitionOutcome:
-    result_tuple_hash = _protected_tuple_hash(private, request.task_id)
+    result_tuple_hash = _protected_tuple_hash(
+        private,
+        request.task_id,
+        allow_deleted=isinstance(request, _DeleteRequest),
+    )
     private.execute(
         "INSERT INTO task_transition_receipts "
         "(operation_id, task_id, operation_kind, request_hash, outcome_code, event_id, "
@@ -730,12 +796,118 @@ def _apply_schedule(
     ), run_id)
 
 
+def _apply_archive(
+    private: sqlite3.Connection,
+    request: _ArchiveRequest,
+) -> _AppliedTransition:
+    from hermes_cli import kanban_db as kb
+
+    row = private.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at, "
+        "block_identity_state FROM tasks WHERE id = ?",
+        (request.task_id,),
+    ).fetchone()
+    if row is None:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="task_not_found"
+        ))
+    if row["block_identity_state"] == "unknown":
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="block_identity_unknown"
+        ))
+    if row["status"] == "archived":
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="invalid_status"
+        ))
+    updated = private.execute(
+        "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+        "WHERE id = ? AND status != 'archived'",
+        (request.task_id,),
+    )
+    if updated.rowcount != 1:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="compare_and_set"
+        ))
+    run_id = kb._end_run(
+        private,
+        request.task_id,
+        outcome="reclaimed",
+        status="reclaimed",
+        summary="task archived with run still active",
+    )
+    kb._append_event(private, request.task_id, "archived", None, run_id=run_id)
+    event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return _AppliedTransition(
+        TransitionOutcome(
+            True,
+            request.operation_id,
+            event_id,
+            row["block_identity_state"],
+        ),
+        hook_run_id=run_id,
+        worker_pid=row["worker_pid"],
+        claim_lock=row["claim_lock"],
+        worker_started_at=row["worker_started_at"],
+        was_running=row["status"] == "running",
+    )
+
+
+def _apply_delete(
+    private: sqlite3.Connection,
+    request: _DeleteRequest,
+) -> _AppliedTransition:
+    row = private.execute(
+        "SELECT status, block_identity_state FROM tasks WHERE id = ?",
+        (request.task_id,),
+    ).fetchone()
+    if row is None:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="task_not_found"
+        ))
+    if row["block_identity_state"] == "unknown":
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="block_identity_unknown"
+        ))
+    if request.archived_only and row["status"] != "archived":
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="invalid_status"
+        ))
+    attachment_paths = tuple(
+        attachment["stored_path"]
+        for attachment in private.execute(
+            "SELECT stored_path FROM task_attachments WHERE task_id = ?",
+            (request.task_id,),
+        ).fetchall()
+    )
+    private.execute(
+        "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+        (request.task_id, request.task_id),
+    )
+    private.execute("DELETE FROM task_comments WHERE task_id = ?", (request.task_id,))
+    private.execute("DELETE FROM task_events WHERE task_id = ?", (request.task_id,))
+    private.execute("DELETE FROM task_runs WHERE task_id = ?", (request.task_id,))
+    private.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (request.task_id,))
+    private.execute("DELETE FROM task_attachments WHERE task_id = ?", (request.task_id,))
+    deleted = private.execute("DELETE FROM tasks WHERE id = ?", (request.task_id,))
+    if deleted.rowcount != 1:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="compare_and_set"
+        ))
+    return _AppliedTransition(
+        TransitionOutcome(True, request.operation_id, identity_state="none"),
+        attachment_paths=attachment_paths,
+    )
+
+
 _OPERATION_HANDLERS = {
     _BlockRequest: _apply_block,
     _ClassifyBlockRequest: _apply_classify_block,
     _UnblockRequest: _apply_unblock,
     _PromoteRequest: _apply_promote,
     _ScheduleRequest: _apply_schedule,
+    _ArchiveRequest: _apply_archive,
+    _DeleteRequest: _apply_delete,
 }
 
 
@@ -772,7 +944,16 @@ def _run_operation(
         except BaseException:
             _rollback(private)
             raise
-    return _KernelResult(outcome, True, applied.hook_run_id)
+    return _KernelResult(
+        outcome,
+        True,
+        applied.hook_run_id,
+        applied.worker_pid,
+        applied.claim_lock,
+        applied.worker_started_at,
+        applied.was_running,
+        applied.attachment_paths,
+    )
 
 
 def block_task_transition(
@@ -917,6 +1098,179 @@ def schedule_task(
         operation_id=_compatibility_lifecycle_operation_id("schedule", task_id),
         reason=reason,
         expected_run_id=expected_run_id,
+    ).committed
+
+
+def _record_archive_worker_termination(
+    conn: sqlite3.Connection,
+    task_id: str,
+    termination: dict[str, Any],
+    run_id: Optional[int],
+) -> None:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    db_path = kbc._main_db_file(conn)
+    if not db_path:
+        raise ValueError("archive audit requires a file-backed Kanban database")
+    with kbc._protected_connection(db_path, operation="archive") as private:
+        try:
+            kbc._execute_boundary_with_retry(private, "BEGIN IMMEDIATE")
+            kb._append_event(
+                private,
+                task_id,
+                "archive_worker_termination",
+                termination,
+                run_id=run_id,
+            )
+            kbc._execute_boundary_with_retry(private, "COMMIT")
+        except BaseException:
+            _rollback(private)
+            raise
+
+
+def archive_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+    signal_fn=None,
+) -> TransitionOutcome:
+    """Archive one task atomically, then perform host-local cleanup after close."""
+    from hermes_cli import kanban_db as kb
+
+    result = _run_operation(
+        conn, _ArchiveRequest(task_id, actor_scope, operation_id)
+    )
+    if not result.applied:
+        return result.outcome
+    if result.was_running:
+        termination = kb._terminate_reclaimed_worker(
+            result.worker_pid,
+            result.claim_lock,
+            signal_fn=signal_fn,
+            started_at=result.worker_started_at,
+        )
+        _record_archive_worker_termination(
+            conn, task_id, termination, result.hook_run_id
+        )
+    kb.recompute_ready(conn)
+    kb._cleanup_workspace(conn, task_id)
+    return result.outcome
+
+
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    signal_fn=None,
+) -> bool:
+    """Compatibility adapter preserving the literal-bool archive result."""
+    return archive_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("archive", task_id),
+        signal_fn=signal_fn,
+    ).committed
+
+
+def _delete_attachment_blobs(
+    conn: sqlite3.Connection,
+    attachment_paths: tuple[str, ...],
+) -> None:
+    for stored_path in dict.fromkeys(attachment_paths):
+        still_referenced = conn.execute(
+            "SELECT 1 FROM task_attachments WHERE stored_path = ? LIMIT 1",
+            (stored_path,),
+        ).fetchone()
+        if still_referenced is not None:
+            continue
+        with contextlib.suppress(OSError):
+            path = Path(stored_path)
+            if path.is_file():
+                path.unlink()
+
+
+def _delete_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+    archived_only: bool,
+) -> TransitionOutcome:
+    from hermes_cli import kanban_db as kb
+
+    operation_kind = "delete_archived" if archived_only else "delete"
+    result = _run_operation(
+        conn,
+        _DeleteRequest(
+            task_id,
+            actor_scope,
+            operation_id,
+            archived_only,
+            operation_kind,
+        ),
+    )
+    if result.applied:
+        kb.recompute_ready(conn)
+        _delete_attachment_blobs(conn, result.attachment_paths)
+    return result.outcome
+
+
+def delete_archived_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+) -> TransitionOutcome:
+    """Delete an archived task and all task-owned rows in one receipt transaction."""
+    return _delete_task_transition(
+        conn,
+        task_id,
+        actor_scope=actor_scope,
+        operation_id=operation_id,
+        archived_only=True,
+    )
+
+
+def delete_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+) -> TransitionOutcome:
+    """Delete any classified task and all task-owned rows in one receipt transaction."""
+    return _delete_task_transition(
+        conn,
+        task_id,
+        actor_scope=actor_scope,
+        operation_id=operation_id,
+        archived_only=False,
+    )
+
+
+def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Compatibility adapter preserving archived-only deletion."""
+    return delete_archived_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("delete-archived", task_id),
+    ).committed
+
+
+def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Compatibility adapter preserving unrestricted classified deletion."""
+    return delete_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("delete", task_id),
     ).committed
 
 
