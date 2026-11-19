@@ -35,6 +35,8 @@ class FiniteEvaluator:
             return Values(frozenset({str(node.value)}))
         if isinstance(node, ast.Name):
             return self._name(node, env, stack)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return self._name(ast.Name(id=f"{node.value.id}.{node.attr}", ctx=ast.Load()), env, stack)
         if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
             return self._union(self.evaluate(item, env, stack) for item in node.elts)
         if isinstance(node, ast.Subscript) and isinstance(node.value, (ast.List, ast.Tuple)):

@@ -386,20 +386,25 @@ UNSAFE = make_suffix()
         "app/writers.py": '''
 from hermes_cli import kanban_db
 from agent.fragments import SUFFIX as suffix, UNSAFE as unsafe
+from agent import fragments
 
 def write(conn):
     conn.execute("DELETE FROM task_links WHERE 1=1" + suffix)
     conn.execute("DELETE FROM task_links WHERE 1=1" + unsafe)
+    conn.execute("DELETE FROM task_links WHERE 1=1" + fragments.SUFFIX)
+    conn.execute("DELETE FROM task_links WHERE 1=1" + fragments.UNSAFE)
 ''',
     })
 
     result, report = _run(repo)
 
     assert result.returncode == 1
-    assert [tuple(item["effects"]) for item in report["inventory"]] == [("task_links.delete",)]
+    assert [tuple(item["effects"]) for item in report["inventory"]] == [
+        ("task_links.delete",), ("task_links.delete",),
+    ]
     kinds = [problem["kind"] for problem in report["problems"]]
-    assert kinds.count("unresolved-sql") == 1
-    assert kinds.count("unallowlisted-writer") == 1
+    assert kinds.count("unresolved-sql") == 2
+    assert kinds.count("unallowlisted-writer") == 2
 
 
 def test_finite_numeric_literals_resolve_without_blessing_dynamic_values(tmp_path):

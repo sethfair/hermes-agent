@@ -94,6 +94,62 @@ def _imported_module_aliases(tree: ast.Module, root: Path) -> set[str]:
     return aliases
 
 
+def _module_path(root: Path, module: str) -> Path | None:
+    candidate = root.joinpath(*module.split("."))
+    for path in (candidate.with_suffix(".py"), candidate / "__init__.py"):
+        if path.is_file():
+            return path
+    return None
+
+
+def _static_imported_values(root: Path, path: Path, name: str,
+                            stack: tuple[Path, ...] = ()) -> list[ast.AST] | None:
+    if path in stack:
+        return None
+    try:
+        imported_tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=path.as_posix())
+    except (OSError, SyntaxError):
+        return None
+    imported_parents = {
+        child: parent for parent in ast.walk(imported_tree) for child in ast.iter_child_nodes(parent)
+    }
+    assignments = _assignments(imported_tree, imported_parents)
+    choices = assignments.get(name, [])
+    if not choices or any(isinstance(item, ast.Call) for choice in choices for item in ast.walk(choice)):
+        return None
+    needed = {
+        item.id for choice in choices for item in ast.walk(choice)
+        if isinstance(item, ast.Name) and item.id not in assignments
+    }
+    for imported in (item for item in ast.walk(imported_tree) if isinstance(item, ast.ImportFrom) and item.module):
+        module = imported.module
+        if module is None:
+            continue
+        imported_path = _module_path(root, module)
+        if imported_path is None:
+            continue
+        for alias in imported.names:
+            local = alias.asname or alias.name
+            if local not in needed:
+                continue
+            values = _static_imported_values(root, imported_path, alias.name, stack + (path,))
+            if values is not None:
+                assignments[local] = values
+    evaluator = FiniteEvaluator(assignments, _functions(imported_tree))
+    strings: set[str] = set()
+    for choice in choices:
+        try:
+            value = evaluator.evaluate(choice)
+        except RecursionError:
+            return None
+        if not value.resolved:
+            return None
+        strings.update(value.strings)
+        if len(strings) > MAX_VARIANTS:
+            return None
+    return [ast.Constant(value=string) for string in strings]
+
+
 def _imported_constant_assignments(tree: ast.Module, root: Path,
                                    parents: dict[ast.AST, ast.AST]) -> dict[str, dict[str, list[ast.AST]]]:
     """Materialize finite imported constants without importing or executing modules."""
@@ -114,41 +170,40 @@ def _imported_constant_assignments(tree: ast.Module, root: Path,
         ]
         if not selected:
             continue
-        candidate = root.joinpath(*node.module.split("."))
-        path = candidate.with_suffix(".py")
-        if not path.is_file():
-            path = candidate / "__init__.py"
-        if not path.is_file():
+        path = _module_path(root, node.module)
+        if path is None:
             continue
-        try:
-            imported_tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=path.as_posix())
-        except (OSError, SyntaxError):
-            continue
-        imported_parents = {
-            child: parent for parent in ast.walk(imported_tree) for child in ast.iter_child_nodes(parent)
-        }
-        assignments = _assignments(imported_tree, imported_parents)
-        evaluator = FiniteEvaluator(assignments, _functions(imported_tree))
         for alias in selected:
-            choices = assignments.get(alias.name, [])
-            if not choices or any(isinstance(item, ast.Call) for choice in choices for item in ast.walk(choice)):
+            values = _static_imported_values(root, path, alias.name)
+            if values is not None:
+                result[_function_name(node, parents)][alias.asname or alias.name] = values
+
+    module_aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            module_aliases.update((alias.asname or alias.name.split(".")[0], alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                module = f"{node.module}.{alias.name}"
+                if _module_path(root, module) is not None:
+                    module_aliases[alias.asname or alias.name] = module
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute) \
+                or call.func.attr not in _SINK_NAMES or not call.args:
+            continue
+        for attribute in (item for item in ast.walk(call.args[0]) if isinstance(item, ast.Attribute)):
+            if not isinstance(attribute.value, ast.Name) or not attribute.attr.isupper():
                 continue
-            strings: set[str] = set()
-            for choice in choices:
-                try:
-                    value = evaluator.evaluate(choice)
-                except RecursionError:
-                    break
-                if not value.resolved:
-                    break
-                strings.update(value.strings)
-                if len(strings) > MAX_VARIANTS:
-                    break
-            else:
-                if len(strings) <= MAX_VARIANTS:
-                    result[_function_name(node, parents)][alias.asname or alias.name] = [
-                        ast.Constant(value=string) for string in strings
-                    ]
+            alias, module = attribute.value.id, module_aliases.get(attribute.value.id)
+            if module is None or any(
+                isinstance(item, ast.Name) and item.id == alias and isinstance(item.ctx, ast.Store)
+                for item in ast.walk(tree)
+            ):
+                continue
+            path = _module_path(root, module)
+            values = _static_imported_values(root, path, attribute.attr) if path is not None else None
+            if values is not None:
+                result["<module>"][f"{alias}.{attribute.attr}"] = values
     return dict(result)
 
 
