@@ -76,6 +76,28 @@ class _ClassifyBlockRequest:
 
 
 @dataclass(frozen=True)
+class _UnblockRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    operation_kind: str = "unblock"
+    authority_kind: str = "block"
+
+
+@dataclass(frozen=True)
+class _PromoteRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    reason: Optional[str]
+    operation_kind: str = "promote"
+    authority_kind: str = "block"
+
+
+_Request = _BlockRequest | _ClassifyBlockRequest | _UnblockRequest | _PromoteRequest
+
+
+@dataclass(frozen=True)
 class _AppliedTransition:
     outcome: TransitionOutcome
     hook_run_id: Optional[int] = None
@@ -132,13 +154,32 @@ def _classify_request_hash(request: _ClassifyBlockRequest) -> str:
     })
 
 
+def _unblock_request_hash(request: _UnblockRequest) -> str:
+    return _canonical_hash({
+        "task_id": request.task_id,
+        "operation_kind": request.operation_kind,
+        "actor_scope": request.actor_scope,
+    })
+
+
+def _promote_request_hash(request: _PromoteRequest) -> str:
+    return _canonical_hash({
+        "task_id": request.task_id,
+        "operation_kind": request.operation_kind,
+        "actor_scope": request.actor_scope,
+        "reason": request.reason,
+    })
+
+
 _REQUEST_HASHERS = {
     _BlockRequest: _block_request_hash,
     _ClassifyBlockRequest: _classify_request_hash,
+    _UnblockRequest: _unblock_request_hash,
+    _PromoteRequest: _promote_request_hash,
 }
 
 
-def _request_hash(request: _BlockRequest | _ClassifyBlockRequest) -> str:
+def _request_hash(request: _Request) -> str:
     return _REQUEST_HASHERS[type(request)](request)
 
 
@@ -184,7 +225,7 @@ def _validate_ingress(
 
 def _receipt_outcome(
     receipt: sqlite3.Row,
-    request: _BlockRequest | _ClassifyBlockRequest,
+    request: _Request,
     request_hash: str,
 ) -> TransitionOutcome:
     matches = (
@@ -199,7 +240,7 @@ def _receipt_outcome(
         or receipt["operation_version"] != _OPERATION_VERSION
         or receipt["tuple_version"] != _TUPLE_VERSION
         or not _valid_result_hash(receipt["result_tuple_hash"])
-        or receipt["result_identity_state"] not in {"known", "unknown"}
+        or receipt["result_identity_state"] not in {"none", "known", "unknown"}
     ):
         return TransitionOutcome(False, request.operation_id, refusal="invalid_receipt")
     return TransitionOutcome(
@@ -223,7 +264,7 @@ def _load_receipt(private: sqlite3.Connection, operation_id: str) -> Optional[sq
 
 def _insert_receipt(
     private: sqlite3.Connection,
-    request: _BlockRequest | _ClassifyBlockRequest,
+    request: _Request,
     request_hash: str,
     outcome: TransitionOutcome,
 ) -> TransitionOutcome:
@@ -477,15 +518,148 @@ def _apply_classify_block(
     ))
 
 
+def _apply_unblock(
+    private: sqlite3.Connection,
+    request: _UnblockRequest,
+) -> _AppliedTransition:
+    from hermes_cli import kanban_db as kb
+
+    row = private.execute(
+        "SELECT status, block_identity_state FROM tasks WHERE id = ?",
+        (request.task_id,),
+    ).fetchone()
+    if row is None:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="task_not_found"
+        ))
+    if row["block_identity_state"] == "unknown":
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="block_identity_unknown"
+        ))
+    if row["status"] not in {"blocked", "scheduled"}:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="invalid_status"
+        ))
+    resume_status = (
+        kb._resume_status_from_events(private, request.task_id)
+        if row["status"] == "blocked"
+        else "ready"
+    )
+    kb._reclaim_dangling_run(
+        private,
+        request.task_id,
+        statuses=("blocked", "scheduled"),
+        now=int(time.time()),
+        note="invariant recovery on unblock",
+    )
+    landing_status = kb._landing_status_after_parents(private, request.task_id)
+    new_status = (
+        "review"
+        if landing_status == "ready" and resume_status == "review"
+        else landing_status
+    )
+    updated = private.execute(
+        "UPDATE tasks SET status = ?, current_run_id = NULL, "
+        "consecutive_failures = 0, last_failure_error = NULL "
+        "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+        (new_status, request.task_id),
+    )
+    if updated.rowcount != 1:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="compare_and_set"
+        ))
+    kb._append_event(
+        private,
+        request.task_id,
+        "unblocked",
+        (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
+        ),
+    )
+    event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return _AppliedTransition(TransitionOutcome(
+        True, request.operation_id, event_id, row["block_identity_state"]
+    ))
+
+
+def _promote_refusal(private: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = private.execute(
+        "SELECT status, block_identity_state FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return f"task {task_id} not found"
+    if row["block_identity_state"] == "unknown":
+        return "block_identity_unknown"
+    if row["status"] not in {"todo", "blocked"}:
+        return (
+            f"task {task_id} is {row['status']!r}; promote only applies to "
+            "'todo' or 'blocked'"
+        )
+    parents = private.execute(
+        "SELECT t.id, t.status FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    unsatisfied = [parent["id"] for parent in parents if parent["status"] not in {"done", "archived"}]
+    if unsatisfied:
+        return (
+            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
+            "(the ready -> running claim re-checks parents, so promotion cannot "
+            "bypass them; complete the parents or drop the link with "
+            f"`hermes kanban unlink <parent_id> {task_id}`)"
+        )
+    return None
+
+
+def _apply_promote(
+    private: sqlite3.Connection,
+    request: _PromoteRequest,
+) -> _AppliedTransition:
+    from hermes_cli import kanban_db as kb
+
+    refusal = _promote_refusal(private, request.task_id)
+    if refusal is not None:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal=refusal
+        ))
+    identity_state = private.execute(
+        "SELECT block_identity_state FROM tasks WHERE id = ?", (request.task_id,)
+    ).fetchone()[0]
+    updated = private.execute(
+        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status IN ('todo', 'blocked')",
+        (request.task_id,),
+    )
+    if updated.rowcount != 1:
+        return _AppliedTransition(TransitionOutcome(
+            False,
+            request.operation_id,
+            refusal=f"task {request.task_id} status changed during promotion",
+        ))
+    kb._append_event(
+        private,
+        request.task_id,
+        "promoted_manual",
+        {"actor": request.actor_scope, "reason": request.reason},
+    )
+    event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return _AppliedTransition(TransitionOutcome(
+        True, request.operation_id, event_id, identity_state
+    ))
+
+
 _OPERATION_HANDLERS = {
     _BlockRequest: _apply_block,
     _ClassifyBlockRequest: _apply_classify_block,
+    _UnblockRequest: _apply_unblock,
+    _PromoteRequest: _apply_promote,
 }
 
 
 def _run_operation(
     conn: sqlite3.Connection,
-    request: _BlockRequest | _ClassifyBlockRequest,
+    request: _Request,
 ) -> _KernelResult:
     """Run one closed request with replay, CAS effects, and receipt in one transaction."""
     from hermes_cli import kanban_db_connect as kbc
@@ -559,6 +733,75 @@ def block_task_transition(
 
 def compatibility_operation_id(task_id: str) -> str:
     return f"legacy-block:{task_id}:{secrets.token_hex(12)}"
+
+
+def _compatibility_lifecycle_operation_id(kind: str, task_id: str) -> str:
+    return f"legacy-{kind}:{task_id}:{secrets.token_hex(12)}"
+
+
+def unblock_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+) -> TransitionOutcome:
+    """Release a classified block/schedule through the receipt kernel."""
+    request = _UnblockRequest(task_id, actor_scope, operation_id)
+    return _run_operation(conn, request).outcome
+
+
+def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Compatibility adapter preserving the literal-bool unblock result."""
+    return unblock_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("unblock", task_id),
+    ).committed
+
+
+def promote_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+    reason: Optional[str] = None,
+    dry_run: bool = False,
+) -> TransitionOutcome:
+    """Validate or commit a replay-safe operator promotion."""
+    _validate_ingress(conn, actor_scope=actor_scope, operation_id=operation_id)
+    if dry_run:
+        refusal = _promote_refusal(conn, task_id)
+        return TransitionOutcome(
+            refusal is None,
+            operation_id,
+            identity_state="none",
+            refusal=refusal,
+        )
+    request = _PromoteRequest(task_id, actor_scope, operation_id, reason)
+    return _run_operation(conn, request).outcome
+
+
+def promote_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+    dry_run: bool = False,
+) -> tuple[bool, Optional[str]]:
+    """Compatibility adapter preserving ``(ok, reason)`` promotion results."""
+    outcome = promote_task_transition(
+        conn,
+        task_id,
+        actor_scope=actor,
+        operation_id=_compatibility_lifecycle_operation_id("promote", task_id),
+        reason=reason,
+        dry_run=dry_run,
+    )
+    return outcome.committed, outcome.refusal
 
 
 def classify_block_transition(
