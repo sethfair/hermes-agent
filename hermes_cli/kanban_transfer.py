@@ -22,7 +22,6 @@ default board's split on-disk layout.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import shutil
 import sqlite3
@@ -34,6 +33,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.sqlite_private_copy import connect_private_copy
 from hermes_cli.archive_safe import (
     archive_root_dirs,
     copy_regular_files,
@@ -158,7 +158,7 @@ def export_board(
         _snapshot_db(db_path, staged / "kanban.db")
         # The snapshot is a private file with no other writers, so plain
         # commit/close is enough — no need for the board DB's WAL dance.
-        with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
+        with connect_private_copy(staged / "kanban.db", private_root=staged) as snapshot:
             _scrub_local_state(snapshot)
             snapshot.commit()
             counts = _count_rows(snapshot)
@@ -246,9 +246,11 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _refuse_authenticated_board_rebinding(db_path: Path, target: str) -> None:
+def _refuse_authenticated_board_rebinding(
+    db_path: Path, target: str, *, private_root: Path,
+) -> None:
     """Fail before publication when import would strand board-keyed authority."""
-    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+    with connect_private_copy(db_path, private_root=private_root) as conn:
         tables = {
             row[0]
             for row in conn.execute(
@@ -398,7 +400,9 @@ def import_board(
         # Receipt and principal history is authoritative and board-keyed. Until
         # import has an explicit history-preserving rekey protocol, reject a
         # rename/collision before creating target metadata or moving any files.
-        _refuse_authenticated_board_rebinding(staged_db, target)
+        _refuse_authenticated_board_rebinding(
+            staged_db, target, private_root=extracted
+        )
 
         staged_meta = _read_board_metadata(extracted / "board.json")
 
@@ -406,7 +410,7 @@ def import_board(
         # discoverable until every protected row and the fresh physical board
         # identity have committed successfully.
         kbc.init_db(db_path=staged_db)
-        with contextlib.closing(sqlite3.connect(staged_db)) as staged:
+        with connect_private_copy(staged_db, private_root=extracted) as staged:
             staged.row_factory = sqlite3.Row
             stats, warnings = _relocate_imported_rows(
                 staged,
