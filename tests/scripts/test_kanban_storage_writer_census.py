@@ -119,6 +119,68 @@ def write(conn):
     assert not [problem for problem in report["problems"] if problem["kind"] == "unresolved-sql"]
 
 
+def test_finite_sql_resolves_keyword_format_arguments(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+INDEX_SQL = "CREATE {if_not_exists}INDEX task_status ON tasks(status)"
+def write(conn):
+    conn.execute(INDEX_SQL.format(if_not_exists="IF NOT EXISTS "))
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 0
+    assert report["inventory"] == []
+    assert report["problems"] == []
+
+
+@pytest.mark.parametrize("placeholder_builder", [
+    '",".join("?" * len(task_ids))',
+    '",".join(["?"] * len(task_ids))',
+    '", ".join("?" for _ in task_ids)',
+])
+def test_runtime_placeholder_count_does_not_hide_fixed_protected_effect(tmp_path, placeholder_builder):
+    repo = _repo(tmp_path, {
+        "app/writers.py": f'''
+from hermes_cli import kanban_db
+def write(conn, task_ids):
+    placeholders = {placeholder_builder}
+    conn.execute(f"UPDATE tasks SET status='triage' WHERE id IN ({{placeholders}})", task_ids)
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"][0]["effects"] == ["tasks.update.status"]
+    assert not [problem for problem in report["problems"] if problem["kind"] == "unresolved-sql"]
+
+
+def test_finite_list_appends_resolve_all_protected_sql_variants(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+def write(conn, title=None, body=None):
+    assignments = ["status = 'todo'"]
+    if title is not None:
+        assignments.append("title = ?")
+    if body is not None:
+        assignments.append("body = ?")
+    conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert len(report["inventory"]) == 4
+    assert {tuple(item["effects"]) for item in report["inventory"]} == {
+        ("tasks.update.status",),
+    }
+    assert not [problem for problem in report["problems"] if problem["kind"] == "unresolved-sql"]
+
+
 def test_finite_branches_and_cte_dml_are_all_inventoried(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": """
@@ -183,6 +245,25 @@ def test_parse_dynamic_identifier_and_alias_fail_closed(tmp_path, source, kind):
     result, report = _run(repo)
     assert result.returncode == 1
     assert kind in {problem["kind"] for problem in report["problems"]}
+
+
+def test_non_sql_execute_receivers_are_not_treated_as_database_sinks(tmp_path):
+    repo = _repo(tmp_path, {
+        "agent/__init__.py": "",
+        "agent/relay_tools.py": "def execute(command): return command\n",
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+from agent import relay_tools
+def dispatch(command):
+    return relay_tools.execute(command)
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 0
+    assert report["inventory"] == []
+    assert report["problems"] == []
 
 
 def test_variant_overflow_fails_closed(tmp_path):

@@ -44,11 +44,33 @@ def _assignments(scope: ast.Module | ast.FunctionDef, parents: dict[ast.AST, ast
             for target in targets:
                 if isinstance(target, ast.Name):
                     result[target.id].append(value)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "append" and len(node.args) == 1 \
+                and isinstance(node.func.value, ast.Name):
+            # Mark list growth distinctly so the evaluator can enumerate the
+            # finite include/exclude variants without treating it as scalar
+            # reassignment. Conditionality is intentionally conservative: an
+            # append may be absent, so both paths are retained.
+            result[node.func.value.id].append(ast.Starred(value=node.args[0], ctx=ast.Load()))
     return dict(result)
 
 
 def _functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
     return {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+
+
+def _imported_module_aliases(tree: ast.Module, root: Path) -> set[str]:
+    """Names proven to refer to modules rather than connection-like objects."""
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            base = root.joinpath(*node.module.split("."))
+            for alias in node.names:
+                if (base / f"{alias.name}.py").is_file() or (base / alias.name / "__init__.py").is_file():
+                    aliases.add(alias.asname or alias.name)
+    return aliases
 
 
 def _wrapper_summary(function: ast.FunctionDef) -> tuple[int, ast.AST] | None:
@@ -163,7 +185,7 @@ def _sink_argument(call: ast.Call, aliases: dict[str, tuple[bool, bool]],
 def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
                 parents: dict[ast.AST, ast.AST], functions: dict[str, ast.FunctionDef],
                 module_assignments: dict[str, list[ast.AST]], relative: str,
-                kanban_relevant: bool) -> tuple[list[InventoryItem], list[Problem]]:
+                kanban_relevant: bool, module_aliases: set[str]) -> tuple[list[InventoryItem], list[Problem]]:
     function = scope if isinstance(scope, ast.FunctionDef) else None
     assignments = {name: list(values) for name, values in module_assignments.items()}
     if function:
@@ -186,6 +208,9 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
     ordinal = 0
     for call in sorted(calls, key=lambda item: (item.lineno, item.col_offset)):
         if isinstance(call.func, ast.Name) and call.func.id in parameters:
+            continue
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) \
+                and call.func.value.id in module_aliases:
             continue
         sink = _sink_argument(call, aliases, functions, parameters)
         if sink is None:
@@ -230,9 +255,11 @@ def _scan_file(root: Path, path: Path) -> tuple[list[InventoryItem], list[Proble
     ))
 
     module_assignments = _assignments(tree, parents)
+    module_aliases = _imported_module_aliases(tree, root)
     for scope in [tree, *functions.values()]:
         found, refused = _scan_scope(
             scope, tree, parents, functions, module_assignments, relative, kanban_relevant,
+            module_aliases,
         )
         inventory.extend(found)
         problems.extend(refused)

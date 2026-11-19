@@ -109,15 +109,27 @@ class FiniteEvaluator:
         assert isinstance(node.func, ast.Attribute)
         template = self.evaluate(node.func.value, env, stack)
         arguments = [self.evaluate(arg, env, stack) for arg in node.args]
-        if not template.resolved or any(not arg.resolved for arg in arguments):
-            return Values(reason=template.reason or next(arg.reason for arg in arguments if not arg.resolved))
+        keywords = {
+            keyword.arg: self.evaluate(keyword.value, env, stack)
+            for keyword in node.keywords
+            if keyword.arg is not None
+        }
+        unresolved = [value for value in [template, *arguments, *keywords.values()] if not value.resolved]
+        if unresolved:
+            return Values(reason=unresolved[0].reason)
         output: set[str] = set()
         for base in template.strings:
             for values in itertools.product(*(arg.strings for arg in arguments)):
-                try:
-                    output.add(base.format(*values))
-                except (IndexError, KeyError, ValueError) as exc:
-                    return Values(reason=f"format operation failed: {exc}")
+                keyword_names = tuple(keywords)
+                keyword_products = itertools.product(*(keywords[name].strings for name in keyword_names))
+                for keyword_values in keyword_products:
+                    try:
+                        output.add(base.format(
+                            *values,
+                            **dict(zip(keyword_names, keyword_values, strict=True)),
+                        ))
+                    except (IndexError, KeyError, ValueError) as exc:
+                        return Values(reason=f"format operation failed: {exc}")
         return self._bounded(output)
 
     def _join_call(self, node: ast.Call, env: dict[str, Values],
@@ -125,6 +137,12 @@ class FiniteEvaluator:
         assert isinstance(node.func, ast.Attribute)
         separators = self.evaluate(node.func.value, env, stack)
         sequence = node.args[0]
+        if self._runtime_placeholders(sequence):
+            if not separators.resolved:
+                return separators
+            return Values(frozenset({"?"}))
+        if isinstance(sequence, ast.Name):
+            return self._join_named_sequence(sequence.id, separators, env, stack)
         if not separators.resolved or not isinstance(sequence, (ast.List, ast.Tuple)):
             return Values(reason=separators.reason or "join input is not a finite literal sequence")
         pieces = [self.evaluate(item, env, stack) for item in sequence.elts]
@@ -135,6 +153,61 @@ class FiniteEvaluator:
             for separator in separators.strings
             for values in itertools.product(*(piece.strings for piece in pieces))
         })
+
+    def _join_named_sequence(self, name: str, separators: Values,
+                             env: dict[str, Values], stack: tuple[str, ...]) -> Values:
+        if not separators.resolved:
+            return separators
+        choices = self.assignments.get(name, [])
+        bases = [choice for choice in choices if isinstance(choice, (ast.List, ast.Tuple))]
+        appends = [choice.value for choice in choices if isinstance(choice, ast.Starred)]
+        if not bases or len(bases) + len(appends) != len(choices):
+            return Values(reason=f"join input {name} is not a finite list")
+
+        sequences: set[tuple[str, ...]] = set()
+        for base in bases:
+            pieces = [self.evaluate(item, env, stack) for item in base.elts]
+            if any(not piece.resolved for piece in pieces):
+                return Values(reason=next(piece.reason for piece in pieces if not piece.resolved))
+            sequences.update(itertools.product(*(piece.strings for piece in pieces)))
+        for append in appends:
+            value = self.evaluate(append, env, stack)
+            if not value.resolved:
+                return value
+            sequences = {
+                variant
+                for current in sequences
+                for variant in (current, *((*current, item) for item in value.strings))
+            }
+            if len(sequences) > MAX_VARIANTS:
+                return Values(reason="variant-overflow")
+        return self._bounded({
+            separator.join(parts)
+            for separator in separators.strings
+            for parts in sequences
+        })
+
+    @staticmethod
+    def _runtime_placeholders(node: ast.AST) -> bool:
+        """Recognize a runtime-sized sequence containing only SQL bind markers."""
+        if isinstance(node, ast.GeneratorExp):
+            return (
+                isinstance(node.elt, ast.Constant)
+                and node.elt.value == "?"
+                and len(node.generators) == 1
+                and not node.generators[0].ifs
+                and not node.generators[0].is_async
+            )
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Mult):
+            return False
+        for part in (node.left, node.right):
+            if isinstance(part, ast.Constant) and part.value == "?":
+                return True
+            if isinstance(part, (ast.List, ast.Tuple)) and len(part.elts) == 1:
+                item = part.elts[0]
+                if isinstance(item, ast.Constant) and item.value == "?":
+                    return True
+        return False
 
     def _helper_call(self, node: ast.Call, env: dict[str, Values],
                      stack: tuple[str, ...]) -> Values:
