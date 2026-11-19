@@ -20,6 +20,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_db_task_state import block_task_transition
 
 
 @pytest.fixture
@@ -493,14 +494,16 @@ def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
 
 def test_review_escalation_unblocks_back_to_review(conn) -> None:
     task_id, review = _claimed_review(conn, "External review escalation")
-    assert kb.block_task(
+    assert block_task_transition(
         conn,
         task_id,
+        actor_scope="review-test",
+        operation_id=f"review-escalation:{task_id}:{review.current_run_id}",
         reason="needs_input: maintainer decision required",
         kind="needs_input",
         subject="maintainer/decision",
         expected_run_id=review.current_run_id,
-    )
+    ).committed
     blocked_event = _event(kb.list_events(conn, task_id), "blocked")
     assert blocked_event.payload is not None
     assert blocked_event.payload["source_status"] == "review"
@@ -532,14 +535,16 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
     assert review is not None
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
-    assert kb.block_task(
+    assert block_task_transition(
         conn,
         task_id,
+        actor_scope="review-test",
+        operation_id=f"review-dependency:{task_id}:{review.current_run_id}",
         reason="dependency: parent contract is being refreshed",
         kind="dependency",
         subject=parent_id,
         expected_run_id=review.current_run_id,
-    )
+    ).committed
     waiting = kb.get_task(conn, task_id)
     assert waiting is not None
     assert waiting.status == "todo"

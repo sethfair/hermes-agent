@@ -586,6 +586,7 @@ def test_block_dependency_without_open_parent_is_unknown(worker_env):
         "reason": "upstream input is missing", "kind": "dependency",
         "subject": "t_deadbeef",
     }))
+    assert "error" not in d, d
     assert (d["ok"], d["status"], d["block_kind"], d["block_identity_state"]) == (
         True, "blocked", "dependency", "unknown"
     )
@@ -805,9 +806,11 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
-        kb.block_task(
-            conn, tid, reason="waiting", kind="transient", subject="tool-unblock-test"
-        )
+        from hermes_cli.kanban_db_task_state import block_task_transition
+        assert block_task_transition(
+            conn, tid, actor_scope="tool-test", operation_id=f"tool-unblock:{tid}",
+            reason="waiting", kind="transient", subject="tool-unblock-test",
+        ).committed
     finally:
         conn.close()
 

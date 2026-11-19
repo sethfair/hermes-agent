@@ -98,8 +98,14 @@ def _protected_connection(path: str | Path, *, operation: str):
     conn.text_factory = _kb._lossy_text
 
     writable_tables = {
-        "block": {"tasks", "task_runs", "task_events", "task_transition_receipts"},
-        "classify": {"tasks", "task_events"},
+        "block": {
+            "tasks", "task_runs", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "classify": {
+            "tasks", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
     }.get(operation, set())
     schema_actions = {
         sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_ALTER_TABLE,
@@ -113,7 +119,7 @@ def _protected_connection(path: str | Path, *, operation: str):
         if action in schema_actions:
             return sqlite3.SQLITE_DENY
         if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
-            return sqlite3.SQLITE_OK if table in writable_tables or _trigger else sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK if table in writable_tables else sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
     conn.set_authorizer(_authorize)
@@ -1119,7 +1125,9 @@ def _migrate_storage_version_fences(conn: sqlite3.Connection) -> None:
         "action_receipts": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
                             ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1")),
         "task_transition_receipts": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
-                                     ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1")),
+                                     ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1"),
+                                     ("result_tuple_hash", "result_tuple_hash TEXT"),
+                                     ("result_identity_state", "result_identity_state TEXT")),
     }.items():
         if not _table_exists(conn, table):
             continue

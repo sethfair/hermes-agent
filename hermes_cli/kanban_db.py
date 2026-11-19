@@ -3452,18 +3452,22 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         review_event = _latest_event(conn, task_id, "review_requested")
         handoff = _json_dict(_row_get(review_event, "payload"))
         implementer = _nonblank_str(handoff.get("implementer"))
+        identity_reset = new_status == "todo"
+        identity_sql = (", block_kind = NULL, block_recurrences = 0, block_identity = NULL, "
+                        "block_identity_state = 'unknown'" if identity_reset else "")
         params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
         cur = conn.execute(
-            # consecutive_failures deliberately PRESERVED: review reopen is not
-            # a success signal; only complete_task resets the breaker (#35072).
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            + (", assignee = ?" if implementer else "")
-            + " WHERE id = ? AND status = 'review'",
-            params,
+            + (", assignee = ?" if implementer else "") + identity_sql
+            + " WHERE id = ? AND status = 'review'", params,
         )
         if cur.rowcount != 1:
             return False
+        if identity_reset:
+            unknown_payload = {"identity_state": "unknown", "identity_version": 1,
+                               "unknown_cause": "review_reopened_parent_wait", "classification_required": True}
+            _append_event(conn, task_id, "block_identity_unknown", unknown_payload)
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer

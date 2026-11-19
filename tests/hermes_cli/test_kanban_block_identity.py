@@ -7,6 +7,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_graph as kbg
+from hermes_cli import kanban_db_task_state as task_state
 from hermes_cli.kanban_db_task_state import block_task_transition
 
 
@@ -165,6 +166,145 @@ def test_invalid_explicit_subject_is_unknown_and_redacted(home):
         encoded = json.dumps([event.payload for event in events])
         assert "private-value" not in encoded
         assert events[-1].payload["unknown_cause"] == "invalid_subject"
+
+
+def test_invalid_raw_subjects_collide_instead_of_replaying(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        operation_id = "invalid-subject-collision"
+        first = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="needs_input",
+            subject="invalid subject one",
+        )
+        second = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="needs_input",
+            subject="invalid subject two",
+        )
+
+        assert first.committed is True
+        assert (second.committed, second.refusal) == (False, "operation_id_collision")
+        receipt = conn.execute(
+            "SELECT request_hash FROM task_transition_receipts WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        assert receipt is not None
+        assert "invalid subject" not in receipt[0]
+
+
+def test_block_replay_returns_validated_result_tuple_receipt(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        operation_id = "block-result-tuple"
+        first = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="capability",
+            subject="missing-access",
+        )
+        replay = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="capability",
+            subject="missing-access",
+        )
+
+        assert replay == first
+        receipt = conn.execute(
+            "SELECT tuple_version, result_tuple_hash FROM task_transition_receipts "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        assert receipt[0] == 1
+        assert len(receipt[1]) == 64
+        int(receipt[1], 16)
+
+
+def test_replay_returns_recorded_landed_identity_state(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        operation_id = "landed-identity-state"
+        first = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="dependency",
+            subject="t_deadbeef",
+        )
+        replay = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="dependency",
+            subject="t_deadbeef",
+        )
+
+        assert first.identity_state == "unknown"
+        assert replay == first
+        assert conn.execute(
+            "SELECT result_identity_state FROM task_transition_receipts "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()[0] == "unknown"
+
+
+def test_classification_operation_replays_and_refuses_collision(home):
+    assert callable(task_state.classify_block_transition)
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        assert kb.block_task(conn, tid, kind="needs_input", reason="classification required")
+        before_events = len(kb.list_events(conn, tid))
+        operation_id = "classify-operation"
+
+        first = task_state.classify_block_transition(
+            conn,
+            tid,
+            operation_id=operation_id,
+            actor_scope="operator",
+            kind="needs_input",
+            subject="owner/decision-a",
+        )
+        replay = task_state.classify_block_transition(
+            conn,
+            tid,
+            operation_id=operation_id,
+            actor_scope="operator",
+            kind="needs_input",
+            subject="owner/decision-a",
+        )
+        collision = task_state.classify_block_transition(
+            conn,
+            tid,
+            operation_id=operation_id,
+            actor_scope="operator",
+            kind="needs_input",
+            subject="owner/decision-b",
+        )
+
+        assert replay == first
+        assert first.committed is True
+        assert (collision.committed, collision.refusal) == (False, "operation_id_collision")
+        assert len(kb.list_events(conn, tid)) == before_events + 1
+        receipt = conn.execute(
+            "SELECT operation_kind, tuple_version, result_tuple_hash "
+            "FROM task_transition_receipts WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        assert tuple(receipt[:2]) == ("classify_block", 1)
+        assert len(receipt[2]) == 64
 
 
 def test_unknown_requires_classification_before_unblock(home):

@@ -32,6 +32,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_ops
+from hermes_cli.kanban_db_task_state import block_task_transition
 
 
 @pytest.fixture
@@ -830,10 +831,12 @@ def test_reopen_review_task_parent_wait_replaces_stale_known_identity(kanban_hom
         parent = kb.create_task(conn, title="parent")
         assert kb.complete_task(conn, parent, summary="done")
         tid = kb.create_task(conn, title="reopen me", assignee="worker", parents=[parent])
-        assert kb.block_task(
-            conn, tid, reason="old decision", kind="needs_input", subject="old-decision",
-        )
-        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert block_task_transition(
+            conn, tid, actor_scope="review-test",
+            operation_id=f"review-old-decision:{tid}", reason="old decision",
+            kind="needs_input", subject="operator/old-decision",
+        ).committed
+        assert kb.unblock_task(conn, tid)
         assert kb.request_review(conn, tid, summary="ready", reviewer="reviewer")
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
 

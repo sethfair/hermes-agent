@@ -195,6 +195,12 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "subject": _prop("string", (
+            "Optional stable non-secret blocker identity. Use the parent task id "
+            "for dependency, owner/decision for needs_input, or a stable slug for "
+            "capability/transient. Omit when no safe stable identity exists; the "
+            "block then lands UNKNOWN and requires explicit classification."
+        )),
     },
     ["reason"],
 )
