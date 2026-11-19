@@ -319,7 +319,7 @@ def _protected_connection(path: str | Path, *, operation: str):
             "tasks", "task_runs", "task_events", "task_transition_receipts",
             "kanban_claim_admissions", "kanban_writer_faults",
         },
-        "classify": {
+        "classify_block": {
             "tasks", "task_events", "task_transition_receipts",
             "kanban_claim_admissions", "kanban_writer_faults",
         },
