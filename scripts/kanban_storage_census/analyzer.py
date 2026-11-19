@@ -200,6 +200,28 @@ def _closed_private_wrapper(function: ast.FunctionDef, tree: ast.Module,
     return wrapped_sql
 
 
+def _parameter_dependencies(node: ast.AST, parameters: set[str],
+                            assignments: dict[str, list[ast.AST]],
+                            seen: frozenset[str] = frozenset()) -> set[str]:
+    """Trace SQL-local aliases back to the parameters that construct them."""
+    relevant: set[str] = set()
+    children = (*ast.iter_child_nodes(node.body), *ast.iter_child_nodes(node.orelse)) \
+        if isinstance(node, ast.IfExp) else ast.iter_child_nodes(node)
+    if isinstance(node, ast.Name):
+        name = node.id
+        if name in parameters:
+            relevant.add(name)
+        elif name not in seen:
+            for choice in assignments.get(name, []):
+                relevant.update(_parameter_dependencies(
+                    choice, parameters, assignments, seen | {name},
+                ))
+        return relevant
+    for child in children:
+        relevant.update(_parameter_dependencies(child, parameters, assignments, seen))
+    return relevant
+
+
 def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
                               parents: dict[ast.AST, ast.AST],
                               evaluator: FiniteEvaluator,
@@ -209,10 +231,7 @@ def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
     summary = _wrapper_summary(function)
     if not function.name.startswith("_") or not parameters or summary is None:
         return {}
-    relevant = {
-        node.id for node in ast.walk(summary[1])
-        if isinstance(node, ast.Name) and node.id in parameters
-    }
+    relevant = _parameter_dependencies(summary[1], set(parameters), evaluator.assignments)
     if not relevant:
         return {}
     uses = name_uses.get(function.name, [])
@@ -459,7 +478,7 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
     environment = _closed_enum_environment(function, tree) if function else {}
     if function:
         environment.update(_private_call_environment(
-            function, tree, parents, FiniteEvaluator(module_assignments, functions), name_uses,
+            function, tree, parents, evaluator, name_uses,
         ))
     closed_wrapper_sql = _closed_private_wrapper(
         function, tree, parents, evaluator, name_uses,

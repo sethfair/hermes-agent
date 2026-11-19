@@ -304,7 +304,8 @@ def test_private_helper_parameters_require_all_call_sites_to_be_finite(tmp_path)
         "app/writers.py": '''
 from hermes_cli import kanban_db
 def _delete(conn, table):
-    conn.execute(f"DELETE FROM {table}")
+    statement = f"DELETE FROM {table}"
+    conn.execute(statement)
 def write(conn):
     _delete(conn, "task_links")
     _delete(conn, "task_events")
@@ -397,6 +398,44 @@ def configure(conn, dynamic_timeout):
     assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
 
 
+def test_finite_integer_conversion_resolves_without_blessing_dynamic_values(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/kanban_configure.py": '''
+from hermes_cli import kanban_db
+LEVEL = "2"
+def configure(conn, dynamic_level):
+    conn.execute(f"PRAGMA synchronous={int(LEVEL)}")
+    conn.execute(f"PRAGMA synchronous={int(dynamic_level)}")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"] == []
+    assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
+
+
+def test_finite_string_replacement_resolves_without_blessing_dynamic_values(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/kanban_configure.py": '''
+from hermes_cli import kanban_db
+INDEX = 'idx"safe'
+def configure(conn, dynamic_name):
+    escaped = INDEX.replace('"', '""')
+    conn.execute(f'REINDEX "{escaped}"')
+    escaped_dynamic = dynamic_name.replace('"', '""')
+    conn.execute(f'REINDEX "{escaped_dynamic}"')
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"] == []
+    assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
+
+
 def test_correlated_dict_item_loops_resolve_only_literal_rows(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": '''
@@ -418,6 +457,43 @@ def write(conn, dynamic_mapping):
     kinds = [problem["kind"] for problem in report["problems"]]
     assert kinds.count("unresolved-sql") == 1
     assert kinds.count("unallowlisted-writer") == 2
+
+
+def test_finite_dict_subscripts_resolve_from_correlated_loop_keys(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/readers.py": '''
+from hermes_cli import kanban_db
+TIME_COLUMNS = {"task_events": "created_at", "task_runs": "ended_at"}
+def read(conn):
+    for table in ("task_events", "task_runs"):
+        column = TIME_COLUMNS[table]
+        conn.execute(f"SELECT {column} FROM {table}")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 0
+    assert report["inventory"] == []
+    assert report["problems"] == []
+
+
+def test_finite_collection_constructors_resolve_scalar_loops(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/readers.py": '''
+from hermes_cli import kanban_db
+TABLES = frozenset(("task_events", "task_runs"))
+def read(conn):
+    for table in TABLES:
+        conn.execute(f"SELECT COUNT(*) FROM {table}")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 0
+    assert report["inventory"] == []
+    assert report["problems"] == []
 
 
 def test_correlated_tuple_loop_targets_resolve_without_cross_products(tmp_path):

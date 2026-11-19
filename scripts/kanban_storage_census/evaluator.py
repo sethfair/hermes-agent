@@ -39,6 +39,8 @@ class FiniteEvaluator:
             return self._union(self.evaluate(item, env, stack) for item in node.elts)
         if isinstance(node, ast.Subscript) and isinstance(node.value, (ast.List, ast.Tuple)):
             return self._subscript(node, env, stack)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, (ast.Dict, ast.Name)):
+            return self._dict_subscript(node, env, stack)
         if isinstance(node, ast.IfExp):
             return self._union((self.evaluate(node.body, env, stack),
                                 self.evaluate(node.orelse, env, stack)))
@@ -84,6 +86,36 @@ class FiniteEvaluator:
             return Values(reason="variant-overflow")
         return self._union(self.evaluate(item, env, stack) for item in node.value.elts)
 
+    def _dict_subscript(self, node: ast.Subscript, env: dict[str, Values],
+                        stack: tuple[str, ...]) -> Values:
+        if isinstance(node.value, ast.Dict):
+            dictionaries = [node.value]
+        else:
+            assert isinstance(node.value, ast.Name)
+            dictionaries = [
+                choice for choice in self.assignments.get(node.value.id, [])
+                if isinstance(choice, ast.Dict)
+            ]
+        if not dictionaries:
+            return Values(reason="subscript source is not a finite dictionary")
+        wanted = self.evaluate(node.slice, env, stack)
+        if not wanted.resolved:
+            return wanted
+        output: list[Values] = []
+        for dictionary in dictionaries:
+            if any(key is None for key in dictionary.keys):
+                return Values(reason="dictionary unpack is not finite")
+            for key, value in zip(dictionary.keys, dictionary.values, strict=True):
+                assert key is not None
+                resolved_key = self.evaluate(key, env, stack)
+                if not resolved_key.resolved:
+                    return resolved_key
+                if resolved_key.strings & wanted.strings:
+                    output.append(self.evaluate(value, env, stack))
+        if not output:
+            return Values(reason="subscript key is outside finite dictionary")
+        return self._union(output)
+
     def _binop(self, node: ast.BinOp, env: dict[str, Values], stack: tuple[str, ...]) -> Values:
         left, right = self.evaluate(node.left, env, stack), self.evaluate(node.right, env, stack)
         if not left.resolved or not right.resolved:
@@ -113,13 +145,53 @@ class FiniteEvaluator:
         return result
 
     def _call(self, node: ast.Call, env: dict[str, Values], stack: tuple[str, ...]) -> Values:
+        if isinstance(node.func, ast.Name) and node.func.id in {"frozenset", "list", "set", "tuple"}:
+            if len(node.args) != 1 or node.keywords:
+                return Values(reason=f"unsupported {node.func.id} construction")
+            return self.evaluate(node.args[0], env, stack)
+        if isinstance(node.func, ast.Name) and node.func.id == "int":
+            return self._int_call(node, env, stack)
         if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
             return self._format_call(node, env, stack)
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "replace":
+            return self._replace_call(node, env, stack)
         if isinstance(node.func, ast.Attribute) and node.func.attr == "join" and node.args:
             return self._join_call(node, env, stack)
         if isinstance(node.func, ast.Name) and node.func.id in self.functions:
             return self._helper_call(node, env, stack)
         return Values(reason=f"unsupported call {ast.unparse(node.func)}")
+
+    def _int_call(self, node: ast.Call, env: dict[str, Values],
+                  stack: tuple[str, ...]) -> Values:
+        if len(node.args) != 1 or node.keywords:
+            return Values(reason="unsupported int conversion")
+        value = self.evaluate(node.args[0], env, stack)
+        if not value.resolved:
+            return value
+        try:
+            return self._bounded({str(int(item)) for item in value.strings})
+        except ValueError as exc:
+            return Values(reason=f"int conversion failed: {exc}")
+
+    def _replace_call(self, node: ast.Call, env: dict[str, Values],
+                      stack: tuple[str, ...]) -> Values:
+        assert isinstance(node.func, ast.Attribute)
+        if len(node.args) != 2 or node.keywords:
+            return Values(reason="unsupported replace operation")
+        values = [
+            self.evaluate(node.func.value, env, stack),
+            *(self.evaluate(argument, env, stack) for argument in node.args),
+        ]
+        unresolved = next((value for value in values if not value.resolved), None)
+        if unresolved is not None:
+            return unresolved
+        receiver, old, new = values
+        return self._bounded({
+            item.replace(before, after)
+            for item in receiver.strings
+            for before in old.strings
+            for after in new.strings
+        })
 
     def _format_call(self, node: ast.Call, env: dict[str, Values],
                      stack: tuple[str, ...]) -> Values:
