@@ -94,7 +94,24 @@ class _PromoteRequest:
     authority_kind: str = "block"
 
 
-_Request = _BlockRequest | _ClassifyBlockRequest | _UnblockRequest | _PromoteRequest
+@dataclass(frozen=True)
+class _ScheduleRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    reason: Optional[str]
+    expected_run_id: Optional[int]
+    operation_kind: str = "schedule"
+    authority_kind: str = "block"
+
+
+_Request = (
+    _BlockRequest
+    | _ClassifyBlockRequest
+    | _UnblockRequest
+    | _PromoteRequest
+    | _ScheduleRequest
+)
 
 
 @dataclass(frozen=True)
@@ -171,11 +188,22 @@ def _promote_request_hash(request: _PromoteRequest) -> str:
     })
 
 
+def _schedule_request_hash(request: _ScheduleRequest) -> str:
+    return _canonical_hash({
+        "task_id": request.task_id,
+        "operation_kind": request.operation_kind,
+        "actor_scope": request.actor_scope,
+        "reason": request.reason,
+        "expected_run_id": request.expected_run_id,
+    })
+
+
 _REQUEST_HASHERS = {
     _BlockRequest: _block_request_hash,
     _ClassifyBlockRequest: _classify_request_hash,
     _UnblockRequest: _unblock_request_hash,
     _PromoteRequest: _promote_request_hash,
+    _ScheduleRequest: _schedule_request_hash,
 }
 
 
@@ -649,11 +677,65 @@ def _apply_promote(
     ))
 
 
+def _apply_schedule(
+    private: sqlite3.Connection,
+    request: _ScheduleRequest,
+) -> _AppliedTransition:
+    from hermes_cli import kanban_db as kb
+
+    row = private.execute(
+        "SELECT status, block_identity_state FROM tasks WHERE id = ?",
+        (request.task_id,),
+    ).fetchone()
+    if row is None:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="task_not_found"
+        ))
+    if row["block_identity_state"] == "unknown":
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="block_identity_unknown"
+        ))
+    params: list[Any] = [request.task_id]
+    sql = (
+        "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL WHERE id = ? "
+        "AND status IN ('todo', 'ready', 'running', 'blocked')"
+    )
+    if request.expected_run_id is not None:
+        sql += " AND current_run_id = ?"
+        params.append(int(request.expected_run_id))
+    updated = private.execute(sql, params)
+    if updated.rowcount != 1:
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="compare_and_set"
+        ))
+    run_id = kb._end_or_synthesize_run(
+        private,
+        request.task_id,
+        outcome="scheduled",
+        status="scheduled",
+        summary=request.reason,
+        synthesize=bool(request.reason),
+    )
+    kb._append_event(
+        private,
+        request.task_id,
+        "scheduled",
+        {"reason": request.reason},
+        run_id=run_id,
+    )
+    event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return _AppliedTransition(TransitionOutcome(
+        True, request.operation_id, event_id, row["block_identity_state"]
+    ), run_id)
+
+
 _OPERATION_HANDLERS = {
     _BlockRequest: _apply_block,
     _ClassifyBlockRequest: _apply_classify_block,
     _UnblockRequest: _apply_unblock,
     _PromoteRequest: _apply_promote,
+    _ScheduleRequest: _apply_schedule,
 }
 
 
@@ -802,6 +884,40 @@ def promote_task(
         dry_run=dry_run,
     )
     return outcome.committed, outcome.refusal
+
+
+def schedule_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> TransitionOutcome:
+    """Park one eligible task through the replay-safe receipt kernel."""
+    request = _ScheduleRequest(
+        task_id, actor_scope, operation_id, reason, expected_run_id
+    )
+    return _run_operation(conn, request).outcome
+
+
+def schedule_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Compatibility adapter preserving the literal-bool schedule result."""
+    return schedule_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("schedule", task_id),
+        reason=reason,
+        expected_run_id=expected_run_id,
+    ).committed
 
 
 def classify_block_transition(
