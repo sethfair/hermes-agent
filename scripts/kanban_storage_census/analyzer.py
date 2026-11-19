@@ -74,6 +74,64 @@ def _imported_module_aliases(tree: ast.Module, root: Path) -> set[str]:
     return aliases
 
 
+def _imported_constant_assignments(tree: ast.Module, root: Path,
+                                   parents: dict[ast.AST, ast.AST]) -> dict[str, dict[str, list[ast.AST]]]:
+    """Materialize finite imported constants without importing or executing modules."""
+    result: dict[str, dict[str, list[ast.AST]]] = defaultdict(dict)
+    sql_names = {
+        name.id
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        and call.func.attr in _SINK_NAMES and call.args
+        for name in ast.walk(call.args[0]) if isinstance(name, ast.Name)
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        selected = [
+            alias for alias in node.names
+            if alias.name.isupper() and (alias.asname or alias.name) in sql_names
+        ]
+        if not selected:
+            continue
+        candidate = root.joinpath(*node.module.split("."))
+        path = candidate.with_suffix(".py")
+        if not path.is_file():
+            path = candidate / "__init__.py"
+        if not path.is_file():
+            continue
+        try:
+            imported_tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=path.as_posix())
+        except (OSError, SyntaxError):
+            continue
+        imported_parents = {
+            child: parent for parent in ast.walk(imported_tree) for child in ast.iter_child_nodes(parent)
+        }
+        assignments = _assignments(imported_tree, imported_parents)
+        evaluator = FiniteEvaluator(assignments, _functions(imported_tree))
+        for alias in selected:
+            choices = assignments.get(alias.name, [])
+            if not choices or any(isinstance(item, ast.Call) for choice in choices for item in ast.walk(choice)):
+                continue
+            strings: set[str] = set()
+            for choice in choices:
+                try:
+                    value = evaluator.evaluate(choice)
+                except RecursionError:
+                    break
+                if not value.resolved:
+                    break
+                strings.update(value.strings)
+                if len(strings) > MAX_VARIANTS:
+                    break
+            else:
+                if len(strings) <= MAX_VARIANTS:
+                    result[_function_name(node, parents)][alias.asname or alias.name] = [
+                        ast.Constant(value=string) for string in strings
+                    ]
+    return dict(result)
+
+
 def _wrapper_summary(function: ast.FunctionDef) -> tuple[int, ast.AST] | None:
     parameters = [arg.arg for arg in function.args.args]
     for call in (node for node in ast.walk(function) if isinstance(node, ast.Call)):
@@ -363,12 +421,16 @@ def _sink_argument(call: ast.Call, aliases: dict[str, tuple[bool, bool]],
 def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
                 parents: dict[ast.AST, ast.AST], functions: dict[str, ast.FunctionDef],
                 module_assignments: dict[str, list[ast.AST]], relative: str,
-                kanban_relevant: bool, module_aliases: set[str]) -> tuple[list[InventoryItem], list[Problem]]:
+                kanban_relevant: bool, module_aliases: set[str],
+                imported_assignments: dict[str, dict[str, list[ast.AST]]]) -> tuple[list[InventoryItem], list[Problem]]:
     function = scope if isinstance(scope, ast.FunctionDef) else None
+    owner = _function_name(scope, parents) if function else "<module>"
     assignments = {name: list(values) for name, values in module_assignments.items()}
     if function:
         for name, values in _assignments(function, parents).items():
             assignments.setdefault(name, []).extend(values)
+        for name, values in imported_assignments.get(owner, {}).items():
+            assignments.setdefault(name, values)
     evaluator = FiniteEvaluator(assignments, functions)
     parameters = {arg.arg for arg in function.args.args} if function else set()
     environment = _closed_enum_environment(function, tree) if function else {}
@@ -383,7 +445,6 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
                 and node.value.attr in _SINK_NAMES:
             uncertain = isinstance(node.value.value, ast.Name) and node.value.value.id not in parameters
             aliases.update((target.id, (True, uncertain)) for target in node.targets if isinstance(target, ast.Name))
-    owner = _function_name(scope, parents) if function else "<module>"
     calls = [node for node in ast.walk(scope) if isinstance(node, ast.Call)
              and _function_name(node, parents) == owner]
     inventory: list[InventoryItem] = []
@@ -440,11 +501,14 @@ def _scan_file(root: Path, path: Path) -> tuple[list[InventoryItem], list[Proble
     ))
 
     module_assignments = _assignments(tree, parents)
+    imported_assignments = _imported_constant_assignments(tree, root, parents)
+    for name, values in imported_assignments.get("<module>", {}).items():
+        module_assignments.setdefault(name, values)
     module_aliases = _imported_module_aliases(tree, root)
     for scope in [tree, *functions.values()]:
         found, refused = _scan_scope(
             scope, tree, parents, functions, module_assignments, relative, kanban_relevant,
-            module_aliases,
+            module_aliases, imported_assignments,
         )
         inventory.extend(found)
         problems.extend(refused)
