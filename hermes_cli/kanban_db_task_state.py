@@ -22,6 +22,7 @@ from hermes_cli.kanban_dispatch_recovery import storage as _recovery
 from hermes_cli.kanban_dispatch_recovery import dead_worker as _dead_recovery
 from hermes_cli.kanban_state_operations import authenticated_action as _authenticated
 from hermes_cli.kanban_state_operations import direct_status as _direct_status
+from hermes_cli.kanban_state_operations import edit_fields as _edit_fields
 
 _TUPLE_VERSION = 1
 _OPERATION_VERSION = 1
@@ -391,6 +392,7 @@ _Request = (
     | _RequestChangesRequest
     | _ReopenReviewRequest
     | _direct_status.DirectStatusRequest
+    | _edit_fields.EditFieldsRequest
     | _authenticated.AuthenticatedActionRequest
     | _recovery.RuntimeTimeoutRequest
     | _recovery.DispatchFailureRequest
@@ -588,6 +590,7 @@ _REQUEST_HASHERS = {
     _RequestChangesRequest: _lifecycle_request_hash,
     _ReopenReviewRequest: _lifecycle_request_hash,
     _direct_status.DirectStatusRequest: _direct_status.request_hash,
+    _edit_fields.EditFieldsRequest: _create_request_hash,
     _authenticated.AuthenticatedActionRequest: _authenticated.request_hash,
     _recovery.RuntimeTimeoutRequest: _create_request_hash,
     _recovery.DispatchFailureRequest: _create_request_hash,
@@ -1523,6 +1526,7 @@ _OPERATION_HANDLERS = {
     _RequestChangesRequest: _apply_request_changes,
     _ReopenReviewRequest: _apply_reopen_review,
     _direct_status.DirectStatusRequest: _direct_status.apply,
+    _edit_fields.EditFieldsRequest: _edit_fields.apply,
     _authenticated.AuthenticatedActionRequest: _authenticated.apply,
     _recovery.RuntimeTimeoutRequest: _recovery._apply_runtime_timeout,
     _recovery.DispatchFailureRequest: _recovery._apply_dispatch_failure,
@@ -1659,6 +1663,10 @@ _state_operations.bind(__import__(__name__, fromlist=["*"]))
 _direct_status.bind(__import__(__name__, fromlist=["*"]))
 direct_status_transition = _direct_status.transition
 direct_status = _direct_status.compatibility
+
+_edit_fields.bind(__import__(__name__, fromlist=["*"]))
+edit_task_fields_transition = _edit_fields.transition
+edit_task_fields = _edit_fields.compatibility
 
 
 def unblock_task_transition(

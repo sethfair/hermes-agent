@@ -113,6 +113,33 @@ def test_create_task_appears_on_board(client):
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
 
+
+def test_patch_title_and_body_uses_one_receipted_storage_operation(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "before", "body": "old"}
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"title": "  after  ", "body": "new"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["title"] == "after"
+    assert response.json()["task"]["body"] == "new"
+    with kbc.connect_closing() as conn:
+        receipts = conn.execute(
+            "SELECT operation_kind,task_id FROM task_transition_receipts "
+            "WHERE task_id=? AND operation_kind='edit_fields' ORDER BY committed_at",
+            (task["id"],),
+        ).fetchall()
+        assert [(row["operation_kind"], row["task_id"]) for row in receipts] == [
+            ("edit_fields", task["id"])
+        ]
+        events = [event for event in kb.list_events(conn, task["id"]) if event.kind == "edited"]
+        assert len(events) == 1
+        assert events[0].payload == {"fields": ["title", "body"]}
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
