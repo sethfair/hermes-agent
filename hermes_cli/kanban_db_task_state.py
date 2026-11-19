@@ -8,7 +8,7 @@ import json
 import secrets
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,6 +43,18 @@ class TransitionOutcome:
     event_id: Optional[int] = None
     identity_state: str = "unknown"
     refusal: Optional[str] = None
+    tuple_version: Optional[int] = None
+    result_tuple_hash: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ClaimTransitionOutcome:
+    committed: bool
+    operation_id: str
+    task: Any = field(default=None, compare=False, repr=False)
+    run_id: Optional[int] = None
+    event_id: Optional[int] = None
+    reason: Optional[str] = None
     tuple_version: Optional[int] = None
     result_tuple_hash: Optional[str] = None
 
@@ -125,6 +137,22 @@ class _DeleteRequest:
     authority_kind: str = "delete"
 
 
+@dataclass(frozen=True)
+class _ClaimRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    source_status: str
+    lock: str
+    expires: int
+    now: int
+    monitor_attempt_id: Optional[str]
+    admission_id: Optional[str]
+    expect_assignee: Optional[str]
+    operation_kind: str
+    authority_kind: str = "claim"
+
+
 _Request = (
     _BlockRequest
     | _ClassifyBlockRequest
@@ -133,6 +161,7 @@ _Request = (
     | _ScheduleRequest
     | _ArchiveRequest
     | _DeleteRequest
+    | _ClaimRequest
 )
 
 
@@ -247,6 +276,21 @@ def _delete_request_hash(request: _DeleteRequest) -> str:
     })
 
 
+def _claim_request_hash(request: _ClaimRequest) -> str:
+    return _canonical_hash({
+        "task_id": request.task_id,
+        "operation_kind": request.operation_kind,
+        "actor_scope": request.actor_scope,
+        "source_status": request.source_status,
+        "lock": request.lock,
+        "expires": request.expires,
+        "now": request.now,
+        "monitor_attempt_id": request.monitor_attempt_id,
+        "admission_id": request.admission_id,
+        "expect_assignee": request.expect_assignee,
+    })
+
+
 _REQUEST_HASHERS = {
     _BlockRequest: _block_request_hash,
     _ClassifyBlockRequest: _classify_request_hash,
@@ -255,6 +299,7 @@ _REQUEST_HASHERS = {
     _ScheduleRequest: _schedule_request_hash,
     _ArchiveRequest: _archive_request_hash,
     _DeleteRequest: _delete_request_hash,
+    _ClaimRequest: _claim_request_hash,
 }
 
 
@@ -898,6 +943,248 @@ def _apply_delete(
         TransitionOutcome(True, request.operation_id, identity_state="none"),
         attachment_paths=attachment_paths,
     )
+
+
+class _ClaimRollback(RuntimeError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _claim_and_open_run(
+    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str,
+    expires: int, now: int, *, event_extra: Optional[dict] = None,
+    admission_id: Optional[str] = None, admission_validated: bool = False,
+    expect_assignee: Optional[str] = None,
+) -> Optional[int]:
+    """CAS one queued task to Running and create its run and claimed event."""
+    from hermes_cli import kanban_db as kb
+
+    if admission_id is not None and source_status == "ready" and not admission_validated:
+        from hermes_cli import kanban_ready_monitor as monitor
+        task = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()
+        previous_run = conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        generation = monitor.ready_generation(conn, task_id)
+        if not task or not generation or not monitor.validate_claim_admission(
+            conn, admission_id, task_id, task["assignee"] or "", generation[0],
+            int(previous_run),
+        ):
+            return None
+    updated = conn.execute(
+        "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+        "started_at=COALESCE(started_at,?), dispatch_admission_id=? "
+        "WHERE id=? AND status=? AND claim_lock IS NULL "
+        "AND (? IS NULL OR assignee=?)",
+        (
+            lock, expires, now, admission_id, task_id, source_status,
+            expect_assignee, expect_assignee,
+        ),
+    )
+    if updated.rowcount != 1:
+        return None
+    task = conn.execute(
+        "SELECT assignee,max_runtime_seconds,current_step_key FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    run = conn.execute(
+        "INSERT INTO task_runs (task_id,profile,step_key,status,claim_lock,claim_expires,"
+        "max_runtime_seconds,started_at) VALUES (?,?,?,'running',?,?,?,?)",
+        (task_id, task["assignee"] if task else None,
+         task["current_step_key"] if task else None, lock, expires,
+         task["max_runtime_seconds"] if task else None, now),
+    )
+    if run.lastrowid is None:
+        raise RuntimeError("claim run insert did not return a row id")
+    run_id = int(run.lastrowid)
+    conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+    kb._append_event(
+        conn, task_id, "claimed",
+        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})},
+        run_id=run_id,
+    )
+    if source_status == "ready":
+        from hermes_cli import kanban_ready_monitor as monitor
+        monitor.close_for_native_ready_claim(conn, task_id, run_id, now=now)
+    return run_id
+
+
+def _claim_parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+        "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
+        (task_id,),
+    ).fetchone() is None
+
+
+def _claim_control_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_control import read_control
+    if kb._has_unknown_block_identity(conn, task_id):
+        return "block_identity_unknown"
+    control = read_control(conn)
+    if control.state == "paused":
+        return "kanban_paused"
+    if control.state != "running":
+        return "kanban_control_unknown"
+    return None
+
+
+def claim_task_transition(
+    conn: sqlite3.Connection, task_id: str, *, actor_scope: str,
+    operation_id: str, source_status: str, lock: str, expires: int, now: int,
+    monitor_attempt_id: Optional[str] = None, admission_id: Optional[str] = None,
+    expect_assignee: Optional[str] = None,
+) -> ClaimTransitionOutcome:
+    """Claim one Ready or Review task through a closed receipt boundary."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    if source_status not in {"ready", "review"}:
+        raise ValueError("source_status must be 'ready' or 'review'")
+    if monitor_attempt_id is not None and admission_id is not None:
+        raise ValueError("monitor_attempt_id and admission_id are mutually exclusive")
+    _validate_ingress(conn, actor_scope=actor_scope, operation_id=operation_id)
+    request = _ClaimRequest(
+        task_id, actor_scope, operation_id, source_status, lock, int(expires),
+        int(now), monitor_attempt_id, admission_id, expect_assignee,
+        f"claim_{source_status}",
+    )
+    db_path = kbc._main_db_file(conn)
+    if not db_path:
+        raise ValueError("protected claim requires a file-backed Kanban database")
+    request_hash = _request_hash(request)
+    applied = False
+    with kbc._protected_connection(db_path, operation="claim") as private:
+        try:
+            kbc._execute_boundary_with_retry(private, "BEGIN IMMEDIATE")
+            receipt = _load_receipt(private, operation_id)
+            if receipt is not None:
+                replay = _receipt_outcome(receipt, request, request_hash)
+                if not replay.committed:
+                    outcome = ClaimTransitionOutcome(
+                        False, operation_id, reason=replay.refusal
+                    )
+                else:
+                    event = private.execute(
+                        "SELECT run_id FROM task_events WHERE id=?", (replay.event_id,)
+                    ).fetchone()
+                    replay_run = int(event[0]) if event and event[0] is not None else None
+                    outcome = ClaimTransitionOutcome(
+                        True, operation_id, kb.get_task(private, task_id), replay_run,
+                        replay.event_id, tuple_version=replay.tuple_version,
+                        result_tuple_hash=replay.result_tuple_hash,
+                    )
+                kbc._execute_boundary_with_retry(private, "COMMIT")
+            else:
+                refusal = _claim_control_refusal(private, task_id)
+                if refusal is not None:
+                    kbc._execute_boundary_with_retry(private, "COMMIT")
+                    return ClaimTransitionOutcome(False, operation_id, reason=refusal)
+                if not _claim_parents_satisfied(private, task_id):
+                    if source_status == "ready":
+                        private.execute(
+                            "UPDATE tasks SET status='todo' WHERE id=? AND status='ready'",
+                            (task_id,),
+                        )
+                        kb._append_event(
+                            private, task_id, "claim_rejected",
+                            {"reason": "parents_not_done"},
+                        )
+                    else:
+                        demoted = private.execute(
+                            "UPDATE tasks SET status='todo' WHERE id=? AND status='review' "
+                            "AND claim_lock IS NULL", (task_id,),
+                        )
+                        if demoted.rowcount == 1:
+                            kb._append_event(
+                                private, task_id, "dependency_wait",
+                                {"reason": "parent_reopened", "source_status": "review"},
+                            )
+                    kbc._execute_boundary_with_retry(private, "COMMIT")
+                    return ClaimTransitionOutcome(
+                        False, operation_id, reason="parents_not_done"
+                    )
+                if source_status == "ready":
+                    kb._reclaim_dangling_run(
+                        private, task_id, statuses=("ready",), now=now,
+                        note="invariant recovery on re-claim",
+                    )
+                effective_admission = admission_id
+                validated = False
+                if monitor_attempt_id is not None:
+                    from hermes_cli import kanban_ready_monitor as monitor
+                    task = private.execute(
+                        "SELECT assignee FROM tasks WHERE id=?", (task_id,)
+                    ).fetchone()
+                    generation = monitor.ready_generation(private, task_id)
+                    previous_run = private.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM task_runs WHERE task_id=?",
+                        (task_id,),
+                    ).fetchone()[0]
+                    if task is None or generation is None:
+                        kbc._execute_boundary_with_retry(private, "COMMIT")
+                        return ClaimTransitionOutcome(
+                            False, operation_id, reason="claim_lost"
+                        )
+                    try:
+                        effective_admission = monitor.arm_claim_admission(
+                            private, attempt_id=monitor_attempt_id, task_id=task_id,
+                            ready_generation=generation[0],
+                            run_generation=int(previous_run),
+                        )
+                    except ValueError:
+                        kbc._execute_boundary_with_retry(private, "COMMIT")
+                        return ClaimTransitionOutcome(
+                            False, operation_id, reason="admission_refused"
+                        )
+                    if not monitor.validate_claim_admission(
+                        private, effective_admission, task_id,
+                        task["assignee"] or "", generation[0], int(previous_run),
+                    ):
+                        raise _ClaimRollback("admission_refused")
+                    validated = True
+                run_id = kb._claim_and_open_run(
+                    private, task_id, source_status, lock, expires, now,
+                    event_extra={"source_status": "review"}
+                    if source_status == "review" else None,
+                    admission_id=effective_admission,
+                    admission_validated=validated,
+                    expect_assignee=expect_assignee,
+                )
+                if run_id is None:
+                    if effective_admission is not None:
+                        raise _ClaimRollback("claim_lost")
+                    kbc._execute_boundary_with_retry(private, "COMMIT")
+                    return ClaimTransitionOutcome(
+                        False, operation_id, reason="claim_lost"
+                    )
+                event_id = private.execute(
+                    "SELECT id FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='claimed' ORDER BY id DESC LIMIT 1", (task_id, run_id),
+                ).fetchone()[0]
+                receipt_outcome = _insert_receipt(
+                    private, request, request_hash,
+                    TransitionOutcome(True, operation_id, event_id, "none"),
+                )
+                task = kb.get_task(private, task_id)
+                kbc._execute_boundary_with_retry(private, "COMMIT")
+                applied = True
+                outcome = ClaimTransitionOutcome(
+                    True, operation_id, task, run_id, event_id,
+                    tuple_version=receipt_outcome.tuple_version,
+                    result_tuple_hash=receipt_outcome.result_tuple_hash,
+                )
+        except _ClaimRollback as exc:
+            _rollback(private)
+            return ClaimTransitionOutcome(False, operation_id, reason=exc.reason)
+        except BaseException:
+            _rollback(private)
+            raise
+    if applied and source_status == "ready":
+        kb._fire_task_hook("kanban_task_claimed", outcome.task, task_id, outcome.run_id)
+    return outcome
 
 
 _OPERATION_HANDLERS = {

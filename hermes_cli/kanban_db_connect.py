@@ -332,17 +332,27 @@ def _protected_connection(path: str | Path, *, operation: str):
             "kanban_notify_subs", "task_attachments", "task_transition_receipts",
             "kanban_claim_admissions", "kanban_writer_faults",
         },
+        "claim": {
+            "tasks", "task_runs", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+            "kanban_ready_state", "kanban_ready_episodes",
+        },
     }.get(operation, set())
     schema_actions = {
         sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_ALTER_TABLE,
         sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TABLE,
         sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_CREATE_VIEW,
         sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE,
-        sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_VIEW, sqlite3.SQLITE_PRAGMA,
+        sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_VIEW,
     }
 
     def _authorize(action, table, _column, _db_name, _trigger):
-        if action in schema_actions:
+        safe_control_schema_read = (
+            action == sqlite3.SQLITE_PRAGMA
+            and table == "table_info"
+            and _column in {"kanban_dispatch_control", "kanban_dispatch_control_events"}
+        )
+        if action in schema_actions or (action == sqlite3.SQLITE_PRAGMA and not safe_control_schema_read):
             return sqlite3.SQLITE_DENY
         if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
             return sqlite3.SQLITE_OK if table in writable_tables else sqlite3.SQLITE_DENY
