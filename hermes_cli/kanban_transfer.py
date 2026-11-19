@@ -273,7 +273,12 @@ def _refuse_authenticated_board_rebinding(db_path: Path, target: str) -> None:
         )
 
 
-def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[str, int], list[str]]:
+def _relocate_imported_rows(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    attachments_source: Optional[Path] = None,
+) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine; returns ``(stats, warnings)``.
 
     * Attachment rows are repointed at this board's tree; rows whose blob
@@ -315,7 +320,12 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
         dropped = rehomed = 0
         for row in conn.execute("SELECT id, task_id, stored_path FROM task_attachments").fetchall():
             landed = attachments_dir / row["task_id"] / Path(row["stored_path"]).name
-            if landed.is_file():
+            source = (
+                attachments_source / row["task_id"] / Path(row["stored_path"]).name
+                if attachments_source is not None
+                else landed
+            )
+            if source.is_file():
                 conn.execute("UPDATE task_attachments SET stored_path = ? WHERE id = ?", (str(landed), row["id"]))
                 rehomed += 1
             else:
@@ -392,53 +402,43 @@ def import_board(
 
         staged_meta = _read_board_metadata(extracted / "board.json")
 
+        # Migrate and normalize the private extracted copy. No board becomes
+        # discoverable until every protected row and the fresh physical board
+        # identity have committed successfully.
+        kbc.init_db(db_path=staged_db)
+        with contextlib.closing(sqlite3.connect(staged_db)) as staged:
+            staged.row_factory = sqlite3.Row
+            stats, warnings = _relocate_imported_rows(
+                staged,
+                target,
+                attachments_source=extracted / "attachments",
+            )
+            counts = _count_rows(staged)
+
+        # Rewritten rather than moved across: the archive's copy names a slug
+        # and a workdir that belong to the exporting machine. Publish the DB
+        # last, after all other files are in place; cleanup keeps failed
+        # imports invisible and retryable.
+        name = str(staged_meta.get("name") or manifest.get("board_name") or target)
         board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
-        for tree in ("attachments", "logs"):
-            src = extracted / tree
-            if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))
-
-    # Rewritten rather than moved across: the archive's copy names a slug
-    # and a workdir that belong to the exporting machine.
-    name = str(staged_meta.get("name") or manifest.get("board_name") or target)
-    kb.write_board_metadata(
-        target,
-        name=name,
-        description=str(staged_meta.get("description") or ""),
-        icon=str(staged_meta.get("icon") or ""),
-        color=str(staged_meta.get("color") or ""),
-        archived=False,
-    )
-    # The archive carries its source board identity. Import is the one
-    # authorized physical relocation/rename boundary, so rebind that marker to
-    # the newly allocated target before normal connection validation runs.
-    imported_db = board_root / "kanban.db"
-    with sqlite3.connect(imported_db) as raw:
-        identity_exists = raw.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'kanban_board_identity'"
-        ).fetchone()
-        if identity_exists is not None:
-            raw.execute("BEGIN IMMEDIATE")
-            raw.execute("DROP TRIGGER IF EXISTS kanban_board_identity_immutable_update")
-            raw.execute(
-                "UPDATE kanban_board_identity SET board = ? WHERE singleton = 1",
-                (target,),
+        board_root.mkdir(parents=True, exist_ok=False)
+        try:
+            for tree in ("attachments", "logs"):
+                src = extracted / tree
+                if src.is_dir():
+                    shutil.move(str(src), str(board_root / tree))
+            kb.write_board_metadata(
+                target,
+                name=name,
+                description=str(staged_meta.get("description") or ""),
+                icon=str(staged_meta.get("icon") or ""),
+                color=str(staged_meta.get("color") or ""),
+                archived=False,
             )
-            raw.execute(
-                "CREATE TRIGGER kanban_board_identity_immutable_update "
-                "BEFORE UPDATE ON kanban_board_identity "
-                "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
-            )
-    # Bring the imported schema up to this install's version before the
-    # relocation pass writes to it.
-    kb.init_db(board=target)
-
-    with kbc.connect_closing(board=target) as conn:
-        stats, warnings = _relocate_imported_rows(conn, target)
-        counts = _count_rows(conn)
+            shutil.move(str(staged_db), str(board_root / "kanban.db"))
+        except Exception:
+            shutil.rmtree(board_root, ignore_errors=True)
+            raise
 
     if activate:
         kb.set_current_board(target)

@@ -373,6 +373,24 @@ def test_authenticated_archive_rejects_board_rebinding_without_partial_import(
         assert kb.read_board_metadata("alpha")["name"] == "Existing Alpha"
 
 
+def test_relocation_failure_never_publishes_a_partial_board(
+    kanban_root, tmp_path, monkeypatch
+):
+    _seed_board()
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+
+    kanban_root("target")
+
+    def fail_relocation(*_args, **_kwargs):
+        raise RuntimeError("forced relocation failure")
+
+    monkeypatch.setattr(kt, "_relocate_imported_rows", fail_relocation)
+    with pytest.raises(RuntimeError, match="forced relocation failure"):
+        kt.import_board(archive)
+
+    assert not kb.board_dir("alpha").exists()
+
+
 @pytest.mark.parametrize("table", kt._AUTHENTICATED_BOARD_TABLES)
 def test_each_authenticated_table_independently_prevents_rebinding(
     kanban_root, tmp_path, table
