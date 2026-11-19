@@ -30,6 +30,9 @@ class FiniteEvaluator:
         env = env or {}
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return Values(frozenset({node.value}))
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            return Values(frozenset({str(node.value)}))
         if isinstance(node, ast.Name):
             return self._name(node, env, stack)
         if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
@@ -40,12 +43,26 @@ class FiniteEvaluator:
             return self._union((self.evaluate(node.body, env, stack),
                                 self.evaluate(node.orelse, env, stack)))
         if isinstance(node, ast.BinOp):
+            numeric = self._numeric_literal(node)
+            if numeric is not None:
+                return Values(frozenset({str(numeric)}))
             return self._binop(node, env, stack)
         if isinstance(node, ast.JoinedStr):
             return self._joined(node, env, stack)
         if isinstance(node, ast.Call):
             return self._call(node, env, stack)
         return Values(reason=f"unsupported {type(node).__name__}")
+
+    @classmethod
+    def _numeric_literal(cls, node: ast.AST) -> int | float | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            left, right = cls._numeric_literal(node.left), cls._numeric_literal(node.right)
+            if left is not None and right is not None:
+                return left * right
+        return None
 
     def _name(self, node: ast.Name, env: dict[str, Values], stack: tuple[str, ...]) -> Values:
         if node.id in env:

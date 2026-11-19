@@ -331,6 +331,24 @@ def write(conn):
     assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
 
 
+def test_finite_numeric_literals_resolve_without_blessing_dynamic_values(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/kanban_configure.py": '''
+from hermes_cli import kanban_db
+LIMIT = 64 * 1024
+def configure(conn, dynamic_timeout):
+    conn.execute(f"PRAGMA busy_timeout={LIMIT}")
+    conn.execute(f"PRAGMA busy_timeout={dynamic_timeout}")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"] == []
+    assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
+
+
 def test_correlated_tuple_loop_targets_resolve_without_cross_products(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": '''
