@@ -450,8 +450,8 @@ def test_respawn_guards_compare_mixed_int_and_iso_times_by_value(conn) -> None:
         conn.execute("UPDATE task_runs SET ended_at = ? WHERE task_id = ?", (iso(60), old_success))
     assert kbd.check_respawn_guard(conn, old_success) == "recent_success"  # a readable recent ISO still holds
 
+    old_pr, guarded = card("old pr"), card("guarded")
     with kb.write_txn(conn):
-        old_pr, guarded = card("old pr"), card("guarded")
         comment(old_pr, iso(90 * 86400))
         comment(guarded, now - 60)
         conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES "

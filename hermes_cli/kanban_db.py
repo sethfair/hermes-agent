@@ -2375,109 +2375,25 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
-
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval. A ``running`` task under a live claim is only completed with
-    proof of ownership (``expected_run_id``) or ``force=True`` (explicit
-    operator override) — otherwise :class:`LiveClaimError`, the same fence
-    :func:`request_review` applies. With no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
-    ``created_cards`` are verified first — a phantom id raises
-    :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
-    Completions from non-review statuses need evidence: a stripped ``result``
-    or ``summary``, or a stripped result already stored on the card. Empty or
-    whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
-    """
-    if _has_unknown_block_identity(conn, task_id):
-        return False
-    now = int(time.time())
-    # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
-    if not _parents_satisfied(conn, task_id):
-        return False
-    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
+    """Compatibility adapter for receipt-backed completion."""
+    from hermes_cli.kanban_db_task_state import (
+        _compatibility_lifecycle_operation_id,
+        complete_task_transition,
     )
-    handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
-    if acceptance is False:
-        return False
-    with write_txn(conn):
-        # Hard invariant even for human review approval: a parent may have
-        # reopened while this task waited.
-        if not _parents_satisfied(conn, task_id):
-            return False
-        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
-        trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = trow["status"] if trow else None
-        # Refuse to close a LIVE worker's run without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True); see
-        # _claim_is_live for what "live" means.
-        if expected_run_id is None and not force and trow and _claim_is_live(trow):
-            raise LiveClaimError(task_id)
-        sql = """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0,
-                       block_identity = NULL,
-                       block_identity_state = 'none'
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
-                """
-        params: tuple = (result, now, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        if isinstance(metadata, dict):
-            _stage_completion_artifacts(conn, task_id, metadata, now)
-        run_id = _end_run(
-            conn, task_id, outcome="completed", status="done", summary=handoff_summary,
-            metadata=metadata,
-        )
-        # Never-claimed task: synthesize a run so the handoff fields survive.
-        if run_id is None and (summary or metadata or result or prior_status == "review"):
-            synth_summary, synth_metadata = handoff_summary, metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = _REVIEW_APPROVED_NOTE
-                synth_metadata = {"source_status": "review", "approval": "manual"}
-            run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
-            )
-        event_summary = handoff_summary
-        if prior_status == "review" and not event_summary:
-            event_summary = _REVIEW_APPROVED_NOTE
-        _append_event(
-            conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
-            run_id=run_id,
-        )
-    _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
-    # Success wipes the breaker counter (history stays on the event log).
-    _clear_failure_counter(conn, task_id)
-    recompute_ready(conn)  # separate txn so children see ``done``
-    _cleanup_workspace(conn, task_id)
-    _done_task = get_task(conn, task_id)
-    if fire_lifecycle_hook:
-        _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
-    return True
+
+    return complete_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("complete", task_id),
+        result=result,
+        summary=summary,
+        metadata=metadata,
+        created_cards=list(created_cards) if created_cards is not None else None,
+        expected_run_id=expected_run_id,
+        fire_lifecycle_hook=fire_lifecycle_hook,
+        force=force,
+    ).committed
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
@@ -2957,114 +2873,24 @@ def request_review(
     :class:`ArtifactPreservationError`, rolling the whole transition back: the
     task stays ``running`` and retryable, with no attachments and no event.
     """
+    from hermes_cli.kanban_db_task_state import (
+        _compatibility_lifecycle_operation_id,
+        request_review_transition,
+    )
 
-    def _ret(ok: bool, reason: Optional[str] = None):
-        return (ok, reason) if with_reason else ok
+    outcome = request_review_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("request-review", task_id),
+        summary=summary,
+        metadata=metadata,
+        reviewer=reviewer,
+        expected_run_id=expected_run_id,
+        force=force,
+    )
+    return (outcome.committed, outcome.refusal) if with_reason else outcome.committed
 
-    if _has_unknown_block_identity(conn, task_id):
-        return _ret(False, "block_identity_unknown")
-
-    summary = redact_review_value(summary)
-    metadata = redact_review_value(metadata)
-    # Declared (metadata["artifacts"]) and prose-referenced files
-    # must be durable BEFORE anything can clean the scratch workspace up: for a
-    # review-bound card the reviewer's completion is the cleanup trigger.
-    metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
-    now = int(time.time())
-    # Staged copies live outside the txn: a rollback after staging must not
-    # leave orphans that make the retry stage ``name_1.ext`` beside them.
-    staged_copies: list[Path] = []
-    try:
-        with write_txn(conn):
-            if not _parents_satisfied(conn, task_id):
-                return _ret(False, "parent dependencies are not satisfied")
-            trow = conn.execute(
-                "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
-            ).fetchone()
-            if trow is None:
-                return _ret(False, "task not found")
-            # Refuse to clear a live worker's claim without proof of ownership
-            # (expected_run_id) or an explicit human override (force=True);
-            # the same fence as complete_task (_claim_is_live).
-            if expected_run_id is None and not force and _claim_is_live(trow):
-                return _ret(
-                    False, "task is running under a live claim; pass expected_run_id "
-                    "(worker ownership) or force=True (explicit operator "
-                    "override) instead of clearing the live run's claim",
-                )
-            if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
-                if reviewer is False:
-                    return _ret(
-                        False, "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
-            reviewer = _canonical_assignee(reviewer)
-            # The actor is the run that did the work. ``assignee`` is the actor
-            # only while a worker holds the card; on a never-claimed card it is
-            # whoever the operator assigned -- possibly the reviewer itself,
-            # which is what ``kanban create --assignee <reviewer>`` followed by
-            # ``request-review`` produces. Recording the reviewer as its own
-            # implementer is worse than recording nothing: request_changes()
-            # routes on this field, and it already refuses a handoff that
-            # carries no implementer provenance.
-            implementer = None
-            if trow["current_run_id"] is not None:
-                arow = conn.execute(
-                    "SELECT profile FROM task_runs WHERE id = ?",
-                    (trow["current_run_id"],),
-                ).fetchone()
-                implementer = arow["profile"] if arow else None
-            if implementer is None and trow["assignee"] != reviewer:
-                implementer = trow["assignee"]
-            assignee_sql = ", assignee = ?" if reviewer is not None else ""
-            run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
-            params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
-                *(() if expected_run_id is None else (int(expected_run_id),)),
-            )
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'review',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL
-                """ + assignee_sql + """
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + run_guard,
-                params,
-            )
-            if cur.rowcount != 1:
-                return _ret(
-                    False, "task is not in running/ready (or expected_run_id did not match the current run)",
-                )
-            if isinstance(metadata, dict):
-                staged_copies = _stage_completion_artifacts(
-                    conn, task_id, metadata, now, uploaded_by="kanban_request_review",
-                )
-            run_id = _end_or_synthesize_run(
-                conn, task_id, outcome="review_requested", status="review",
-                summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
-                profile=implementer,
-            )
-            payload: dict = {
-                "summary": _first_line(summary, 400) or None,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            }
-            staged = _cleaned_artifact_paths(metadata)
-            if staged:
-                payload["artifacts"] = staged
-            _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
-    except Exception:
-        if staged_copies:
-            _discard_staged_copies(staged_copies, staged_copies[0].parent)
-        raise
-    return _ret(True)
 
 
 def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
@@ -3093,70 +2919,21 @@ def request_changes(
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``."""
-    reason = str(redact_review_value(reason or "")).strip()
-    if not reason:
-        return False, "reason is required"
-    if _has_unknown_block_identity(conn, task_id):
-        return False, "block_identity_unknown"
+    from hermes_cli.kanban_db_task_state import (
+        _compatibility_lifecycle_operation_id,
+        request_changes_transition,
+    )
 
-    with write_txn(conn):
-        task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if task_row is None:
-            return False, "task not found"
-        current_run_id = task_row["current_run_id"]
-        if task_row["status"] != "running" or current_run_id is None:
-            return False, "task is not in an active review run"
-        if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
-            return False, "run_id mismatch"
+    outcome = request_changes_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("request-changes", task_id),
+        reason=reason,
+        expected_run_id=expected_run_id,
+    )
+    return outcome.committed, outcome.detail if outcome.committed else outcome.refusal
 
-        claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
-        claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
-        if claimed_payload.get("source_status") != "review":
-            return False, "active run was not claimed from review"
-
-        requested_event = _latest_event(conn, task_id, "review_requested")
-        if requested_event is None:
-            return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
-        if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
-        reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
-
-        new_status = _landing_status_after_parents(conn, task_id)
-        # consecutive_failures deliberately PRESERVED: a review transition is
-        # not evidence the pathology cleared; only complete_task resets it.
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status = ?,
-                   assignee = COALESCE(?, assignee),
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL, worker_started_at = NULL
-             WHERE id = ? AND status = 'running' AND current_run_id = ?
-            """,
-            (new_status, implementer, task_id, int(current_run_id)),
-        )
-        if cur.rowcount != 1:
-            return False, "task changed during review handoff"
-        run_id = _end_run(
-            conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
-        )
-        _append_event(
-            conn,
-            task_id,
-            "changes_requested",
-            {
-                "reason": reason,
-                "implementer": implementer,
-                "reviewer": reviewer,
-                "status": new_status,
-            },
-            run_id=run_id,
-        )
-    return True, implementer
 
 
 def promote_task(
@@ -3213,41 +2990,18 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
     not a block; only :func:`complete_task` clears them)."""
-    if _has_unknown_block_identity(conn, task_id):
-        return False
-    now = int(time.time())
-    with write_txn(conn):
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("review",), now=now,
-            note="invariant recovery on review reopen",
-        )
-        new_status = _landing_status_after_parents(conn, task_id)
-        review_event = _latest_event(conn, task_id, "review_requested")
-        handoff = _json_dict(_row_get(review_event, "payload"))
-        implementer = _nonblank_str(handoff.get("implementer"))
-        identity_reset = new_status == "todo"
-        identity_sql = (", block_kind = NULL, block_recurrences = 0, block_identity = NULL, "
-                        "block_identity_state = 'unknown'" if identity_reset else "")
-        params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            + (", assignee = ?" if implementer else "") + identity_sql
-            + " WHERE id = ? AND status = 'review'", params,
-        )
-        if cur.rowcount != 1:
-            return False
-        if identity_reset:
-            unknown_payload = {"identity_state": "unknown", "identity_version": 1,
-                               "unknown_cause": "review_reopened_parent_wait", "classification_required": True}
-            _append_event(conn, task_id, "block_identity_unknown", unknown_payload)
-        payload: dict[str, Any] = {"status": new_status}
-        if implementer:
-            payload["implementer"] = implementer
-        _append_event(
-            conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
-        )
-        return True
+    from hermes_cli.kanban_db_task_state import (
+        _compatibility_lifecycle_operation_id,
+        reopen_review_task_transition,
+    )
+
+    return reopen_review_task_transition(
+        conn,
+        task_id,
+        actor_scope="legacy",
+        operation_id=_compatibility_lifecycle_operation_id("reopen-review", task_id),
+    ).committed
+
 
 
 def invalidate_descendants_for_parent_reopen(
