@@ -60,6 +60,26 @@ def _functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
     return {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
 
 
+def _local_execute_receivers(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
+                             parents: dict[ast.AST, ast.AST]) -> set[str]:
+    """Return receivers proven to be instances of local classes defining execute."""
+    classes = {
+        node.name for node in tree.body if isinstance(node, ast.ClassDef)
+        and any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "execute"
+                for item in node.body)
+    }
+    if not classes:
+        return set()
+    assignments = _assignments(scope, parents)
+    return {
+        name for name, values in assignments.items()
+        if values and all(
+            isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in classes
+            for value in values
+        )
+    }
+
+
 def _imported_module_aliases(tree: ast.Module, root: Path) -> set[str]:
     """Names proven to refer to modules rather than connection-like objects."""
     aliases: set[str] = set()
@@ -143,7 +163,8 @@ def _wrapper_summary(function: ast.FunctionDef) -> tuple[int, ast.AST] | None:
 
 
 def _closed_private_wrapper(function: ast.FunctionDef, tree: ast.Module,
-                            parents: dict[ast.AST, ast.AST], evaluator: FiniteEvaluator) -> ast.AST | None:
+                            parents: dict[ast.AST, ast.AST], evaluator: FiniteEvaluator,
+                            name_uses: dict[str, list[ast.Name]]) -> ast.AST | None:
     """Return the forwarded SQL node when every use is a finite local call."""
     if not function.name.startswith("_"):
         return None
@@ -158,7 +179,7 @@ def _closed_private_wrapper(function: ast.FunctionDef, tree: ast.Module,
         sql_index = parameters.index(wrapped_sql.id)
     except ValueError:
         return None
-    uses = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == function.name]
+    uses = name_uses.get(function.name, [])
     if not uses:
         return None
     for use in uses:
@@ -181,7 +202,8 @@ def _closed_private_wrapper(function: ast.FunctionDef, tree: ast.Module,
 
 def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
                               parents: dict[ast.AST, ast.AST],
-                              evaluator: FiniteEvaluator) -> dict[str, Values]:
+                              evaluator: FiniteEvaluator,
+                              name_uses: dict[str, list[ast.Name]]) -> dict[str, Values]:
     """Infer private parameters only from complete, finite local call sites."""
     parameters = [arg.arg for arg in function.args.args]
     summary = _wrapper_summary(function)
@@ -193,7 +215,7 @@ def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
     }
     if not relevant:
         return {}
-    uses = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == function.name]
+    uses = name_uses.get(function.name, [])
     if not uses:
         return {}
     collected: dict[str, set[str]] = {parameter: set() for parameter in relevant}
@@ -422,7 +444,8 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
                 parents: dict[ast.AST, ast.AST], functions: dict[str, ast.FunctionDef],
                 module_assignments: dict[str, list[ast.AST]], relative: str,
                 kanban_relevant: bool, module_aliases: set[str],
-                imported_assignments: dict[str, dict[str, list[ast.AST]]]) -> tuple[list[InventoryItem], list[Problem]]:
+                imported_assignments: dict[str, dict[str, list[ast.AST]]],
+                name_uses: dict[str, list[ast.Name]]) -> tuple[list[InventoryItem], list[Problem]]:
     function = scope if isinstance(scope, ast.FunctionDef) else None
     owner = _function_name(scope, parents) if function else "<module>"
     assignments = {name: list(values) for name, values in module_assignments.items()}
@@ -436,9 +459,12 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
     environment = _closed_enum_environment(function, tree) if function else {}
     if function:
         environment.update(_private_call_environment(
-            function, tree, parents, FiniteEvaluator(module_assignments, functions),
+            function, tree, parents, FiniteEvaluator(module_assignments, functions), name_uses,
         ))
-    closed_wrapper_sql = _closed_private_wrapper(function, tree, parents, evaluator) if function else None
+    closed_wrapper_sql = _closed_private_wrapper(
+        function, tree, parents, evaluator, name_uses,
+    ) if function else None
+    local_execute_receivers = _local_execute_receivers(scope, tree, parents)
     aliases: dict[str, tuple[bool, bool]] = {}
     for node in ast.walk(scope):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute) \
@@ -455,6 +481,9 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
             continue
         if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) \
                 and call.func.value.id in module_aliases:
+            continue
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) \
+                and call.func.value.id in local_execute_receivers:
             continue
         sink = _sink_argument(call, aliases, functions, parameters)
         if sink is None:
@@ -505,10 +534,14 @@ def _scan_file(root: Path, path: Path) -> tuple[list[InventoryItem], list[Proble
     for name, values in imported_assignments.get("<module>", {}).items():
         module_assignments.setdefault(name, values)
     module_aliases = _imported_module_aliases(tree, root)
+    name_uses: dict[str, list[ast.Name]] = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            name_uses[node.id].append(node)
     for scope in [tree, *functions.values()]:
         found, refused = _scan_scope(
             scope, tree, parents, functions, module_assignments, relative, kanban_relevant,
-            module_aliases, imported_assignments,
+            module_aliases, imported_assignments, name_uses,
         )
         inventory.extend(found)
         problems.extend(refused)

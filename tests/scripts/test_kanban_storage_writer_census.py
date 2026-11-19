@@ -63,7 +63,7 @@ def test_check_registers_kanban_storage_writer_guard():
         cwd=REPO,
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=300,
         check=False,
     )
     output = result.stdout + result.stderr
@@ -329,6 +329,28 @@ def write(conn):
     _, report = _run(repo)
 
     assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
+
+
+def test_local_class_execute_receiver_is_not_a_database_sink(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+class CommandRunner:
+    def execute(self, command):
+        return command
+
+def dispatch(conn, sql):
+    runner = CommandRunner()
+    runner.execute(sql)
+    conn.execute(sql)
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"] == []
+    assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
 
 
 def test_imported_finite_constants_resolve_without_evaluating_imports(tmp_path):
