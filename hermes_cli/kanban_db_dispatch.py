@@ -890,7 +890,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at, current_run_id FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
@@ -907,40 +907,28 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
-        with _kb.write_txn(conn):
-            if owner_reclaim_blocked(conn, tid):
-                continue
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
-            )
-            if cur.rowcount != 1:
-                continue
-            payload = {
-                "reason": "orphaned_running",
-                "claim_lock": row["claim_lock"],
-                "claim_expires": _kb._to_epoch(row["claim_expires"]),
-                "worker_pid": int(pid) if pid else None,
-                "now": now,
-            }
-            run_id = _kb._end_run(
-                conn, tid,
-                outcome="reclaimed", status="reclaimed",
-                error="orphaned running card (broken claim bookkeeping)",
-                metadata=payload,
-            )
-            _kb._insert_comment(
-                conn, tid, "dispatcher",
-                "reconciliation: card was 'running' with no valid claim "
-                "(dead/gone worker) — requeued to ready",
-                now,
-            )
-            _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
-            reconciled.append(tid)
+        if owner_reclaim_blocked(conn, tid):
+            continue
+        run_id = _kb._row_get(row, "current_run_id")
+        retry_status = _kb._retry_status_for_run(conn, tid, run_id)
+        from hermes_cli import kanban_db_task_state as task_state
+        operation_suffix = str(run_id) if run_id is not None else f"no-run:{now}"
+        result = task_state.orphan_running_transition(
+            conn,
+            tid,
+            actor_scope="dispatcher",
+            operation_id=f"orphan-running:{tid}:{operation_suffix}",
+            expected_run_id=int(run_id) if run_id is not None else None,
+            claim_lock=row["claim_lock"],
+            claim_expires=row["claim_expires"],
+            worker_pid=int(pid) if pid else None,
+            now=now,
+            retry_status=retry_status,
+            error="orphaned running card (broken claim bookkeeping)",
+        )
+        if not result.committed:
+            continue
+        reconciled.append(tid)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,

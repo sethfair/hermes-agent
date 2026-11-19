@@ -61,6 +61,22 @@ class StaleRunningRequest:
     authority_kind: str = "recovery"
 
 
+@dataclass(frozen=True)
+class OrphanRunningRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    expected_run_id: Optional[int]
+    claim_lock: Optional[str]
+    claim_expires: object
+    worker_pid: Optional[int]
+    now: int
+    retry_status: str
+    error: str
+    operation_kind: str = "orphan_running"
+    authority_kind: str = "recovery"
+
+
 def _state():
     from hermes_cli import kanban_db_task_state
 
@@ -143,6 +159,27 @@ def stale_running_transition(
         task_id, actor_scope, operation_id, expected_run_id, claim_lock,
         worker_pid, elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds,
         timeout_seconds, termination, retry_status, error,
+    )
+    return _state()._run_operation(conn, request).outcome
+
+
+def orphan_running_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+    expected_run_id: Optional[int],
+    claim_lock: Optional[str],
+    claim_expires: object,
+    worker_pid: Optional[int],
+    now: int,
+    retry_status: str,
+    error: str,
+):
+    request = OrphanRunningRequest(
+        task_id, actor_scope, operation_id, expected_run_id, claim_lock,
+        claim_expires, worker_pid, now, retry_status, error,
     )
     return _state()._run_operation(conn, request).outcome
 
@@ -330,5 +367,43 @@ def _apply_stale_running(private: sqlite3.Connection, request):
         error=request.error, metadata=payload,
     )
     kb._append_event(private, request.task_id, "stale", payload, run_id=run_id)
+    event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return _applied(_outcome(request, committed=True, event_id=event_id), hook_run_id=run_id)
+
+
+def _apply_orphan_running(private: sqlite3.Connection, request):
+    from hermes_cli import kanban_db as kb
+
+    updated = private.execute(
+        "UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,"
+        "worker_started_at=NULL,last_heartbeat_at=NULL "
+        "WHERE id=? AND status='running' AND current_run_id IS ? "
+        "AND claim_lock IS ? AND claim_expires IS ? AND worker_pid IS ?",
+        (
+            request.retry_status, request.task_id, request.expected_run_id,
+            request.claim_lock, request.claim_expires, request.worker_pid,
+        ),
+    )
+    if updated.rowcount != 1:
+        return _applied(_outcome(request, committed=False, refusal="compare_and_set"))
+    payload = {
+        "reason": "orphaned_running",
+        "claim_lock": request.claim_lock,
+        "claim_expires": kb._to_epoch(request.claim_expires),
+        "worker_pid": request.worker_pid,
+        "now": request.now,
+        "retry_status": request.retry_status,
+    }
+    run_id = kb._end_run(
+        private, request.task_id, outcome="reclaimed", status="reclaimed",
+        error=request.error, metadata=payload,
+    )
+    kb._insert_comment(
+        private, request.task_id, "dispatcher",
+        "reconciliation: card was 'running' with no valid claim "
+        "(dead/gone worker) — requeued to " + request.retry_status,
+        request.now,
+    )
+    kb._append_event(private, request.task_id, "reconciled", payload, run_id=run_id)
     event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
     return _applied(_outcome(request, committed=True, event_id=event_id), hook_run_id=run_id)

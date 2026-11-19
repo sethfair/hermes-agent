@@ -368,7 +368,6 @@ class _ReopenReviewRequest:
     authority_kind: str = "lifecycle"
 
 
-
 _Request = (
     _BlockRequest
     | _ClassifyBlockRequest
@@ -391,6 +390,7 @@ _Request = (
     | _recovery.RuntimeTimeoutRequest
     | _recovery.DispatchFailureRequest
     | _recovery.StaleRunningRequest
+    | _recovery.OrphanRunningRequest
 )
 
 
@@ -582,6 +582,7 @@ _REQUEST_HASHERS = {
     _recovery.RuntimeTimeoutRequest: _create_request_hash,
     _recovery.DispatchFailureRequest: _create_request_hash,
     _recovery.StaleRunningRequest: _create_request_hash,
+    _recovery.OrphanRunningRequest: _create_request_hash,
 }
 
 
@@ -1234,7 +1235,6 @@ def _apply_delete(
 
 
 
-
 class _ClaimRollback(RuntimeError):
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -1486,7 +1486,6 @@ def claim_task_transition(
 
 
 
-
 from hermes_cli.kanban_state_operations import storage as _state_operations
 
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
@@ -1525,6 +1524,7 @@ _OPERATION_HANDLERS = {
     _recovery.RuntimeTimeoutRequest: _recovery._apply_runtime_timeout,
     _recovery.DispatchFailureRequest: _recovery._apply_dispatch_failure,
     _recovery.StaleRunningRequest: _recovery._apply_stale_running,
+    _recovery.OrphanRunningRequest: _recovery._apply_orphan_running,
 }
 
 
@@ -1674,6 +1674,7 @@ reopen_review_task_transition = _lifecycle.reopen_review_task_transition
 runtime_timeout_transition = _recovery.runtime_timeout_transition
 dispatch_failure_transition = _recovery.dispatch_failure_transition
 stale_running_transition = _recovery.stale_running_transition
+orphan_running_transition = _recovery.orphan_running_transition
 
 
 def _compatibility_lifecycle_operation_id(kind: str, task_id: str) -> str:

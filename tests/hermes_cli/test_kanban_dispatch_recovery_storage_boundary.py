@@ -250,3 +250,60 @@ def test_stale_receipt_failure_rolls_back_task_run_and_event(board, monkeypatch)
     assert task is not None and task.status == "running" and task.current_run_id == run_id
     assert run is not None and run.ended_at is None
     assert list(kb.list_events(board, task_id)) == before_events
+
+
+def _orphan(board) -> tuple[str, int]:
+    task_id, run_id = _overrun(board)
+    with kb.write_txn(board):
+        board.execute(
+            "UPDATE tasks SET claim_lock=NULL,worker_pid=NULL,worker_started_at=NULL "
+            "WHERE id=?",
+            (task_id,),
+        )
+    return task_id, run_id
+
+
+def test_orphan_reconciliation_is_receipt_backed(board) -> None:
+    task_id, run_id = _orphan(board)
+
+    assert kbd.reconcile_orphaned_running(board) == [task_id]
+
+    task = kb.get_task(board, task_id)
+    run = kb.latest_run(board, task_id)
+    receipt = board.execute(
+        "SELECT operation_kind FROM task_transition_receipts WHERE operation_id=?",
+        (f"orphan-running:{task_id}:{run_id}",),
+    ).fetchone()
+    comments = board.execute(
+        "SELECT body FROM task_comments WHERE task_id=? ORDER BY id", (task_id,),
+    ).fetchall()
+    assert task is not None and task.status == "ready"
+    assert run is not None and run.outcome == "reclaimed"
+    assert receipt is not None and receipt["operation_kind"] == "orphan_running"
+    assert comments[-1]["body"].startswith("reconciliation:")
+
+
+def test_orphan_receipt_failure_rolls_back_task_run_event_and_comment(board) -> None:
+    task_id, run_id = _orphan(board)
+    before_events = list(kb.list_events(board, task_id))
+    before_comments = board.execute(
+        "SELECT * FROM task_comments WHERE task_id=?", (task_id,),
+    ).fetchall()
+    board.execute(
+        "CREATE TRIGGER refuse_orphan_receipt BEFORE INSERT ON task_transition_receipts "
+        "WHEN NEW.operation_kind='orphan_running' "
+        "BEGIN SELECT RAISE(ABORT, 'forced orphan receipt failure'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced orphan receipt failure"):
+        kbd.reconcile_orphaned_running(board)
+
+    task = kb.get_task(board, task_id)
+    run = kb.latest_run(board, task_id)
+    after_comments = board.execute(
+        "SELECT * FROM task_comments WHERE task_id=?", (task_id,),
+    ).fetchall()
+    assert task is not None and task.status == "running" and task.current_run_id == run_id
+    assert run is not None and run.ended_at is None
+    assert list(kb.list_events(board, task_id)) == before_events
+    assert after_comments == before_comments
