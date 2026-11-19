@@ -299,6 +299,30 @@ def write(conn):
     assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
 
 
+def test_finite_scalar_loop_targets_resolve_without_blessing_dynamic_loops(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+TABLES = ("task_links", "task_events")
+def write(conn, dynamic_tables):
+    for table in TABLES:
+        conn.execute(f"DELETE FROM {table}")
+    for table in dynamic_tables:
+        conn.execute(f"DELETE FROM {table}")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert {tuple(item["effects"]) for item in report["inventory"]} == {
+        ("task_events.delete",), ("task_links.delete",),
+    }
+    kinds = [problem["kind"] for problem in report["problems"]]
+    assert kinds.count("unresolved-sql") == 1
+    assert kinds.count("unallowlisted-writer") == 2
+
+
 def test_variant_overflow_fails_closed(tmp_path):
     choices = ", ".join(repr(f"UPDATE tasks SET status='{index}'") for index in range(70))
     repo = _repo(tmp_path, {

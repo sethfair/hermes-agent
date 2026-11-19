@@ -151,6 +151,22 @@ def _closed_enum_environment(function: ast.FunctionDef, tree: ast.Module) -> dic
     return environment
 
 
+def _loop_environment(node: ast.AST, parents: dict[ast.AST, ast.AST],
+                      evaluator: FiniteEvaluator, base: dict[str, Values]) -> dict[str, Values]:
+    """Bind scalar loop targets only from their proven finite enclosing iterable."""
+    loops: list[ast.For] = []
+    current = parents.get(node)
+    while current is not None and not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(current, ast.For):
+            loops.append(current)
+        current = parents.get(current)
+    environment = dict(base)
+    for loop in reversed(loops):
+        if isinstance(loop.target, ast.Name):
+            environment[loop.target.id] = evaluator.evaluate(loop.iter, environment)
+    return environment
+
+
 def _import_problems(tree: ast.Module, relative: str) -> list[Problem]:
     problems: list[Problem] = []
     if relative != "hermes_cli/kanban_db_task_state.py":
@@ -261,7 +277,7 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
             problems.append(Problem(relative, call.lineno, "unresolved-alias",
                                     "execute alias receiver is not a function parameter"))
             continue
-        values = evaluator.evaluate(sql_node, environment)
+        values = evaluator.evaluate(sql_node, _loop_environment(call, parents, evaluator, environment))
         if not values.resolved:
             if kanban_relevant:
                 kind = "variant-overflow" if values.reason == "variant-overflow" else "unresolved-sql"
