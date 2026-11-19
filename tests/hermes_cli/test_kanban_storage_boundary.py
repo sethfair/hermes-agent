@@ -126,3 +126,119 @@ def test_receipt_failure_rolls_back_task_run_and_events(home):
         assert conn.execute(
             "SELECT * FROM task_transition_receipts WHERE operation_id='storage:block'"
         ).fetchall() == []
+
+
+@pytest.mark.parametrize("cached_statements", [None, 0, 1, 128])
+def test_ordinary_facade_denies_protected_writes_across_statement_caches(
+    home, cached_statements
+):
+    path = kb.kanban_db_path()
+    with kbc.connect_closing() as legacy:
+        task_id = _ready_task(legacy, title=f"cache {cached_statements}")
+
+    kwargs = {} if cached_statements is None else {"cached_statements": cached_statements}
+    with kbc._ordinary_connection(path, **kwargs) as conn:
+        attempts = (
+            lambda: conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,)),
+            lambda: conn.cursor().execute(
+                "UPDATE tasks SET status='done' WHERE id=?", (task_id,)
+            ),
+            lambda: conn.executemany(
+                "UPDATE tasks SET status='done' WHERE id=?", [(task_id,)]
+            ),
+            lambda: conn.cursor().executemany(
+                "UPDATE tasks SET status='done' WHERE id=?", [(task_id,)]
+            ),
+        )
+        for attempt in attempts:
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                attempt()
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "ready"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "BEGIN",
+        "bEgIn ImMeDiAtE",
+        "/* boundary */ BEGIN EXCLUSIVE",
+        "COMMIT",
+        "-- boundary\nROLLBACK",
+        "SAVEPOINT nested",
+        "RELEASE nested",
+        "ROLLBACK TO nested",
+        "ATTACH DATABASE ':memory:' AS escaped",
+        "DETACH DATABASE escaped",
+        "CREATE TABLE escaped(value TEXT)",
+        "PRAGMA writable_schema=ON",
+    ],
+)
+def test_ordinary_facade_denies_transaction_schema_and_attachment_control(home, statement):
+    with kbc._ordinary_connection(kb.kanban_db_path()) as conn:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute(statement)
+
+
+def test_ordinary_facade_and_results_hide_physical_control_surfaces(home):
+    with kbc._ordinary_connection(kb.kanban_db_path()) as conn:
+        result = conn.execute("SELECT 1 AS value")
+        cursor = conn.cursor()
+
+        assert result.fetchone()["value"] == 1
+        assert not hasattr(conn, "connection")
+        assert not hasattr(result, "connection")
+        assert not hasattr(cursor, "connection")
+        for hidden in (
+            "commit",
+            "rollback",
+            "backup",
+            "executescript",
+            "set_authorizer",
+            "enable_load_extension",
+            "load_extension",
+        ):
+            assert not hasattr(conn, hidden)
+            assert not hasattr(result, hidden)
+            assert not hasattr(cursor, hidden)
+
+
+def test_ordinary_facade_returns_safe_iterable_results(home):
+    with kbc.KanbanConnection(kb.kanban_db_path()) as conn:
+        result = conn.execute(
+            "SELECT value FROM (SELECT 2 AS value UNION ALL SELECT 1) ORDER BY value"
+        )
+        assert [row["value"] for row in result] == [1, 2]
+        assert result.description[0][0] == "value"
+
+
+def test_connect_remains_legacy_until_global_activation(home):
+    conn = kbc.connect()
+    try:
+        assert isinstance(conn, sqlite3.Connection)
+        conn.execute("BEGIN")
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+def test_each_private_factory_open_gets_a_fresh_physical_connection(home, monkeypatch):
+    opened = []
+    original = kbc._sqlite_connect
+
+    def tracked(*args, **kwargs):
+        physical = original(*args, **kwargs)
+        opened.append(physical)
+        return physical
+
+    monkeypatch.setattr(kbc, "_sqlite_connect", tracked)
+    path = kb.kanban_db_path()
+    with kbc._protected_connection(path, operation="block"):
+        pass
+    with kbc._protected_connection(path, operation="block"):
+        pass
+
+    assert len(opened) == 2
+    assert opened[0] is not opened[1]
+    for physical in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            physical.execute("SELECT 1")

@@ -251,6 +251,22 @@ def test_workspaces_are_never_exported(kanban_root, tmp_path):
     assert not any("workspaces" in name for name in names)
 
 
+def test_export_backup_source_is_opened_read_only(kanban_root, tmp_path, monkeypatch):
+    _seed_board()
+    modes = []
+    original = kbc._sqlite_connect
+
+    def tracked(path, **kwargs):
+        modes.append(kwargs.get("read_only", False))
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(kbc, "_sqlite_connect", tracked)
+
+    kt.export_board("alpha", str(tmp_path / "alpha"))
+
+    assert modes == [True, False]
+
+
 # ---------------------------------------------------------------------------
 # Machine-local state does not travel
 # ---------------------------------------------------------------------------

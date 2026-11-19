@@ -71,11 +71,8 @@ def _placeholders(items) -> str:
 # ---------------------------------------------------------------------------
 
 def _snapshot_db(source: Path, target: Path) -> None:
-    """Consistent copy of ``source`` via the online-backup API (a file copy
-    would miss pages still in the ``-wal`` sidecar and could tear)."""
-    with contextlib.closing(sqlite3.connect(str(source))) as src, \
-            contextlib.closing(sqlite3.connect(str(target))) as dst:
-        src.backup(dst)
+    """Consistent copy of ``source`` through storage's read-only backup seam."""
+    kbc.backup_database(source, target)
 
 
 def _scrub_local_state(conn: sqlite3.Connection) -> None:

@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from dataclasses import field
 from agent.deadline import poll_until
@@ -57,19 +58,27 @@ def _resolve_busy_timeout_ms() -> int:
     return _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
 
 
-def _sqlite_connect(path: Path, *, cached_statements: int = 128) -> sqlite3.Connection:
+def _sqlite_connect(
+    path: Path, *, cached_statements: int = 128, read_only: bool = False
+) -> sqlite3.Connection:
     """Open a Kanban SQLite connection via ``connect_tracked``: while registered,
     byte-level probes of the file are refused because an ``open()``/``close()``
     would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``)."""
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
+    target = path.resolve().as_uri() + "?mode=ro" if read_only else path
+    connect_kwargs = {
+        "isolation_level": None,
+        "timeout": busy_timeout_ms / 1000.0,
+        "cached_statements": cached_statements,
+    }
+    if read_only:
+        connect_kwargs["uri"] = True
     conn = connect_tracked(
-        path,
+        target,
         connect_fn=sqlite3.connect,
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
-        cached_statements=cached_statements,
+        **connect_kwargs,
     )
     try:
         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
@@ -83,6 +92,214 @@ def _sqlite_connect(path: Path, *, cached_statements: int = 128) -> sqlite3.Conn
             conn.close()
         raise
     return conn
+
+
+_PROTECTED_ORDINARY_TABLES = frozenset(
+    {
+        "tasks",
+        "task_links",
+        "task_events",
+        "task_runs",
+        "task_comments",
+        "task_attachments",
+        "task_transition_receipts",
+        "action_receipts",
+        "operation_keys",
+        "kanban_claim_admissions",
+        "kanban_writer_faults",
+    }
+)
+_SCHEMA_ACTIONS = frozenset(
+    action
+    for name in (
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_REINDEX",
+    )
+    if (action := getattr(sqlite3, name, None)) is not None
+)
+_CONTROL_ACTIONS = frozenset(
+    action
+    for name in ("SQLITE_TRANSACTION", "SQLITE_SAVEPOINT")
+    if (action := getattr(sqlite3, name, None)) is not None
+)
+
+
+def _ordinary_authorizer(action, table, argument, _db_name, _trigger):
+    if action in _SCHEMA_ACTIONS or action in _CONTROL_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA and argument is not None:
+        return sqlite3.SQLITE_DENY
+    if (
+        action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
+        and table in _PROTECTED_ORDINARY_TABLES
+    ):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+_RESULT_CURSORS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_FACADE_CONNECTIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+class KanbanResult:
+    """A SQLite result without a path back to its physical connection."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        _RESULT_CURSORS[self] = cursor
+
+    def __cursor(self) -> sqlite3.Cursor:
+        return _RESULT_CURSORS[self]
+
+    @property
+    def description(self):
+        return self.__cursor().description
+
+    @property
+    def lastrowid(self):
+        return self.__cursor().lastrowid
+
+    @property
+    def rowcount(self):
+        return self.__cursor().rowcount
+
+    def close(self) -> None:
+        self.__cursor().close()
+        _RESULT_CURSORS.pop(self, None)
+
+    def fetchone(self):
+        return self.__cursor().fetchone()
+
+    def fetchmany(self, size: Optional[int] = None):
+        cursor = self.__cursor()
+        return cursor.fetchmany() if size is None else cursor.fetchmany(size)
+
+    def fetchall(self):
+        return self.__cursor().fetchall()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.__cursor())
+
+    def _execute(self, sql: str, parameters) -> None:
+        self.__cursor().execute(sql, parameters)
+
+    def _executemany(self, sql: str, parameters) -> None:
+        self.__cursor().executemany(sql, parameters)
+
+
+class KanbanCursor(KanbanResult):
+    """A restricted cursor that returns only safe result wrappers."""
+
+    def execute(self, sql: str, parameters=()) -> KanbanCursor:
+        self._execute(sql, parameters)
+        return self
+
+    def executemany(self, sql: str, parameters) -> KanbanCursor:
+        self._executemany(sql, parameters)
+        return self
+
+
+class KanbanConnection:
+    """Ordinary reusable Kanban access with permanently denied capabilities."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, path: str | Path, *, cached_statements: int = 128) -> None:
+        physical = _sqlite_connect(Path(path), cached_statements=cached_statements)
+        try:
+            physical.row_factory = sqlite3.Row
+            physical.text_factory = _kb._lossy_text
+            physical.set_authorizer(_ordinary_authorizer)
+        except BaseException:
+            physical.close()
+            raise
+        _FACADE_CONNECTIONS[self] = physical
+
+    def __physical(self) -> sqlite3.Connection:
+        return _FACADE_CONNECTIONS[self]
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.__physical().in_transaction
+
+    @property
+    def total_changes(self) -> int:
+        return self.__physical().total_changes
+
+    def close(self) -> None:
+        physical = _FACADE_CONNECTIONS.pop(self, None)
+        if physical is not None:
+            physical.close()
+
+    def cursor(self) -> KanbanCursor:
+        return KanbanCursor(self.__physical().cursor())
+
+    def execute(self, sql: str, parameters=()) -> KanbanResult:
+        return KanbanResult(self.__physical().execute(sql, parameters))
+
+    def executemany(self, sql: str, parameters) -> KanbanResult:
+        return KanbanResult(self.__physical().executemany(sql, parameters))
+
+    def __enter__(self) -> KanbanConnection:
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+
+@contextlib.contextmanager
+def _ordinary_connection(path: str | Path, *, cached_statements: int = 128):
+    """Open the non-activated ordinary facade on an initialized board."""
+    facade = KanbanConnection(path, cached_statements=cached_statements)
+    try:
+        yield facade
+    finally:
+        facade.close()
+
+
+@contextlib.contextmanager
+def _migration_connection(path: str | Path):
+    """Open one fresh physical connection reserved for versioned migrations."""
+    conn = _sqlite_connect(Path(path), cached_statements=0)
+    conn.row_factory = sqlite3.Row
+    conn.text_factory = _kb._lossy_text
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def backup_database(source: str | Path, target: str | Path) -> None:
+    """Create a consistent snapshot while holding only read authority on source."""
+    source_conn = _sqlite_connect(Path(source), cached_statements=0, read_only=True)
+    try:
+        with _migration_connection(target) as target_conn:
+            source_conn.backup(target_conn)
+    finally:
+        source_conn.close()
 
 
 @contextlib.contextmanager
