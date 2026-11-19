@@ -1353,14 +1353,10 @@ def claim_task_transition(
         int(now), monitor_attempt_id, admission_id, expect_assignee,
         f"claim_{source_status}",
     )
-    db_path = kbc._main_db_file(conn)
-    if not db_path:
-        raise ValueError("protected claim requires a file-backed Kanban database")
     request_hash = _request_hash(request)
     applied = False
-    with kbc._protected_connection(db_path, operation="claim") as private:
+    with kbc._claim_connection(conn) as (private, nested):
         try:
-            kbc._execute_boundary_with_retry(private, "BEGIN IMMEDIATE")
             receipt = _load_receipt(private, operation_id)
             if receipt is not None:
                 replay = _receipt_outcome(receipt, request, request_hash)
@@ -1378,11 +1374,11 @@ def claim_task_transition(
                         replay.event_id, tuple_version=replay.tuple_version,
                         result_tuple_hash=replay.result_tuple_hash,
                     )
-                kbc._execute_boundary_with_retry(private, "COMMIT")
+                kbc._finish_claim_boundary(private, nested)
             else:
                 refusal = _claim_control_refusal(private, task_id)
                 if refusal is not None:
-                    kbc._execute_boundary_with_retry(private, "COMMIT")
+                    kbc._finish_claim_boundary(private, nested)
                     return ClaimTransitionOutcome(False, operation_id, reason=refusal)
                 if not _claim_parents_satisfied(private, task_id):
                     if source_status == "ready":
@@ -1404,7 +1400,7 @@ def claim_task_transition(
                                 private, task_id, "dependency_wait",
                                 {"reason": "parent_reopened", "source_status": "review"},
                             )
-                    kbc._execute_boundary_with_retry(private, "COMMIT")
+                    kbc._finish_claim_boundary(private, nested)
                     return ClaimTransitionOutcome(
                         False, operation_id, reason="parents_not_done"
                     )
@@ -1426,7 +1422,7 @@ def claim_task_transition(
                         (task_id,),
                     ).fetchone()[0]
                     if task is None or generation is None:
-                        kbc._execute_boundary_with_retry(private, "COMMIT")
+                        kbc._finish_claim_boundary(private, nested)
                         return ClaimTransitionOutcome(
                             False, operation_id, reason="claim_lost"
                         )
@@ -1437,7 +1433,7 @@ def claim_task_transition(
                             run_generation=int(previous_run),
                         )
                     except ValueError:
-                        kbc._execute_boundary_with_retry(private, "COMMIT")
+                        kbc._finish_claim_boundary(private, nested)
                         return ClaimTransitionOutcome(
                             False, operation_id, reason="admission_refused"
                         )
@@ -1458,7 +1454,7 @@ def claim_task_transition(
                 if run_id is None:
                     if effective_admission is not None:
                         raise _ClaimRollback("claim_lost")
-                    kbc._execute_boundary_with_retry(private, "COMMIT")
+                    kbc._finish_claim_boundary(private, nested)
                     return ClaimTransitionOutcome(
                         False, operation_id, reason="claim_lost"
                     )
@@ -1471,7 +1467,7 @@ def claim_task_transition(
                     TransitionOutcome(True, operation_id, event_id, "none"),
                 )
                 task = kb.get_task(private, task_id)
-                kbc._execute_boundary_with_retry(private, "COMMIT")
+                kbc._finish_claim_boundary(private, nested)
                 applied = True
                 outcome = ClaimTransitionOutcome(
                     True, operation_id, task, run_id, event_id,
@@ -1479,10 +1475,10 @@ def claim_task_transition(
                     result_tuple_hash=receipt_outcome.result_tuple_hash,
                 )
         except _ClaimRollback as exc:
-            _rollback(private)
+            kbc._rollback_claim_boundary(private, nested)
             return ClaimTransitionOutcome(False, operation_id, reason=exc.reason)
         except BaseException:
-            _rollback(private)
+            kbc._rollback_claim_boundary(private, nested)
             raise
     if applied and source_status == "ready":
         kb._fire_task_hook("kanban_task_claimed", outcome.task, task_id, outcome.run_id)

@@ -9,6 +9,7 @@ import json
 import secrets
 import sqlite3
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -709,11 +710,22 @@ def recompute_ready_transition(
     _validate_ingress(conn, actor_scope=actor_scope, operation_id=operation_id)
     db_path = kbc._main_db_file(conn)
     if not db_path:
-        raise ValueError("protected readiness recompute requires a file-backed database")
+        # In-memory boards are process-local compatibility/test databases. Bring
+        # their raw SCHEMA_SQL up to the same optional-column contract as a
+        # file-backed board before receipt-backed readiness transitions.
+        kbc._migrate_add_optional_columns(conn)
     promoted = 0
-    with kbc._protected_connection(db_path, operation="graph") as private:
+    connection = (
+        kbc._protected_connection(db_path, operation="graph")
+        if db_path else nullcontext(conn)
+    )
+    with connection as private:
+        nested = not db_path and private.in_transaction
         try:
-            kbc._execute_boundary_with_retry(private, "BEGIN IMMEDIATE")
+            if nested:
+                private.execute("SAVEPOINT readiness_recompute")
+            else:
+                kbc._execute_boundary_with_retry(private, "BEGIN IMMEDIATE")
             rows = private.execute(
                 "SELECT id,status,consecutive_failures,max_retries "
                 "FROM tasks WHERE status IN ('todo','blocked') ORDER BY id"
@@ -771,9 +783,16 @@ def recompute_ready_transition(
                     TransitionOutcome(True, request.operation_id, event_id, "none"),
                 )
                 promoted += 1
-            kbc._execute_boundary_with_retry(private, "COMMIT")
+            if nested:
+                private.execute("RELEASE SAVEPOINT readiness_recompute")
+            else:
+                kbc._execute_boundary_with_retry(private, "COMMIT")
         except BaseException:
-            _rollback(private)
+            if nested:
+                private.execute("ROLLBACK TO SAVEPOINT readiness_recompute")
+                private.execute("RELEASE SAVEPOINT readiness_recompute")
+            else:
+                _rollback(private)
             raise
     return promoted
 

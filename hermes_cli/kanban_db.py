@@ -878,7 +878,9 @@ CREATE TABLE IF NOT EXISTS task_transition_receipts (
     event_id       INTEGER,
     committed_at   INTEGER NOT NULL,
     operation_version INTEGER NOT NULL DEFAULT 1,
-    tuple_version INTEGER NOT NULL DEFAULT 1
+    tuple_version INTEGER NOT NULL DEFAULT 1,
+    result_tuple_hash TEXT,
+    result_identity_state TEXT NOT NULL DEFAULT 'none'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (

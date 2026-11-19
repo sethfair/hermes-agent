@@ -310,6 +310,41 @@ def _protected_connection_operation(conn: sqlite3.Connection) -> str | None:
 
 
 @contextlib.contextmanager
+def _claim_connection(conn: sqlite3.Connection):
+    """Open a protected claim boundary, retaining in-memory compatibility."""
+    db_path = _main_db_file(conn)
+    if not db_path:
+        _migrate_add_optional_columns(conn)
+    connection = (
+        _protected_connection(db_path, operation="claim")
+        if db_path else contextlib.nullcontext(conn)
+    )
+    with connection as private:
+        nested = not db_path and private.in_transaction
+        if nested:
+            private.execute("SAVEPOINT protected_claim")
+        else:
+            _execute_boundary_with_retry(private, "BEGIN IMMEDIATE")
+        yield private, nested
+
+
+def _finish_claim_boundary(private: sqlite3.Connection, nested: bool) -> None:
+    if nested:
+        private.execute("RELEASE SAVEPOINT protected_claim")
+    else:
+        _execute_boundary_with_retry(private, "COMMIT")
+
+
+def _rollback_claim_boundary(private: sqlite3.Connection, nested: bool) -> None:
+    if nested:
+        private.execute("ROLLBACK TO SAVEPOINT protected_claim")
+        private.execute("RELEASE SAVEPOINT protected_claim")
+    else:
+        with contextlib.suppress(sqlite3.OperationalError):
+            private.rollback()
+
+
+@contextlib.contextmanager
 def _protected_connection(path: str | Path, *, operation: str):
     """Yield a short-lived connection for one closed typed operation.
 
@@ -1647,7 +1682,7 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     write_txn serializes against concurrent dispatchers, and the per-row
     UPDATE uses ``current_run_id IS NULL`` as a CAS guard so a racing claim
     can't produce an orphaned row."""
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         inflight = conn.execute(
             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
             "       max_runtime_seconds, last_heartbeat_at, started_at "
