@@ -20,6 +20,7 @@ from hermes_cli.kanban_task_state import (
 )
 from hermes_cli.kanban_dispatch_recovery import storage as _recovery
 from hermes_cli.kanban_dispatch_recovery import dead_worker as _dead_recovery
+from hermes_cli.kanban_state_operations import authenticated_action as _authenticated
 
 _TUPLE_VERSION = 1
 _OPERATION_VERSION = 1
@@ -388,6 +389,7 @@ _Request = (
     | _RequestReviewRequest
     | _RequestChangesRequest
     | _ReopenReviewRequest
+    | _authenticated.AuthenticatedActionRequest
     | _recovery.RuntimeTimeoutRequest
     | _recovery.DispatchFailureRequest
     | _recovery.StaleRunningRequest
@@ -581,6 +583,7 @@ _REQUEST_HASHERS = {
     _RequestReviewRequest: _lifecycle_request_hash,
     _RequestChangesRequest: _lifecycle_request_hash,
     _ReopenReviewRequest: _lifecycle_request_hash,
+    _authenticated.AuthenticatedActionRequest: _authenticated.request_hash,
     _recovery.RuntimeTimeoutRequest: _create_request_hash,
     _recovery.DispatchFailureRequest: _create_request_hash,
     _recovery.StaleRunningRequest: _create_request_hash,
@@ -1488,6 +1491,7 @@ def claim_task_transition(
 from hermes_cli.kanban_state_operations import storage as _state_operations
 
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
+_authenticated.bind(__import__(__name__, fromlist=["*"]))
 _apply_create = _state_operations._apply_create
 _apply_swarm_create = _state_operations._apply_swarm_create
 _apply_decompose = _state_operations._apply_decompose
@@ -1520,6 +1524,7 @@ _OPERATION_HANDLERS = {
     _RequestReviewRequest: _apply_request_review,
     _RequestChangesRequest: _apply_request_changes,
     _ReopenReviewRequest: _apply_reopen_review,
+    _authenticated.AuthenticatedActionRequest: _authenticated.apply,
     _recovery.RuntimeTimeoutRequest: _recovery._apply_runtime_timeout,
     _recovery.DispatchFailureRequest: _recovery._apply_dispatch_failure,
     _recovery.StaleRunningRequest: _recovery._apply_stale_running,
@@ -1638,17 +1643,9 @@ def _run_operation(
 
 
 
-
-
-
-
-
-
-
-
-
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
 _graph_transition_outcome = _state_operations._graph_transition_outcome
+authenticated_action_transition = _authenticated.transition
 link_tasks_transition = _state_operations.link_tasks_transition
 unlink_tasks_transition = _state_operations.unlink_tasks_transition
 create_task_transition = _state_operations.create_task_transition
