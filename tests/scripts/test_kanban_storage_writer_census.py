@@ -349,6 +349,29 @@ def configure(conn, dynamic_timeout):
     assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
 
 
+def test_correlated_dict_item_loops_resolve_only_literal_rows(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+def write(conn, dynamic_mapping):
+    for table, column in {"task_links": "child_id", "task_events": "task_id"}.items():
+        conn.execute(f"DELETE FROM {table} WHERE {column} = 't1'")
+    for table, column in dynamic_mapping.items():
+        conn.execute(f"DELETE FROM {table} WHERE {column} = 't1'")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert {tuple(item["effects"]) for item in report["inventory"]} == {
+        ("task_events.delete",), ("task_links.delete",),
+    }
+    kinds = [problem["kind"] for problem in report["problems"]]
+    assert kinds.count("unresolved-sql") == 1
+    assert kinds.count("unallowlisted-writer") == 2
+
+
 def test_correlated_tuple_loop_targets_resolve_without_cross_products(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": '''

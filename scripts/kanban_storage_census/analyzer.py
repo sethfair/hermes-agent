@@ -219,9 +219,29 @@ def _loop_environments(node: ast.AST, parents: dict[ast.AST, ast.AST],
             isinstance(target, ast.Name) for target in loop.target.elts
         ):
             continue
-        sources = evaluator.assignments.get(loop.iter.id, []) if isinstance(loop.iter, ast.Name) else [loop.iter]
-        rows = [row for source in sources if isinstance(source, (ast.Tuple, ast.List)) for row in source.elts]
-        valid = bool(sources) and all(isinstance(source, (ast.Tuple, ast.List)) for source in sources) and all(
+        dict_items = isinstance(loop.iter, ast.Call) and isinstance(loop.iter.func, ast.Attribute) \
+            and loop.iter.func.attr == "items" and not loop.iter.args \
+            and isinstance(loop.iter.func.value, (ast.Name, ast.Dict))
+        if dict_items:
+            assert isinstance(loop.iter, ast.Call) and isinstance(loop.iter.func, ast.Attribute) \
+                and isinstance(loop.iter.func.value, (ast.Name, ast.Dict))
+            sources = evaluator.assignments.get(loop.iter.func.value.id, []) \
+                if isinstance(loop.iter.func.value, ast.Name) else [loop.iter.func.value]
+            rows = [
+                ast.Tuple(elts=[key, value], ctx=ast.Load())
+                for source in sources if isinstance(source, ast.Dict)
+                for key, value in zip(source.keys, source.values, strict=True)
+                if key is not None
+            ]
+            valid_sources = bool(sources) and all(
+                isinstance(source, ast.Dict) and all(key is not None for key in source.keys)
+                for source in sources
+            )
+        else:
+            sources = evaluator.assignments.get(loop.iter.id, []) if isinstance(loop.iter, ast.Name) else [loop.iter]
+            rows = [row for source in sources if isinstance(source, (ast.Tuple, ast.List)) for row in source.elts]
+            valid_sources = bool(sources) and all(isinstance(source, (ast.Tuple, ast.List)) for source in sources)
+        valid = valid_sources and all(
             isinstance(row, (ast.Tuple, ast.List)) and len(row.elts) == len(loop.target.elts) for row in rows
         )
         if not valid:
