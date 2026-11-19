@@ -23,7 +23,7 @@ def production_python_files(root: Path) -> tuple[list[Path], list[str]]:
         return [], [f"cannot enumerate tracked files: {exc}"]
     tracked = sorted(part.decode("utf-8", "surrogateescape") for part in raw.split(b"\0") if part)
     try:
-        metadata = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        metadata = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8-sig"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return [], [f"cannot parse pyproject.toml: {exc}"]
 

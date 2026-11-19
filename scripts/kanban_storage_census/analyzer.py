@@ -243,7 +243,7 @@ def _load_allowlist(path: Path | None) -> tuple[list[dict[str, object]], list[Pr
     if path is None:
         return [], []
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         return [], [Problem(path.as_posix(), 0, "invalid-allowlist", str(exc))]
     if not isinstance(document, dict) or document.get("version") != 1 or not isinstance(document.get("entries"), list):

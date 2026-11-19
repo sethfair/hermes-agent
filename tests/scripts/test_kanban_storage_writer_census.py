@@ -237,6 +237,36 @@ def test_exact_allowlist_accepts_only_matching_inventory_and_rejects_stale_or_du
     assert "duplicate-allowlist" in {problem["kind"] for problem in report["problems"]}
 
 
+def test_utf8_bom_in_pyproject_does_not_hide_production_writers(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": "def write(conn): conn.execute(\"UPDATE tasks SET status='blocked'\")\n",
+    })
+    (repo / "pyproject.toml").write_text(_PYPROJECT, encoding="utf-8-sig")
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"][0]["path"] == "app/writers.py"
+    assert not [problem for problem in report["problems"] if problem["kind"] == "discovery-error"]
+
+
+def test_utf8_bom_in_exact_allowlist_is_accepted(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": "def write(conn): conn.execute(\"UPDATE tasks SET status='blocked'\")\n",
+    })
+    _, first = _run(repo)
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(
+        json.dumps({"version": 1, "entries": first["inventory"]}),
+        encoding="utf-8-sig",
+    )
+
+    result, report = _run(repo, allowlist)
+
+    assert result.returncode == 0
+    assert report["problems"] == []
+
+
 def test_non_target_write_requires_a_closed_table_and_column_enum(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": """
