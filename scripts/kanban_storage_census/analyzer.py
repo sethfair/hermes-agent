@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .discovery import production_python_files
-from .evaluator import FiniteEvaluator, Values
+from .evaluator import MAX_VARIANTS, FiniteEvaluator, Values
 from .model import InventoryItem, Problem
 from .sql import protected_effects, statement_hash
 
@@ -118,6 +118,54 @@ def _closed_private_wrapper(function: ast.FunctionDef, tree: ast.Module,
         if not resolved:
             return None
     return wrapped_sql
+
+
+def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
+                              parents: dict[ast.AST, ast.AST],
+                              evaluator: FiniteEvaluator) -> dict[str, Values]:
+    """Infer private parameters only from complete, finite local call sites."""
+    parameters = [arg.arg for arg in function.args.args]
+    summary = _wrapper_summary(function)
+    if not function.name.startswith("_") or not parameters or summary is None:
+        return {}
+    relevant = {
+        node.id for node in ast.walk(summary[1])
+        if isinstance(node, ast.Name) and node.id in parameters
+    }
+    if not relevant:
+        return {}
+    uses = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == function.name]
+    if not uses:
+        return {}
+    collected: dict[str, set[str]] = {parameter: set() for parameter in relevant}
+    reasons: dict[str, str] = {}
+    defaults = dict(zip(parameters[-len(function.args.defaults):], function.args.defaults, strict=False)) \
+        if function.args.defaults else {}
+    for use in uses:
+        call = parents.get(use)
+        if not isinstance(call, ast.Call) or call.func is not use:
+            return {parameter: Values(reason=f"escaped private helper {function.name}") for parameter in relevant}
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
+        for parameter in relevant:
+            index = parameters.index(parameter)
+            argument = call.args[index] if index < len(call.args) else keywords.get(parameter, defaults.get(parameter))
+            if argument is None:
+                reasons[parameter] = f"unbound private parameter {parameter}"
+                continue
+            try:
+                value = evaluator.evaluate(argument)
+            except RecursionError:
+                value = Values(reason="recursive finite evaluation")
+            if not value.resolved:
+                reasons[parameter] = value.reason or "unresolved private parameter"
+                continue
+            collected[parameter].update(value.strings)
+            if len(collected[parameter]) > MAX_VARIANTS:
+                reasons[parameter] = "variant-overflow"
+    return {
+        parameter: Values(reason=reasons[parameter]) if parameter in reasons else Values(frozenset(values))
+        for parameter, values in collected.items()
+    }
 
 
 def _closed_enum_environment(function: ast.FunctionDef, tree: ast.Module) -> dict[str, Values]:
@@ -247,6 +295,10 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
     evaluator = FiniteEvaluator(assignments, functions)
     parameters = {arg.arg for arg in function.args.args} if function else set()
     environment = _closed_enum_environment(function, tree) if function else {}
+    if function:
+        environment.update(_private_call_environment(
+            function, tree, parents, FiniteEvaluator(module_assignments, functions),
+        ))
     closed_wrapper_sql = _closed_private_wrapper(function, tree, parents, evaluator) if function else None
     aliases: dict[str, tuple[bool, bool]] = {}
     for node in ast.walk(scope):

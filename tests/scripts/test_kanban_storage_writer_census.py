@@ -299,6 +299,38 @@ def write(conn):
     assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
 
 
+def test_private_helper_parameters_require_all_call_sites_to_be_finite(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+def _delete(conn, table):
+    conn.execute(f"DELETE FROM {table}")
+def write(conn):
+    _delete(conn, "task_links")
+    _delete(conn, "task_events")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert {tuple(item["effects"]) for item in report["inventory"]} == {
+        ("task_events.delete",), ("task_links.delete",),
+    }
+    assert not [problem for problem in report["problems"] if problem["kind"] == "unresolved-sql"]
+
+    source = (repo / "app/writers.py").read_text(encoding="utf-8")
+    (repo / "app/writers.py").write_text(
+        source + "\ndef unsafe(conn, table):\n    _delete(conn, table)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, timeout=30)
+
+    _, report = _run(repo)
+
+    assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
+
+
 def test_finite_scalar_loop_targets_resolve_without_blessing_dynamic_loops(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": '''
