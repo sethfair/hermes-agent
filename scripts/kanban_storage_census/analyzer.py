@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import re
 from collections import defaultdict
@@ -199,20 +200,76 @@ def _closed_enum_environment(function: ast.FunctionDef, tree: ast.Module) -> dic
     return environment
 
 
-def _loop_environment(node: ast.AST, parents: dict[ast.AST, ast.AST],
-                      evaluator: FiniteEvaluator, base: dict[str, Values]) -> dict[str, Values]:
-    """Bind scalar loop targets only from their proven finite enclosing iterable."""
+def _loop_environments(node: ast.AST, parents: dict[ast.AST, ast.AST],
+                       evaluator: FiniteEvaluator, base: dict[str, Values]) -> list[dict[str, Values]]:
+    """Bind enclosing loop targets while preserving tuple-row correlation."""
     loops: list[ast.For] = []
     current = parents.get(node)
     while current is not None and not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
         if isinstance(current, ast.For):
             loops.append(current)
         current = parents.get(current)
-    environment = dict(base)
+    environments = [dict(base)]
     for loop in reversed(loops):
         if isinstance(loop.target, ast.Name):
-            environment[loop.target.id] = evaluator.evaluate(loop.iter, environment)
-    return environment
+            for environment in environments:
+                environment[loop.target.id] = evaluator.evaluate(loop.iter, environment)
+            continue
+        if not isinstance(loop.target, (ast.Tuple, ast.List)) or not all(
+            isinstance(target, ast.Name) for target in loop.target.elts
+        ):
+            continue
+        sources = evaluator.assignments.get(loop.iter.id, []) if isinstance(loop.iter, ast.Name) else [loop.iter]
+        rows = [row for source in sources if isinstance(source, (ast.Tuple, ast.List)) for row in source.elts]
+        valid = bool(sources) and all(isinstance(source, (ast.Tuple, ast.List)) for source in sources) and all(
+            isinstance(row, (ast.Tuple, ast.List)) and len(row.elts) == len(loop.target.elts) for row in rows
+        )
+        if not valid:
+            for environment in environments:
+                for target in loop.target.elts:
+                    assert isinstance(target, ast.Name)
+                    environment[target.id] = Values(reason="unresolved tuple loop")
+            continue
+        expanded: list[dict[str, Values]] = []
+        for environment in environments:
+            for row in rows:
+                assert isinstance(row, (ast.Tuple, ast.List))
+                values = [evaluator.evaluate(item, environment) for item in row.elts]
+                if any(not value.resolved for value in values):
+                    unresolved = next(value for value in values if not value.resolved)
+                    variant = dict(environment)
+                    for target in loop.target.elts:
+                        assert isinstance(target, ast.Name)
+                        variant[target.id] = unresolved
+                    expanded.append(variant)
+                    continue
+                for combination in itertools.product(*(value.strings for value in values)):
+                    variant = dict(environment)
+                    for target, value in zip(loop.target.elts, combination, strict=True):
+                        assert isinstance(target, ast.Name)
+                        variant[target.id] = Values(frozenset({value}))
+                    expanded.append(variant)
+                    if len(expanded) > MAX_VARIANTS:
+                        overflow = dict(base)
+                        for target in loop.target.elts:
+                            assert isinstance(target, ast.Name)
+                            overflow[target.id] = Values(reason="variant-overflow")
+                        return [overflow]
+        environments = expanded
+    return environments
+
+
+def _evaluate_in_loops(node: ast.AST, call: ast.Call, parents: dict[ast.AST, ast.AST],
+                       evaluator: FiniteEvaluator, base: dict[str, Values]) -> Values:
+    output: set[str] = set()
+    for environment in _loop_environments(call, parents, evaluator, base):
+        value = evaluator.evaluate(node, environment)
+        if not value.resolved:
+            return value
+        output.update(value.strings)
+        if len(output) > MAX_VARIANTS:
+            return Values(reason="variant-overflow")
+    return Values(frozenset(output))
 
 
 def _import_problems(tree: ast.Module, relative: str) -> list[Problem]:
@@ -329,7 +386,7 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
             problems.append(Problem(relative, call.lineno, "unresolved-alias",
                                     "execute alias receiver is not a function parameter"))
             continue
-        values = evaluator.evaluate(sql_node, _loop_environment(call, parents, evaluator, environment))
+        values = _evaluate_in_loops(sql_node, call, parents, evaluator, environment)
         if not values.resolved:
             if kanban_relevant:
                 kind = "variant-overflow" if values.reason == "variant-overflow" else "unresolved-sql"

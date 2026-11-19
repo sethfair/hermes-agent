@@ -331,6 +331,30 @@ def write(conn):
     assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
 
 
+def test_correlated_tuple_loop_targets_resolve_without_cross_products(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+PAIRS = (("task_links", "child_id"), ("task_events", "task_id"))
+def write(conn, dynamic_pairs):
+    for table, column in PAIRS:
+        conn.execute(f"DELETE FROM {table} WHERE {column} = 't1'")
+    for table, column in dynamic_pairs:
+        conn.execute(f"DELETE FROM {table} WHERE {column} = 't1'")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert {tuple(item["effects"]) for item in report["inventory"]} == {
+        ("task_events.delete",), ("task_links.delete",),
+    }
+    kinds = [problem["kind"] for problem in report["problems"]]
+    assert kinds.count("unresolved-sql") == 1
+    assert kinds.count("unallowlisted-writer") == 2
+
+
 def test_finite_scalar_loop_targets_resolve_without_blessing_dynamic_loops(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": '''
