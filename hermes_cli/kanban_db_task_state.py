@@ -19,6 +19,7 @@ from hermes_cli.kanban_task_state import (
     identity_event_fields,
 )
 from hermes_cli.kanban_dispatch_recovery import storage as _recovery
+from hermes_cli.kanban_dispatch_recovery import dead_worker as _dead_recovery
 
 _TUPLE_VERSION = 1
 _OPERATION_VERSION = 1
@@ -391,6 +392,7 @@ _Request = (
     | _recovery.DispatchFailureRequest
     | _recovery.StaleRunningRequest
     | _recovery.OrphanRunningRequest
+    | _dead_recovery.DeadWorkerRequest
 )
 
 
@@ -583,6 +585,7 @@ _REQUEST_HASHERS = {
     _recovery.DispatchFailureRequest: _create_request_hash,
     _recovery.StaleRunningRequest: _create_request_hash,
     _recovery.OrphanRunningRequest: _create_request_hash,
+    _dead_recovery.DeadWorkerRequest: _create_request_hash,
 }
 
 
@@ -1233,8 +1236,6 @@ def _apply_delete(
 
 
 
-
-
 class _ClaimRollback(RuntimeError):
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -1484,8 +1485,6 @@ def claim_task_transition(
 
 
 
-
-
 from hermes_cli.kanban_state_operations import storage as _state_operations
 
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
@@ -1525,6 +1524,7 @@ _OPERATION_HANDLERS = {
     _recovery.DispatchFailureRequest: _recovery._apply_dispatch_failure,
     _recovery.StaleRunningRequest: _recovery._apply_stale_running,
     _recovery.OrphanRunningRequest: _recovery._apply_orphan_running,
+    _dead_recovery.DeadWorkerRequest: _dead_recovery._apply_dead_worker,
 }
 
 
@@ -1647,7 +1647,6 @@ def _run_operation(
 
 
 
-
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
 _graph_transition_outcome = _state_operations._graph_transition_outcome
 link_tasks_transition = _state_operations.link_tasks_transition
@@ -1675,6 +1674,7 @@ runtime_timeout_transition = _recovery.runtime_timeout_transition
 dispatch_failure_transition = _recovery.dispatch_failure_transition
 stale_running_transition = _recovery.stale_running_transition
 orphan_running_transition = _recovery.orphan_running_transition
+dead_worker_transition = _dead_recovery.dead_worker_transition
 
 
 def _compatibility_lifecycle_operation_id(kind: str, task_id: str) -> str:

@@ -31,11 +31,13 @@ class DispatchFailureRequest:
     actor_scope: str
     operation_id: str
     trigger_operation_id: str
+    trigger_operation_kind: str
     expected_run_id: int
     error: str
     outcome: str
     retry_status: str
     failure_limit: int
+    count_failure: bool
     force_trip: bool
     event_payload_extra: Optional[dict[str, Any]]
     operation_kind: str = "dispatch_failure"
@@ -122,17 +124,19 @@ def dispatch_failure_transition(
     actor_scope: str,
     operation_id: str,
     trigger_operation_id: str,
+    trigger_operation_kind: str = "runtime_timeout",
     expected_run_id: int,
     error: str,
     outcome: str,
     retry_status: str,
     failure_limit: int,
+    count_failure: bool = True,
     force_trip: bool = False,
     event_payload_extra: Optional[dict[str, Any]] = None,
 ):
     request = DispatchFailureRequest(
-        task_id, actor_scope, operation_id, trigger_operation_id,
-        expected_run_id, error[:500], outcome, retry_status, failure_limit, force_trip,
+        task_id, actor_scope, operation_id, trigger_operation_id, trigger_operation_kind,
+        expected_run_id, error[:500], outcome, retry_status, failure_limit, count_failure, force_trip,
         event_payload_extra,
     )
     return _state()._run_operation(conn, request).outcome
@@ -281,8 +285,8 @@ def _apply_dispatch_failure(private: sqlite3.Connection, request):
     trigger = private.execute(
         "SELECT r.outcome_code,e.run_id FROM task_transition_receipts r "
         "LEFT JOIN task_events e ON e.id=r.event_id "
-        "WHERE r.operation_id=? AND r.task_id=? AND r.operation_kind='runtime_timeout'",
-        (request.trigger_operation_id, request.task_id),
+        "WHERE r.operation_id=? AND r.task_id=? AND r.operation_kind=?",
+        (request.trigger_operation_id, request.task_id, request.trigger_operation_kind),
     ).fetchone()
     if (
         trigger is None
@@ -298,11 +302,11 @@ def _apply_dispatch_failure(private: sqlite3.Connection, request):
         return _applied(_outcome(request, committed=False, refusal="task_not_found"))
     if row["status"] != "recovering":
         return _applied(_outcome(request, committed=False, refusal="compare_and_set"))
-    failures = int(row["consecutive_failures"]) + 1
+    failures = int(row["consecutive_failures"]) + (1 if request.count_failure else 0)
     override = kb._row_get(row, "max_retries")
     effective_limit = int(override) if override is not None else request.failure_limit
     limit_source = "task" if override is not None else "dispatcher"
-    if not (request.force_trip or failures >= effective_limit):
+    if not request.count_failure or not (request.force_trip or failures >= effective_limit):
         private.execute(
             "UPDATE tasks SET status=?,consecutive_failures=?,last_failure_error=? "
             "WHERE id=? AND status='recovering'",

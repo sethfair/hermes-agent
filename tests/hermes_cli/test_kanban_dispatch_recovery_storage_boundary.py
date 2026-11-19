@@ -307,3 +307,73 @@ def test_orphan_receipt_failure_rolls_back_task_run_event_and_comment(board) -> 
     assert run is not None and run.ended_at is None
     assert list(kb.list_events(board, task_id)) == before_events
     assert after_comments == before_comments
+
+
+def _dead_worker(board) -> tuple[str, int]:
+    task_id, run_id = _overrun(board)
+    old = int(time.time()) - 300
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET started_at=? WHERE id=?", (old, task_id))
+    return task_id, run_id
+
+
+def test_dead_worker_recovery_and_failure_accounting_have_receipts(board, monkeypatch) -> None:
+    task_id, run_id = _dead_worker(board)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    assert kbd.detect_crashed_workers(board) == [task_id]
+
+    task = kb.get_task(board, task_id)
+    run = kb.latest_run(board, task_id)
+    receipts = board.execute(
+        "SELECT operation_kind FROM task_transition_receipts "
+        "WHERE operation_id IN (?,?) ORDER BY operation_kind",
+        (
+            f"dead-worker:{task_id}:{run_id}",
+            f"dispatch-failure:crashed:{task_id}:{run_id}",
+        ),
+    ).fetchall()
+    assert task is not None and task.status == "ready" and task.consecutive_failures == 1
+    assert run is not None and run.outcome == "crashed"
+    assert [row["operation_kind"] for row in receipts] == ["dead_worker", "dispatch_failure"]
+
+
+def test_dead_worker_receipt_failure_rolls_back_task_run_and_event(board, monkeypatch) -> None:
+    task_id, run_id = _dead_worker(board)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    before_events = list(kb.list_events(board, task_id))
+    board.execute(
+        "CREATE TRIGGER refuse_dead_receipt BEFORE INSERT ON task_transition_receipts "
+        "WHEN NEW.operation_kind='dead_worker' "
+        "BEGIN SELECT RAISE(ABORT, 'forced dead receipt failure'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced dead receipt failure"):
+        kbd.detect_crashed_workers(board)
+
+    task = kb.get_task(board, task_id)
+    run = kb.latest_run(board, task_id)
+    assert task is not None and task.status == "running" and task.current_run_id == run_id
+    assert run is not None and run.ended_at is None
+    assert list(kb.list_events(board, task_id)) == before_events
+
+
+def test_pending_dead_worker_failure_accounting_is_reconciled(board, monkeypatch) -> None:
+    task_id, _run_id = _dead_worker(board)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    board.execute(
+        "CREATE TRIGGER refuse_dead_accounting BEFORE INSERT ON task_transition_receipts "
+        "WHEN NEW.operation_kind='dispatch_failure' "
+        "BEGIN SELECT RAISE(ABORT, 'forced dead accounting failure'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced dead accounting failure"):
+        kbd.detect_crashed_workers(board)
+    interrupted = kb.get_task(board, task_id)
+    assert interrupted is not None and interrupted.status == "recovering"
+
+    board.execute("DROP TRIGGER refuse_dead_accounting")
+    assert kbd.detect_crashed_workers(board) == []
+    recovered = kb.get_task(board, task_id)
+    assert recovered is not None and recovered.status == "ready"
+    assert recovered.consecutive_failures == 1
