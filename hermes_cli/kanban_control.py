@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli.sqlite_readonly import connect_readonly
+
 
 logger = logging.getLogger(__name__)
 
@@ -338,13 +340,9 @@ def control_status(*, board: Optional[str] = None) -> dict:
                 wal = path.with_name(path.name + "-wal")
                 shm = path.with_name(path.name + "-shm")
                 if not wal.exists() and not shm.exists():
-                    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
-                    conn = sqlite3.connect(uri, uri=True)
-                    conn.row_factory = sqlite3.Row
-                    try:
+                    with connect_readonly(path, immutable=True) as conn:
+                        conn.row_factory = sqlite3.Row
                         state = read_control(conn)
-                    finally:
-                        conn.close()
                 else:
                     with tempfile.TemporaryDirectory(prefix="hermes-kanban-status-") as tmp:
                         snapshot = Path(tmp) / path.name
@@ -353,12 +351,9 @@ def control_status(*, board: Optional[str] = None) -> dict:
                             shutil.copyfile(
                                 wal, snapshot.with_name(snapshot.name + "-wal"),
                             )
-                        conn = sqlite3.connect(snapshot)
-                        conn.row_factory = sqlite3.Row
-                        try:
+                        with connect_readonly(snapshot) as conn:
+                            conn.row_factory = sqlite3.Row
                             state = read_control(conn)
-                        finally:
-                            conn.close()
         except Exception as exc:
             logger.exception("failed to read Kanban pickup control for board %s", slug)
             state = ControlState(
