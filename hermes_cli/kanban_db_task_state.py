@@ -238,6 +238,49 @@ def block_task_transition(
                 if parent is None or parent[0] in {"done", "archived"}:
                     cause = "no_open_parent" if parent else "nonparent_subject"
                     identity = BlockIdentity("unknown", kind=kind, unknown_cause=cause)
+            classify_in_place = (
+                row[0] == "blocked"
+                and row[2] is None
+                and row[1] is None
+                and kind is not None
+                and subject is None
+                and expected_run_id is None
+            )
+            if classify_in_place:
+                updated = private.execute(
+                    "UPDATE tasks SET block_kind = ?, block_recurrences = 1, "
+                    "block_identity = NULL, block_identity_state = 'unknown' "
+                    "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
+                    "AND current_run_id IS NULL",
+                    (kind, task_id),
+                )
+                if updated.rowcount != 1:
+                    private.execute("ROLLBACK")
+                    return BlockTransitionOutcome(False, operation_id, refusal="compare_and_set")
+                unknown_fields = identity_event_fields(identity)
+                kb._append_event(
+                    private, task_id, "block_identity_unknown",
+                    {**unknown_fields, "classification_required": True},
+                )
+                kb._append_event(
+                    private, task_id, "blocked",
+                    {"kind": kind, "reason": reason, "classified_in_place": True, **unknown_fields},
+                )
+                event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+                result_tuple_hash = _protected_tuple_hash(private, task_id)
+                private.execute(
+                    "INSERT INTO task_transition_receipts "
+                    "(operation_id, task_id, operation_kind, request_hash, outcome_code, event_id, "
+                    "committed_at, tuple_version, result_tuple_hash, result_identity_state) "
+                    "VALUES (?, ?, 'block', ?, 'committed', ?, ?, ?, ?, 'unknown')",
+                    (operation_id, task_id, request_hash, event_id, int(time.time()),
+                     _TUPLE_VERSION, result_tuple_hash),
+                )
+                private.execute("COMMIT")
+                return BlockTransitionOutcome(
+                    True, operation_id, event_id, "unknown", tuple_version=_TUPLE_VERSION,
+                    result_tuple_hash=result_tuple_hash,
+                )
             source_status = "ready"
             if row[0] == "running":
                 source_status = kb._retry_status_for_run(private, task_id)
