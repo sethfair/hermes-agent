@@ -302,6 +302,13 @@ def backup_database(source: str | Path, target: str | Path) -> None:
         source_conn.close()
 
 
+_PROTECTED_CONNECTION_OPERATIONS: dict[int, str] = {}
+
+
+def _protected_connection_operation(conn: sqlite3.Connection) -> str | None:
+    return _PROTECTED_CONNECTION_OPERATIONS.get(id(conn))
+
+
 @contextlib.contextmanager
 def _protected_connection(path: str | Path, *, operation: str):
     """Yield a short-lived connection for one closed typed operation.
@@ -313,6 +320,7 @@ def _protected_connection(path: str | Path, *, operation: str):
     conn = _sqlite_connect(Path(path), cached_statements=0)
     conn.row_factory = sqlite3.Row
     conn.text_factory = _kb._lossy_text
+    _PROTECTED_CONNECTION_OPERATIONS[id(conn)] = operation
 
     writable_tables = {
         "block": {
@@ -336,6 +344,14 @@ def _protected_connection(path: str | Path, *, operation: str):
             "tasks", "task_runs", "task_events", "task_transition_receipts",
             "kanban_claim_admissions", "kanban_writer_faults",
             "kanban_ready_state", "kanban_ready_episodes",
+        },
+        "graph": {
+            "tasks", "task_links", "task_events", "task_transition_receipts",
+            "kanban_notify_subs", "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "create": {
+            "tasks", "task_runs", "task_links", "task_comments", "task_events",
+            "task_transition_receipts", "kanban_notify_subs", "kanban_claim_admissions", "kanban_writer_faults",
         },
     }.get(operation, set())
     schema_actions = {
@@ -362,6 +378,7 @@ def _protected_connection(path: str | Path, *, operation: str):
     try:
         yield conn
     finally:
+        _PROTECTED_CONNECTION_OPERATIONS.pop(id(conn), None)
         with contextlib.suppress(Exception):
             conn.close()
 

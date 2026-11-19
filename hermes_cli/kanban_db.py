@@ -1189,7 +1189,6 @@ def create_task(
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
-    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
@@ -1248,87 +1247,53 @@ def create_task(
             workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
+    from hermes_cli.kanban_db_task_state import create_task_transition
+
     for attempt in range(2):
         task_id = _new_task_id()
+        resolved_workspace_path = workspace_path
+        resolved_branch_name = branch_name
+        if project_obj is not None and workspace_kind == "worktree":
+            if project_repo and not resolved_workspace_path:
+                resolved_workspace_path = os.path.join(project_repo, ".worktrees", task_id)
+            if not resolved_branch_name:
+                resolved_branch_name = _project_branch_name(project_obj, task_id, title)
         try:
-            # allow_nested: graph builders compose create_task under one outer
-            # commit so the dispatcher never sees a half-built graph.
-            with write_txn(conn, allow_nested=True):
-                task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
-                # Project worktree: fresh dir under the repo + deterministic
-                # branch, instead of the random ``wt/<id>`` worker fallback.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(project_repo, ".worktrees", task_id)
-                    if not branch_name:
-                        branch_name = _project_branch_name(project_obj, task_id, title)
-
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id, title.strip(), body, assignee, task_status, priority,
-                        created_by, now, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        _opt_int(max_runtime_seconds),
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        _opt_int(max_retries), model_override, provider_override, reasoning_effort,
-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
-                    ),
-                )
-                for pid in parents:
-                    _link(conn, pid, task_id)
-                _append_event(
-                    conn,
-                    task_id,
-                    "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "creator_task_id": creator_task_id,
-                        "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
-                        "project_id": project_id,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
-                        "provider_override": provider_override,
-                    },
-                )
-                if task_status == "blocked":
-                    _append_event(
-                        conn,
-                        task_id,
-                        "blocked",
-                        {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
-                    )
-                if task_status == "todo":
-                    # Parked behind an open parent: record why, exactly as
-                    # link_tasks does, so the board never shows an unexplained todo.
-                    gating = [p for p in parents if _task_status(conn, p) not in ("done", "archived")]
-                    if gating:
-                        _append_event(
-                            conn,
-                            task_id,
-                            "dependency_wait",
-                            {"reason": "parent_not_done", "parent": gating[0]},
-                        )
-                # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
-                inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
-                _inherit_notify_subs(conn, task_id, parents, created_at=now)
-            return task_id
+            outcome = create_task_transition(
+                conn,
+                task_id,
+                actor_scope="legacy",
+                operation_id=f"create:{task_id}:{secrets.token_hex(8)}",
+                title=title.strip(),
+                body=body,
+                assignee=assignee,
+                created_by=created_by,
+                created_at=now,
+                workspace_kind=workspace_kind,
+                workspace_path=resolved_workspace_path,
+                branch_name=resolved_branch_name,
+                project_id=project_id,
+                tenant=tenant,
+                priority=priority,
+                parents=parents,
+                triage=triage,
+                initial_status=initial_status,
+                idempotency_key=idempotency_key,
+                max_runtime_seconds=_opt_int(max_runtime_seconds),
+                skills_json=json.dumps(skills_list) if skills_list is not None else None,
+                max_retries=_opt_int(max_retries),
+                model_override=model_override,
+                provider_override=provider_override,
+                reasoning_effort=reasoning_effort,
+                goal_mode=goal_mode,
+                goal_max_turns=_opt_int(goal_max_turns),
+                session_id=session_id,
+                creator_task_id=creator_task_id,
+                completion_contract=completion_contract,
+            )
+            if not outcome.committed:
+                raise RuntimeError(outcome.refusal or "task creation refused")
+            return outcome.task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
                 raise
@@ -1543,56 +1508,15 @@ def link_tasks(
     *,
     expected_child_run_id: Optional[int] = None,
 ) -> bool:
-    """Link ``parent_id -> child_id``. Returns True when the link gated a
-    ``ready`` child back to ``todo`` (the new parent is not yet terminal), so
-    callers can surface the demotion instead of a silent status flip.
+    """Compatibility entrypoint for receipt-backed graph linking."""
+    from hermes_cli.kanban_db_task_state import link_tasks as _link_tasks
 
-    A running child cannot normally be gated retroactively, so reject the edge
-    rather than record a dependency that did not constrain the active run. The
-    owning worker may link its own active run for a subsequent dependency-block
-    handoff by supplying its trusted ``expected_child_run_id``.
-    """
-    if parent_id == child_id:
-        raise ValueError("a task cannot depend on itself")
-    gated = False
-    with write_txn(conn):
-        missing = _missing_task_ids(conn, [parent_id, child_id])
-        if missing:
-            raise ValueError(f"unknown task(s): {', '.join(missing)}")
-        child = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?", (child_id,),
-        ).fetchone()
-        if child["status"] == "running" and (
-            expected_child_run_id is None
-            or child["current_run_id"] != expected_child_run_id
-        ):
-            raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
-        if _would_cycle(conn, parent_id, child_id):
-            raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
-        _link(conn, parent_id, child_id)
-        # If child was ready but parent is not yet terminal, demote child to todo
-        # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
-        if _task_status(conn, parent_id) not in ("done", "archived"):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
-            gated = cur.rowcount == 1
-            if gated:
-                _append_event(
-                    conn,
-                    child_id,
-                    "dependency_wait",
-                    {"reason": "parent_not_done", "demoted": True, "parent": parent_id},
-                )
-        _append_event(
-            conn,
-            child_id,
-            "linked",
-            {"parent": parent_id, "child": child_id},
-        )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
-    return gated
+    return _link_tasks(
+        conn,
+        parent_id,
+        child_id,
+        expected_child_run_id=expected_child_run_id,
+    )
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -1614,18 +1538,10 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
-        )
-        removed = cur.rowcount > 0
-        if removed:
-            _append_event(conn, child_id, "unlinked", {"parent": parent_id, "child": child_id})
-    if removed:
-        # Re-gate the child now (as complete_task/unblock_task do) instead of
-        # leaving it in todo until the next tick.
-        recompute_ready(conn)
-    return removed
+    """Compatibility entrypoint for receipt-backed graph unlinking."""
+    from hermes_cli.kanban_db_task_state import unlink_tasks as _unlink_tasks
+
+    return _unlink_tasks(conn, parent_id, child_id)
 
 
 def _linked_ids(conn: sqlite3.Connection, want: str, where: str, task_id: str) -> list[str]:
@@ -2047,67 +1963,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
-    """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
-    returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+    """Compatibility entrypoint for receipt-backed automatic readiness."""
+    from hermes_cli.kanban_db_task_state import recompute_ready as _recompute_ready
 
-    ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
-    ``consecutive_failures`` reached the limit (else the breaker could never
-    trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
-    ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
-
-    1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).
-    """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
-    promoted = 0
-    with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
-        for row in todo_rows:
-            task_id = row["id"]
-            cur_status = row["status"]
-            if _has_unknown_block_identity(conn, task_id):
-                continue
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Explicit human-intervention block; only ``unblock_task`` may exit it.
-                continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?", (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
-                resume_status = _resume_status_from_events(conn, task_id)
-                if cur_status == "blocked":
-                    # At the breaker limit, no auto-recovery (else block ->
-                    # recover -> respawn -> exhaust -> block forever). The
-                    # counter is preserved so it accumulates across cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
-                        (resume_status, task_id),
-                    )
-                _append_event(
-                    conn, task_id, "promoted",
-                    {"status": resume_status} if resume_status != "ready" else None,
-                )
-                promoted += 1
-    return promoted
+    return _recompute_ready(conn, failure_limit=failure_limit)
 
 
 # --- Claim / complete / block ---
