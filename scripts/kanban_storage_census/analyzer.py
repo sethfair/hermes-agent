@@ -83,6 +83,43 @@ def _wrapper_summary(function: ast.FunctionDef) -> tuple[int, ast.AST] | None:
     return None
 
 
+def _closed_private_wrapper(function: ast.FunctionDef, tree: ast.Module,
+                            parents: dict[ast.AST, ast.AST], evaluator: FiniteEvaluator) -> ast.AST | None:
+    """Return the forwarded SQL node when every use is a finite local call."""
+    if not function.name.startswith("_"):
+        return None
+    summary = _wrapper_summary(function)
+    if summary is None:
+        return None
+    _, wrapped_sql = summary
+    if not isinstance(wrapped_sql, ast.Name):
+        return None
+    parameters = [arg.arg for arg in function.args.args]
+    try:
+        sql_index = parameters.index(wrapped_sql.id)
+    except ValueError:
+        return None
+    uses = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == function.name]
+    if not uses:
+        return None
+    for use in uses:
+        call = parents.get(use)
+        if not isinstance(call, ast.Call) or call.func is not use:
+            return None
+        argument = call.args[sql_index] if sql_index < len(call.args) else next(
+            (keyword.value for keyword in call.keywords if keyword.arg == wrapped_sql.id), None,
+        )
+        if argument is None:
+            return None
+        try:
+            resolved = evaluator.evaluate(argument).resolved
+        except RecursionError:
+            return None
+        if not resolved:
+            return None
+    return wrapped_sql
+
+
 def _closed_enum_environment(function: ast.FunctionDef, tree: ast.Module) -> dict[str, Values]:
     """Resolve identifier parameters only when code proves a closed table/column enum."""
     source = ast.unparse(function)
@@ -194,6 +231,7 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
     evaluator = FiniteEvaluator(assignments, functions)
     parameters = {arg.arg for arg in function.args.args} if function else set()
     environment = _closed_enum_environment(function, tree) if function else {}
+    closed_wrapper_sql = _closed_private_wrapper(function, tree, parents, evaluator) if function else None
     aliases: dict[str, tuple[bool, bool]] = {}
     for node in ast.walk(scope):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute) \
@@ -216,6 +254,8 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
         if sink is None:
             continue
         sql_node, uncertain_alias = sink
+        if sql_node is closed_wrapper_sql:
+            continue
         ordinal += 1
         if uncertain_alias:
             problems.append(Problem(relative, call.lineno, "unresolved-alias",

@@ -266,6 +266,39 @@ def dispatch(command):
     assert report["problems"] == []
 
 
+def test_private_sql_wrapper_resolves_only_when_all_call_sites_are_finite(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+def _run(conn, sql):
+    conn.execute(sql)
+def write(conn):
+    _run(conn, "UPDATE tasks SET status='ready' WHERE id='t1'")
+    _run(conn, "DELETE FROM task_links WHERE child_id='t1'")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert {tuple(item["effects"]) for item in report["inventory"]} == {
+        ("task_links.delete",), ("tasks.update.status",),
+    }
+    assert not [problem for problem in report["problems"] if problem["kind"] == "unresolved-sql"]
+
+    source = (repo / "app/writers.py").read_text(encoding="utf-8")
+    (repo / "app/writers.py").write_text(
+        source + "\ndef unsafe(conn, sql):\n    _run(conn, sql)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, timeout=30)
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
+
+
 def test_variant_overflow_fails_closed(tmp_path):
     choices = ", ".join(repr(f"UPDATE tasks SET status='{index}'") for index in range(70))
     repo = _repo(tmp_path, {
