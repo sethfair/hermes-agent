@@ -500,6 +500,28 @@ def read(conn):
     assert report["problems"] == []
 
 
+def test_finite_list_comprehensions_over_dictionary_keys_resolve_conservatively(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/readers.py": '''
+from hermes_cli import kanban_db
+TABLES = {"task_events": "created_at", "task_runs": "ended_at"}
+def read(conn, include, dynamic_tables):
+    selected = [table for table in TABLES if include(table)]
+    for table in selected:
+        conn.execute(f"SELECT COUNT(*) FROM {table}")
+    dynamic = [table for table in dynamic_tables if include(table)]
+    for table in dynamic:
+        conn.execute(f"SELECT COUNT(*) FROM {table}")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"] == []
+    assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
+
+
 def test_finite_collection_constructors_resolve_scalar_loops(tmp_path):
     repo = _repo(tmp_path, {
         "app/readers.py": '''

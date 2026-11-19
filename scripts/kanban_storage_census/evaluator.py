@@ -51,6 +51,8 @@ class FiniteEvaluator:
             return self._binop(node, env, stack)
         if isinstance(node, ast.JoinedStr):
             return self._joined(node, env, stack)
+        if isinstance(node, ast.ListComp):
+            return self._list_comprehension(node, env, stack)
         if isinstance(node, ast.Call):
             return self._call(node, env, stack)
         return Values(reason=f"unsupported {type(node).__name__}")
@@ -115,6 +117,38 @@ class FiniteEvaluator:
         if not output:
             return Values(reason="subscript key is outside finite dictionary")
         return self._union(output)
+
+    def _finite_iterable(self, node: ast.AST, env: dict[str, Values],
+                         stack: tuple[str, ...]) -> Values:
+        dictionaries = [node] if isinstance(node, ast.Dict) else (
+            [choice for choice in self.assignments.get(node.id, []) if isinstance(choice, ast.Dict)]
+            if isinstance(node, ast.Name) else []
+        )
+        if dictionaries:
+            if any(key is None for dictionary in dictionaries for key in dictionary.keys):
+                return Values(reason="dictionary unpack is not finite")
+            return self._union(
+                self.evaluate(key, env, stack)
+                for dictionary in dictionaries for key in dictionary.keys if key is not None
+            )
+        return self.evaluate(node, env, stack)
+
+    def _list_comprehension(self, node: ast.ListComp, env: dict[str, Values],
+                            stack: tuple[str, ...]) -> Values:
+        if len(node.generators) != 1:
+            return Values(reason="nested comprehension is not finite")
+        generator = node.generators[0]
+        if generator.is_async or not isinstance(generator.target, ast.Name):
+            return Values(reason="unsupported comprehension target")
+        iterable = self._finite_iterable(generator.iter, env, stack)
+        if not iterable.resolved:
+            return iterable
+        values: list[Values] = []
+        for item in iterable.strings:
+            variant = dict(env)
+            variant[generator.target.id] = Values(frozenset({item}))
+            values.append(self.evaluate(node.elt, variant, stack))
+        return self._union(values)
 
     def _binop(self, node: ast.BinOp, env: dict[str, Values], stack: tuple[str, ...]) -> Values:
         left, right = self.evaluate(node.left, env, stack), self.evaluate(node.right, env, stack)
