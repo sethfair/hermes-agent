@@ -340,6 +340,31 @@ def test_reopening_parent_demotes_ready_child(client):
     ).json()["task"]
     assert child_after_reopen["status"] == "todo"
 
+
+def test_dashboard_direct_status_uses_receipt_backed_transition(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "drag target"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "todo"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "todo"
+    with kbc.connect() as conn:
+        receipt = conn.execute(
+            "SELECT operation_kind, event_id FROM task_transition_receipts "
+            "WHERE task_id = ? AND operation_kind = 'direct_status'",
+            (task["id"],),
+        ).fetchone()
+        assert receipt is not None
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE id = ?", (receipt["event_id"],),
+        ).fetchone()
+    assert event["kind"] == "status"
+    assert json.loads(event["payload"]) == {"status": "todo", "requested_status": "todo"}
+
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")

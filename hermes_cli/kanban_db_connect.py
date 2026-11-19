@@ -357,6 +357,10 @@ def _protected_connection(path: str | Path, *, operation: str):
             "tasks", "task_runs", "task_events", "task_attachments",
             "task_transition_receipts", "kanban_claim_admissions", "kanban_writer_faults",
         },
+        "direct_status": {
+            "tasks", "task_runs", "task_comments", "task_events",
+            "task_transition_receipts", "kanban_claim_admissions", "kanban_writer_faults",
+        },
         "recovery": {
             "tasks", "task_runs", "task_events", "task_comments", "task_transition_receipts",
             "kanban_claim_admissions", "kanban_writer_faults",

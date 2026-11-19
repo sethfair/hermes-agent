@@ -21,6 +21,7 @@ from hermes_cli.kanban_task_state import (
 from hermes_cli.kanban_dispatch_recovery import storage as _recovery
 from hermes_cli.kanban_dispatch_recovery import dead_worker as _dead_recovery
 from hermes_cli.kanban_state_operations import authenticated_action as _authenticated
+from hermes_cli.kanban_state_operations import direct_status as _direct_status
 
 _TUPLE_VERSION = 1
 _OPERATION_VERSION = 1
@@ -389,6 +390,7 @@ _Request = (
     | _RequestReviewRequest
     | _RequestChangesRequest
     | _ReopenReviewRequest
+    | _direct_status.DirectStatusRequest
     | _authenticated.AuthenticatedActionRequest
     | _recovery.RuntimeTimeoutRequest
     | _recovery.DispatchFailureRequest
@@ -408,6 +410,7 @@ class _AppliedTransition:
     was_running: bool = False
     attachment_paths: tuple[str, ...] = ()
     staged_copies: tuple[Path, ...] = ()
+    terminations: tuple[tuple[Optional[int], Optional[str], object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -420,6 +423,7 @@ class _KernelResult:
     worker_started_at: object = None
     was_running: bool = False
     attachment_paths: tuple[str, ...] = ()
+    terminations: tuple[tuple[Optional[int], Optional[str], object], ...] = ()
 
 
 def _canonical_hash(value: object) -> str:
@@ -583,6 +587,7 @@ _REQUEST_HASHERS = {
     _RequestReviewRequest: _lifecycle_request_hash,
     _RequestChangesRequest: _lifecycle_request_hash,
     _ReopenReviewRequest: _lifecycle_request_hash,
+    _direct_status.DirectStatusRequest: _direct_status.request_hash,
     _authenticated.AuthenticatedActionRequest: _authenticated.request_hash,
     _recovery.RuntimeTimeoutRequest: _create_request_hash,
     _recovery.DispatchFailureRequest: _create_request_hash,
@@ -1481,13 +1486,6 @@ def claim_task_transition(
     return outcome
 
 
-
-
-
-
-
-
-
 from hermes_cli.kanban_state_operations import storage as _state_operations
 
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
@@ -1524,6 +1522,7 @@ _OPERATION_HANDLERS = {
     _RequestReviewRequest: _apply_request_review,
     _RequestChangesRequest: _apply_request_changes,
     _ReopenReviewRequest: _apply_reopen_review,
+    _direct_status.DirectStatusRequest: _direct_status.apply,
     _authenticated.AuthenticatedActionRequest: _authenticated.apply,
     _recovery.RuntimeTimeoutRequest: _recovery._apply_runtime_timeout,
     _recovery.DispatchFailureRequest: _recovery._apply_dispatch_failure,
@@ -1568,6 +1567,7 @@ def _run_operation(
             applied.worker_started_at,
             applied.was_running,
             applied.attachment_paths,
+            applied.terminations,
         )
 
     _validate_ingress(
@@ -1614,33 +1614,8 @@ def _run_operation(
         applied.worker_started_at,
         applied.was_running,
         applied.attachment_paths,
+        applied.terminations,
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
@@ -1679,6 +1654,11 @@ def _compatibility_lifecycle_operation_id(kind: str, task_id: str) -> str:
 
 
 _state_operations.bind(__import__(__name__, fromlist=["*"]))
+
+
+_direct_status.bind(__import__(__name__, fromlist=["*"]))
+direct_status_transition = _direct_status.transition
+direct_status = _direct_status.compatibility
 
 
 def unblock_task_transition(
