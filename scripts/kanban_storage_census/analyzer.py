@@ -227,7 +227,9 @@ def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
                               evaluator: FiniteEvaluator,
                               name_uses: dict[str, list[ast.Name]]) -> dict[str, Values]:
     """Infer private parameters only from complete, finite local call sites."""
-    parameters = [arg.arg for arg in function.args.args]
+    positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
+    keyword_only = [arg.arg for arg in function.args.kwonlyargs]
+    parameters = [*positional, *keyword_only]
     summary = _wrapper_summary(function)
     if not function.name.startswith("_") or not parameters or summary is None:
         return {}
@@ -239,16 +241,23 @@ def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
         return {}
     collected: dict[str, set[str]] = {parameter: set() for parameter in relevant}
     reasons: dict[str, str] = {}
-    defaults = dict(zip(parameters[-len(function.args.defaults):], function.args.defaults, strict=False)) \
+    defaults = dict(zip(positional[-len(function.args.defaults):], function.args.defaults, strict=False)) \
         if function.args.defaults else {}
+    defaults.update({
+        name: value for name, value in zip(keyword_only, function.args.kw_defaults, strict=True)
+        if value is not None
+    })
     for use in uses:
         call = parents.get(use)
         if not isinstance(call, ast.Call) or call.func is not use:
             return {parameter: Values(reason=f"escaped private helper {function.name}") for parameter in relevant}
         keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
         for parameter in relevant:
-            index = parameters.index(parameter)
-            argument = call.args[index] if index < len(call.args) else keywords.get(parameter, defaults.get(parameter))
+            if parameter in positional:
+                index = positional.index(parameter)
+                argument = call.args[index] if index < len(call.args) else keywords.get(parameter, defaults.get(parameter))
+            else:
+                argument = keywords.get(parameter, defaults.get(parameter))
             if argument is None:
                 reasons[parameter] = f"unbound private parameter {parameter}"
                 continue
@@ -297,6 +306,25 @@ def _closed_enum_environment(function: ast.FunctionDef, tree: ast.Module) -> dic
     if "column" in parameters:
         environment["column"] = Values(frozenset(column for columns in tables.values() for column in columns))
     return environment
+
+
+def _tuple_row_variants(row: ast.Tuple | ast.List, targets: ast.Tuple | ast.List,
+                        environment: dict[str, Values],
+                        evaluator: FiniteEvaluator) -> list[dict[str, Values]]:
+    values = [evaluator.evaluate(item, environment) for item in row.elts]
+    choices = [
+        [Values(frozenset({item})) for item in value.strings]
+        if value.resolved else [value]
+        for value in values
+    ]
+    variants: list[dict[str, Values]] = []
+    for combination in itertools.product(*choices):
+        variant = dict(environment)
+        for target, value in zip(targets.elts, combination, strict=True):
+            assert isinstance(target, ast.Name)
+            variant[target.id] = value
+        variants.append(variant)
+    return variants
 
 
 def _loop_environments(node: ast.AST, parents: dict[ast.AST, ast.AST],
@@ -353,27 +381,13 @@ def _loop_environments(node: ast.AST, parents: dict[ast.AST, ast.AST],
         for environment in environments:
             for row in rows:
                 assert isinstance(row, (ast.Tuple, ast.List))
-                values = [evaluator.evaluate(item, environment) for item in row.elts]
-                if any(not value.resolved for value in values):
-                    unresolved = next(value for value in values if not value.resolved)
-                    variant = dict(environment)
+                expanded.extend(_tuple_row_variants(row, loop.target, environment, evaluator))
+                if len(expanded) > MAX_VARIANTS:
+                    overflow = dict(base)
                     for target in loop.target.elts:
                         assert isinstance(target, ast.Name)
-                        variant[target.id] = unresolved
-                    expanded.append(variant)
-                    continue
-                for combination in itertools.product(*(value.strings for value in values)):
-                    variant = dict(environment)
-                    for target, value in zip(loop.target.elts, combination, strict=True):
-                        assert isinstance(target, ast.Name)
-                        variant[target.id] = Values(frozenset({value}))
-                    expanded.append(variant)
-                    if len(expanded) > MAX_VARIANTS:
-                        overflow = dict(base)
-                        for target in loop.target.elts:
-                            assert isinstance(target, ast.Name)
-                            overflow[target.id] = Values(reason="variant-overflow")
-                        return [overflow]
+                        overflow[target.id] = Values(reason="variant-overflow")
+                    return [overflow]
         environments = expanded
     return environments
 

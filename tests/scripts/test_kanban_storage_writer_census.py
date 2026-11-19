@@ -332,6 +332,28 @@ def write(conn):
     assert "unresolved-sql" in {problem["kind"] for problem in report["problems"]}
 
 
+def test_private_keyword_only_parameters_require_all_call_sites_to_be_finite(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+def _delete(conn, table, *, suffix=""):
+    statement = f"DELETE FROM {table}{suffix}"
+    conn.execute(statement)
+def write(conn):
+    _delete(conn, "task_links")
+    _delete(conn, "task_events", suffix=" WHERE id < 10")
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert {tuple(item["effects"]) for item in report["inventory"]} == {
+        ("task_events.delete",), ("task_links.delete",),
+    }
+    assert not [problem for problem in report["problems"] if problem["kind"] == "unresolved-sql"]
+
+
 def test_local_class_execute_receiver_is_not_a_database_sink(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": '''
@@ -494,6 +516,24 @@ def read(conn):
     assert result.returncode == 0
     assert report["inventory"] == []
     assert report["problems"] == []
+
+
+def test_correlated_tuple_loops_preserve_finite_fields_when_siblings_are_dynamic(tmp_path):
+    repo = _repo(tmp_path, {
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+def write(conn, dynamic_value):
+    for column, value in (("status", dynamic_value), ("priority", dynamic_value)):
+        conn.execute(f"UPDATE tasks SET {column} = ?", (value,))
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert len(report["inventory"]) == 1
+    assert report["inventory"][0]["effects"] == ["tasks.update.status"]
+    assert not [problem for problem in report["problems"] if problem["kind"] == "unresolved-sql"]
 
 
 def test_correlated_tuple_loop_targets_resolve_without_cross_products(tmp_path):
