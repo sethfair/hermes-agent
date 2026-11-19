@@ -42,6 +42,25 @@ class DispatchFailureRequest:
     authority_kind: str = "recovery"
 
 
+@dataclass(frozen=True)
+class StaleRunningRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    expected_run_id: int
+    claim_lock: Optional[str]
+    worker_pid: Optional[int]
+    elapsed_seconds: int
+    last_heartbeat_at: Optional[int]
+    heartbeat_age_seconds: Optional[int]
+    timeout_seconds: int
+    termination: dict[str, Any]
+    retry_status: str
+    error: str
+    operation_kind: str = "stale_running"
+    authority_kind: str = "recovery"
+
+
 def _state():
     from hermes_cli import kanban_db_task_state
 
@@ -99,6 +118,31 @@ def dispatch_failure_transition(
         task_id, actor_scope, operation_id, trigger_operation_id,
         expected_run_id, error[:500], outcome, retry_status, failure_limit, force_trip,
         event_payload_extra,
+    )
+    return _state()._run_operation(conn, request).outcome
+
+
+def stale_running_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+    expected_run_id: int,
+    claim_lock: Optional[str],
+    worker_pid: Optional[int],
+    elapsed_seconds: int,
+    last_heartbeat_at: Optional[int],
+    heartbeat_age_seconds: Optional[int],
+    timeout_seconds: int,
+    termination: dict[str, Any],
+    retry_status: str,
+    error: str,
+):
+    request = StaleRunningRequest(
+        task_id, actor_scope, operation_id, expected_run_id, claim_lock,
+        worker_pid, elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds,
+        timeout_seconds, termination, retry_status, error,
     )
     return _state()._run_operation(conn, request).outcome
 
@@ -255,3 +299,36 @@ def _apply_dispatch_failure(private: sqlite3.Connection, request):
     kb._append_event(private, request.task_id, "gave_up", payload)
     event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
     return _applied(_outcome(request, committed=True, event_id=event_id))
+
+
+def _apply_stale_running(private: sqlite3.Connection, request):
+    from hermes_cli import kanban_db as kb
+
+    updated = private.execute(
+        "UPDATE tasks SET status=?,claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,"
+        "worker_started_at=NULL,last_heartbeat_at=NULL "
+        "WHERE id=? AND status='running' AND current_run_id=? "
+        "AND claim_lock IS ? AND worker_pid IS ?",
+        (
+            request.retry_status, request.task_id, request.expected_run_id,
+            request.claim_lock, request.worker_pid,
+        ),
+    )
+    if updated.rowcount != 1:
+        return _applied(_outcome(request, committed=False, refusal="compare_and_set"))
+    payload = {
+        "elapsed_seconds": request.elapsed_seconds,
+        "last_heartbeat_at": request.last_heartbeat_at,
+        "heartbeat_age_seconds": request.heartbeat_age_seconds,
+        "timeout_seconds": request.timeout_seconds,
+        "pid": request.worker_pid,
+        "retry_status": request.retry_status,
+    }
+    payload.update(request.termination)
+    run_id = kb._end_run(
+        private, request.task_id, outcome="stale", status="stale",
+        error=request.error, metadata=payload,
+    )
+    kb._append_event(private, request.task_id, "stale", payload, run_id=run_id)
+    event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return _applied(_outcome(request, committed=True, event_id=event_id), hook_run_id=run_id)

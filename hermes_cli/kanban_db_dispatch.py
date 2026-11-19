@@ -804,7 +804,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "       t.current_run_id, COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -841,43 +841,37 @@ def detect_stale_running(
             )
             continue
 
-        with _kb.write_txn(conn):
-            # Again under the write lock, after the termination wait (see enforce_max_runtime).
-            if owner_reclaim_blocked_after_kill(conn, tid, signalled=bool(termination.get("termination_attempted"))):
-                continue
-            retry_status = _kb._retry_status_for_run(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
-                continue
-
-            payload = {
-                "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": _kb._opt_int(last_hb),
-                "heartbeat_age_seconds": _kb._opt_int(hb_age),
-                "timeout_seconds": stale_timeout_seconds,
-                "pid": int(pid) if pid else None,
-                "retry_status": retry_status,
-            }
-            payload.update(termination)
-
-            run_id = _kb._end_run(
-                conn, tid,
-                outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
-                metadata=payload,
-            )
-            _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
+        # Again after the termination wait (see enforce_max_runtime).
+        if owner_reclaim_blocked_after_kill(
+            conn, tid, signalled=bool(termination.get("termination_attempted")),
+        ):
+            continue
+        run_id = _kb._row_get(row, "current_run_id")
+        if run_id is None:
+            continue
+        retry_status = _kb._retry_status_for_run(conn, tid, run_id)
+        from hermes_cli import kanban_db_task_state as task_state
+        result = task_state.stale_running_transition(
+            conn,
+            tid,
+            actor_scope="dispatcher",
+            operation_id=f"stale-running:{tid}:{run_id}",
+            expected_run_id=int(run_id),
+            claim_lock=row["claim_lock"],
+            worker_pid=int(pid) if pid else None,
+            elapsed_seconds=int(elapsed),
+            last_heartbeat_at=_kb._opt_int(last_hb),
+            heartbeat_age_seconds=_kb._opt_int(hb_age),
+            timeout_seconds=stale_timeout_seconds,
+            termination=termination,
+            retry_status=retry_status,
+            error=(
+                f"no heartbeat for {int(hb_age)}s "
+                if hb_age is not None
+                else "no heartbeat ever"
+            ) + f" after {int(elapsed)}s running",
+        )
+        if result.committed:
             reclaimed.append(tid)
 
     return reclaimed

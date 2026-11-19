@@ -208,3 +208,45 @@ def test_failure_receipt_failure_keeps_timeout_but_rolls_back_accounting(board) 
     assert kbd._reconcile_pending_runtime_timeouts(board, failure_limit=3) == [task_id]
     task = kb.get_task(board, task_id)
     assert task is not None and task.status == "ready" and task.consecutive_failures == 1
+
+
+def test_stale_running_recovery_is_receipt_backed(board, monkeypatch) -> None:
+    task_id, run_id = _overrun(board)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    assert kbd.detect_stale_running(
+        board, stale_timeout_seconds=1, signal_fn=lambda *_args: None,
+    ) == [task_id]
+
+    task = kb.get_task(board, task_id)
+    run = kb.latest_run(board, task_id)
+    receipt = board.execute(
+        "SELECT operation_kind FROM task_transition_receipts "
+        "WHERE operation_id=?",
+        (f"stale-running:{task_id}:{run_id}",),
+    ).fetchone()
+    assert task is not None and task.status == "ready"
+    assert run is not None and run.outcome == "stale"
+    assert receipt is not None and receipt["operation_kind"] == "stale_running"
+
+
+def test_stale_receipt_failure_rolls_back_task_run_and_event(board, monkeypatch) -> None:
+    task_id, run_id = _overrun(board)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    before_events = list(kb.list_events(board, task_id))
+    board.execute(
+        "CREATE TRIGGER refuse_stale_receipt BEFORE INSERT ON task_transition_receipts "
+        "WHEN NEW.operation_kind='stale_running' "
+        "BEGIN SELECT RAISE(ABORT, 'forced stale receipt failure'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced stale receipt failure"):
+        kbd.detect_stale_running(
+            board, stale_timeout_seconds=1, signal_fn=lambda *_args: None,
+        )
+
+    task = kb.get_task(board, task_id)
+    run = kb.latest_run(board, task_id)
+    assert task is not None and task.status == "running" and task.current_run_id == run_id
+    assert run is not None and run.ended_at is None
+    assert list(kb.list_events(board, task_id)) == before_events

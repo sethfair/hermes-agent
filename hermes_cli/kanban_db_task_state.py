@@ -366,8 +366,7 @@ class _ReopenReviewRequest:
     operation_id: str
     operation_kind: str = "reopen_review"
     authority_kind: str = "lifecycle"
-_RuntimeTimeoutRequest = _recovery.RuntimeTimeoutRequest
-_DispatchFailureRequest = _recovery.DispatchFailureRequest
+
 
 
 _Request = (
@@ -389,8 +388,9 @@ _Request = (
     | _RequestReviewRequest
     | _RequestChangesRequest
     | _ReopenReviewRequest
-    | _RuntimeTimeoutRequest
-    | _DispatchFailureRequest
+    | _recovery.RuntimeTimeoutRequest
+    | _recovery.DispatchFailureRequest
+    | _recovery.StaleRunningRequest
 )
 
 
@@ -579,8 +579,9 @@ _REQUEST_HASHERS = {
     _RequestReviewRequest: _lifecycle_request_hash,
     _RequestChangesRequest: _lifecycle_request_hash,
     _ReopenReviewRequest: _lifecycle_request_hash,
-    _RuntimeTimeoutRequest: _create_request_hash,
-    _DispatchFailureRequest: _create_request_hash,
+    _recovery.RuntimeTimeoutRequest: _create_request_hash,
+    _recovery.DispatchFailureRequest: _create_request_hash,
+    _recovery.StaleRunningRequest: _create_request_hash,
 }
 
 
@@ -1504,10 +1505,6 @@ _apply_request_changes = _lifecycle._apply_request_changes
 _apply_reopen_review = _lifecycle._apply_reopen_review
 
 
-_apply_runtime_timeout = _recovery._apply_runtime_timeout
-_apply_dispatch_failure = _recovery._apply_dispatch_failure
-
-
 _OPERATION_HANDLERS = {
     _BlockRequest: _apply_block,
     _ClassifyBlockRequest: _apply_classify_block,
@@ -1525,8 +1522,9 @@ _OPERATION_HANDLERS = {
     _RequestReviewRequest: _apply_request_review,
     _RequestChangesRequest: _apply_request_changes,
     _ReopenReviewRequest: _apply_reopen_review,
-    _RuntimeTimeoutRequest: _apply_runtime_timeout,
-    _DispatchFailureRequest: _apply_dispatch_failure,
+    _recovery.RuntimeTimeoutRequest: _recovery._apply_runtime_timeout,
+    _recovery.DispatchFailureRequest: _recovery._apply_dispatch_failure,
+    _recovery.StaleRunningRequest: _recovery._apply_stale_running,
 }
 
 
@@ -1675,6 +1673,7 @@ reopen_review_task_transition = _lifecycle.reopen_review_task_transition
 
 runtime_timeout_transition = _recovery.runtime_timeout_transition
 dispatch_failure_transition = _recovery.dispatch_failure_transition
+stale_running_transition = _recovery.stale_running_transition
 
 
 def _compatibility_lifecycle_operation_id(kind: str, task_id: str) -> str:
