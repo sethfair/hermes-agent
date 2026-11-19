@@ -288,7 +288,16 @@ def _private_call_environment(function: ast.FunctionDef, tree: ast.Module,
     summary = _wrapper_summary(function)
     if not function.name.startswith("_") or not parameters or summary is None:
         return {}
-    relevant = _parameter_dependencies(summary[1], set(parameters), evaluator.assignments)
+    sql_nodes: list[ast.AST] = [
+        call.args[0] for call in ast.walk(function)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        and call.func.attr in _SINK_NAMES and call.args
+    ]
+    if summary[1] not in sql_nodes:
+        sql_nodes.append(summary[1])
+    relevant: set[str] = set()
+    for sql_node in sql_nodes:
+        relevant.update(_parameter_dependencies(sql_node, set(parameters), evaluator.assignments))
     if not relevant:
         return {}
     uses = name_uses.get(function.name, [])

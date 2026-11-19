@@ -304,6 +304,7 @@ def test_private_helper_parameters_require_all_call_sites_to_be_finite(tmp_path)
         "app/writers.py": '''
 from hermes_cli import kanban_db
 def _delete(conn, table):
+    conn.execute("SELECT 1")
     statement = f"DELETE FROM {table}"
     conn.execute(statement)
 def write(conn):
