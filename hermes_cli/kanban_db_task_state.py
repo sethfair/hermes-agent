@@ -18,6 +18,7 @@ from hermes_cli.kanban_task_state import (
     effective_block_identity,
     identity_event_fields,
 )
+from hermes_cli.kanban_dispatch_recovery import storage as _recovery
 
 _TUPLE_VERSION = 1
 _OPERATION_VERSION = 1
@@ -365,6 +366,8 @@ class _ReopenReviewRequest:
     operation_id: str
     operation_kind: str = "reopen_review"
     authority_kind: str = "lifecycle"
+_RuntimeTimeoutRequest = _recovery.RuntimeTimeoutRequest
+_DispatchFailureRequest = _recovery.DispatchFailureRequest
 
 
 _Request = (
@@ -386,6 +389,8 @@ _Request = (
     | _RequestReviewRequest
     | _RequestChangesRequest
     | _ReopenReviewRequest
+    | _RuntimeTimeoutRequest
+    | _DispatchFailureRequest
 )
 
 
@@ -574,6 +579,8 @@ _REQUEST_HASHERS = {
     _RequestReviewRequest: _lifecycle_request_hash,
     _RequestChangesRequest: _lifecycle_request_hash,
     _ReopenReviewRequest: _lifecycle_request_hash,
+    _RuntimeTimeoutRequest: _create_request_hash,
+    _DispatchFailureRequest: _create_request_hash,
 }
 
 
@@ -1497,6 +1504,10 @@ _apply_request_changes = _lifecycle._apply_request_changes
 _apply_reopen_review = _lifecycle._apply_reopen_review
 
 
+_apply_runtime_timeout = _recovery._apply_runtime_timeout
+_apply_dispatch_failure = _recovery._apply_dispatch_failure
+
+
 _OPERATION_HANDLERS = {
     _BlockRequest: _apply_block,
     _ClassifyBlockRequest: _apply_classify_block,
@@ -1514,6 +1525,8 @@ _OPERATION_HANDLERS = {
     _RequestReviewRequest: _apply_request_review,
     _RequestChangesRequest: _apply_request_changes,
     _ReopenReviewRequest: _apply_reopen_review,
+    _RuntimeTimeoutRequest: _apply_runtime_timeout,
+    _DispatchFailureRequest: _apply_dispatch_failure,
 }
 
 
@@ -1658,6 +1671,10 @@ complete_task_transition = _lifecycle.complete_task_transition
 request_review_transition = _lifecycle.request_review_transition
 request_changes_transition = _lifecycle.request_changes_transition
 reopen_review_task_transition = _lifecycle.reopen_review_task_transition
+
+
+runtime_timeout_transition = _recovery.runtime_timeout_transition
+dispatch_failure_transition = _recovery.dispatch_failure_transition
 
 
 def _compatibility_lifecycle_operation_id(kind: str, task_id: str) -> str:

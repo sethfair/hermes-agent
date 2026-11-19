@@ -357,6 +357,10 @@ def _protected_connection(path: str | Path, *, operation: str):
             "tasks", "task_runs", "task_events", "task_attachments",
             "task_transition_receipts", "kanban_claim_admissions", "kanban_writer_faults",
         },
+        "recovery": {
+            "tasks", "task_runs", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
     }.get(operation, set())
     schema_actions = {
         sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_ALTER_TABLE,

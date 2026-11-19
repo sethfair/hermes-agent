@@ -30,6 +30,9 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
+from hermes_cli.kanban_dispatch_recovery.storage import (
+    reconcile_pending_runtime_timeouts as _reconcile_pending_runtime_timeouts,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -681,12 +684,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
     """
+    _reconcile_pending_runtime_timeouts(conn, failure_limit=DEFAULT_FAILURE_LIMIT)
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -732,51 +736,47 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
-        with _kb.write_txn(conn):
-            # Again under the write lock, after the kill wait: an interpreter that bound
-            # meanwhile is invisible to the pid/claim CAS below. Host-local by the filter above.
-            if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
-                continue
-            retry_status = _kb._retry_status_for_run(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
-            )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": limit,
-                    "sigkill": killed,
-                    "retry_status": retry_status,
-                }
-                run_id = _kb._end_run(
-                    conn, tid, outcome="timed_out", status="timed_out",
-                    error=error, metadata=payload,
-                )
-                _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
-                timed_out.append(tid)
-        # Outside the write_txn above because ``_record_task_failure`` opens its
-        # own. If the breaker trips this flips the task to ``blocked`` and emits
-        # ``gave_up`` on top of the ``timed_out`` already emitted.
-        if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=error,
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
-            )
+        # Again after the kill wait: owner evidence may have changed while no board lock was held.
+        if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
+            continue
+        run_id = _kb._row_get(row, "current_run_id")
+        if run_id is None:
+            continue
+        retry_status = _kb._retry_status_for_run(conn, tid, run_id)
+        from hermes_cli import kanban_db_task_state as task_state
+        recovery_operation_id = f"runtime-timeout:{tid}:{run_id}"
+        recovered = task_state.runtime_timeout_transition(
+            conn, tid,
+            actor_scope="dispatcher",
+            operation_id=recovery_operation_id,
+            expected_run_id=int(run_id),
+            worker_pid=pid,
+            claim_lock=row["claim_lock"],
+            elapsed_seconds=int(elapsed),
+            limit_seconds=limit,
+            sigkill=killed,
+            retry_status=retry_status,
+            error=error,
+        )
+        if not recovered.committed:
+            continue
+        timed_out.append(tid)
+        task_state.dispatch_failure_transition(
+            conn, tid,
+            actor_scope="dispatcher",
+            operation_id=f"dispatch-failure:timed-out:{tid}:{run_id}",
+            trigger_operation_id=recovery_operation_id,
+            expected_run_id=int(run_id),
+            error=error,
+            outcome="timed_out",
+            retry_status=retry_status,
+            failure_limit=DEFAULT_FAILURE_LIMIT,
+            event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+        )
     return timed_out
 
 
 # A running task with no heartbeat for this long is inactive regardless of
-# ``dispatch_stale_timeout_seconds`` (spec: ">4h started + no commits in 1h").
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
