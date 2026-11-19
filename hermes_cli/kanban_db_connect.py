@@ -346,8 +346,8 @@ def _protected_connection(path: str | Path, *, operation: str):
             "kanban_ready_state", "kanban_ready_episodes",
         },
         "graph": {
-            "tasks", "task_links", "task_events", "task_transition_receipts",
-            "kanban_notify_subs", "kanban_claim_admissions", "kanban_writer_faults",
+            "tasks", "task_links", "task_comments", "task_events",
+            "task_transition_receipts", "kanban_notify_subs", "kanban_claim_admissions", "kanban_writer_faults",
         },
         "create": {
             "tasks", "task_runs", "task_links", "task_comments", "task_events",

@@ -1313,13 +1313,6 @@ def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -
         return None
 
 
-def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-        (parent_id, child_id),
-    )
-
-
 def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
     """Subset of ``ids`` (order kept) with no ``tasks`` row."""
     ids = list(ids)

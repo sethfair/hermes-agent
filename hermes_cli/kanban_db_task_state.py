@@ -94,6 +94,16 @@ class SwarmTransitionOutcome:
     refusal: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class DecomposeTransitionOutcome:
+    committed: bool
+    operation_id: str
+    task_id: str
+    child_ids: tuple[str, ...]
+    event_id: Optional[int] = None
+    refusal: Optional[str] = None
+
+
 BlockTransitionOutcome = TransitionOutcome
 
 
@@ -282,6 +292,20 @@ class _SwarmRequest:
     authority_kind: str = "create"
 
 
+@dataclass(frozen=True)
+class _DecomposeRequest:
+    task_id: str
+    actor_scope: str
+    operation_id: str
+    root_assignee: Optional[str]
+    children: tuple[dict[str, Any], ...]
+    child_ids: tuple[str, ...]
+    author: Optional[str]
+    created_at: int
+    operation_kind: str = "decompose"
+    authority_kind: str = "graph"
+
+
 _Request = (
     _BlockRequest
     | _ClassifyBlockRequest
@@ -296,6 +320,7 @@ _Request = (
     | _ReadinessRequest
     | _CreateRequest
     | _SwarmRequest
+    | _DecomposeRequest
 )
 
 
@@ -468,6 +493,7 @@ _REQUEST_HASHERS = {
     _ReadinessRequest: _readiness_request_hash,
     _CreateRequest: _create_request_hash,
     _SwarmRequest: _create_request_hash,
+    _DecomposeRequest: _create_request_hash,
 }
 
 
@@ -1701,6 +1727,123 @@ def _apply_swarm_create(
     ))
 
 
+def _apply_decompose(
+    private: sqlite3.Connection, request: _DecomposeRequest,
+) -> _AppliedTransition:
+    from hermes_cli import kanban_db as kb
+
+    if len(request.children) != len(request.child_ids):
+        raise ValueError("child_ids must match children")
+    if len(set(request.child_ids)) != len(request.child_ids):
+        raise ValueError("child_ids must be unique")
+    if kb._has_unknown_block_identity(private, request.task_id):
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="unknown_block_identity"
+        ))
+    root = private.execute(
+        "SELECT id,status,tenant,workspace_kind,workspace_path,project_id "
+        "FROM tasks WHERE id=?", (request.task_id,),
+    ).fetchone()
+    if root is None or root["status"] != "triage":
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="not_triage"
+        ))
+    if private.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='decomposed' LIMIT 1",
+        (request.task_id,),
+    ).fetchone():
+        return _AppliedTransition(TransitionOutcome(
+            False, request.operation_id, refusal="already_decomposed"
+        ))
+
+    for child_id, child in zip(request.child_ids, request.children):
+        root_kind = root["workspace_kind"] or "scratch"
+        child_kind = child.get("workspace_kind") or root_kind
+        if child.get("workspace_path"):
+            child_path = child.get("workspace_path")
+        elif child_kind == "worktree":
+            child_path = None
+        elif child_kind == root_kind:
+            child_path = root["workspace_path"]
+        else:
+            child_path = None
+        body = child.get("body")
+        private.execute(
+            "INSERT INTO tasks (id,title,body,assignee,status,workspace_kind,"
+            "workspace_path,tenant,created_at,created_by,session_id) "
+            "VALUES (?,?,?,?, 'todo',?,?,?,?,?,"
+            "(SELECT session_id FROM tasks WHERE id=?))",
+            (
+                child_id, child["title"].strip(),
+                body if isinstance(body, str) else None,
+                kb._canonical_assignee(child.get("assignee")),
+                child_kind, child_path, root["tenant"],
+                request.created_at, request.author or "decomposer", request.task_id,
+            ),
+        )
+        kb._append_event(
+            private,
+            child_id,
+            "created",
+            {"by": request.author or "decomposer",
+             "from_decompose_of": request.task_id},
+        )
+        kb._inherit_notify_subs(
+            private, child_id, (request.task_id,), created_at=request.created_at
+        )
+
+    for index, child in enumerate(request.children):
+        for parent_index in child.get("parents") or []:
+            parent_id = request.child_ids[parent_index]
+            child_id = request.child_ids[index]
+            private.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id,child_id) VALUES (?,?)",
+                (parent_id, child_id),
+            )
+            kb._append_event(
+                private, child_id, "linked",
+                {"parent": parent_id, "child": child_id},
+            )
+    for child_id in request.child_ids:
+        private.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id,child_id) VALUES (?,?)",
+            (child_id, request.task_id),
+        )
+    if request.root_assignee is None:
+        private.execute(
+            "UPDATE tasks SET status='todo' WHERE id=? AND status='triage'",
+            (request.task_id,),
+        )
+    else:
+        private.execute(
+            "UPDATE tasks SET status='todo',assignee=? "
+            "WHERE id=? AND status='triage'",
+            (request.root_assignee, request.task_id),
+        )
+    if request.author and request.author.strip():
+        private.execute(
+            "INSERT INTO task_comments (task_id,author,body,created_at) VALUES (?,?,?,?)",
+            (
+                request.task_id,
+                request.author.strip(),
+                "Decomposed into " + ", ".join(request.child_ids)
+                + ". Root will wake when all children complete.",
+                request.created_at,
+            ),
+        )
+    kb._append_event(
+        private,
+        request.task_id,
+        "decomposed",
+        {"child_ids": list(request.child_ids),
+         "root_assignee": request.root_assignee},
+    )
+    event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return _AppliedTransition(TransitionOutcome(
+        True, request.operation_id, event_id, "none"
+    ))
+
+
 _OPERATION_HANDLERS = {
     _BlockRequest: _apply_block,
     _ClassifyBlockRequest: _apply_classify_block,
@@ -1713,6 +1856,7 @@ _OPERATION_HANDLERS = {
     _UnlinkRequest: _apply_unlink,
     _CreateRequest: _apply_create,
     _SwarmRequest: _apply_swarm_create,
+    _DecomposeRequest: _apply_decompose,
 }
 
 
@@ -1927,6 +2071,32 @@ def create_swarm_transition(
         worker_ids,
         verifier_id,
         synthesizer_id,
+        result.outcome.event_id,
+        result.outcome.refusal,
+    )
+
+
+def decompose_task_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_scope: str,
+    operation_id: str,
+    root_assignee: Optional[str],
+    children: tuple[dict[str, Any], ...],
+    child_ids: tuple[str, ...],
+    author: Optional[str],
+) -> DecomposeTransitionOutcome:
+    request = _DecomposeRequest(
+        task_id, actor_scope, operation_id, root_assignee, children,
+        child_ids, author, int(time.time()),
+    )
+    result = _run_operation(conn, request)
+    return DecomposeTransitionOutcome(
+        result.outcome.committed,
+        operation_id,
+        task_id,
+        child_ids,
         result.outcome.event_id,
         result.outcome.refusal,
     )
