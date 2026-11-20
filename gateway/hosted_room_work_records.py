@@ -22,6 +22,21 @@ SOURCE_TABLE = "hosted_room_work_records_source"
 TARGET_TABLE = "hosted_room_work_records_target"
 PENDING_TABLE = "hosted_room_work_records_pending"
 BLOCKED_DELIVERY_STATUSES = {"rejected", "needs_reauthorization", "invalid_ack", "unsupported_lineage", "invalid_work_evidence"}
+_SOURCE_ROW_SIZE_SQL = (
+    "20+COALESCE(length(CAST(room_id AS BLOB)),0)+COALESCE(length(CAST(revision AS BLOB)),0)"
+    "+COALESCE(length(CAST(digest AS BLOB)),0)+COALESCE(length(CAST(record_json AS BLOB)),0)"
+    "+COALESCE(length(CAST(producer_gateway_id AS BLOB)),0)+COALESCE(length(CAST(producer_epoch AS BLOB)),0)"
+)
+_PENDING_ROW_SIZE_SQL = (
+    _SOURCE_ROW_SIZE_SQL + "+COALESCE(length(CAST(target_install_id AS BLOB)),0)"
+    "+COALESCE(length(CAST(route_generation AS BLOB)),0)+COALESCE(length(CAST(status AS BLOB)),0)"
+)
+_INVALID_ROW_SIZE_SQL = (
+    "20+COALESCE(length(CAST(room_id AS BLOB)),0)+COALESCE(length(CAST(revision AS BLOB)),0)"
+    "+COALESCE(length(CAST(digest AS BLOB)),0)+COALESCE(length(CAST(record_json AS BLOB)),0)"
+    "+COALESCE(length(CAST(source_table AS BLOB)),0)+COALESCE(length(CAST(target_install_id AS BLOB)),0)"
+    "+COALESCE(length(CAST(route_generation AS BLOB)),0)+COALESCE(length(CAST(status AS BLOB)),0)"
+)
 LIMITATIONS = ["process_local_approvals_not_captured", "field_journals_not_captured",
                "external_effects_not_captured", "absent_record_is_not_non_admission", "not_execution_checkpoint"]
 _PHASES = {"queued", "running", "indeterminate", "stopping", "deferred", "settled", "failed", "cancelled"}
@@ -181,16 +196,42 @@ def initialize(conn: sqlite3.Connection) -> None:
 
 
 def _budget(conn, table, proposed):
-    total_sql, count_sql = storage.usage_sql((SOURCE_TABLE, PENDING_TABLE, storage.INVALID_TABLE))
-    total, count = conn.execute(f"SELECT {total_sql}, {count_sql}").fetchone()
-    keys = ["room_id", "producer_gateway_id", "producer_epoch"]
-    if table == PENDING_TABLE:
-        keys.append("target_install_id")
-    where = " AND ".join(f"{k}=?" for k in keys)
-    old = conn.execute(f"SELECT {storage.row_size_sql(table)} FROM {table} WHERE {where}",
-                       [proposed[k] for k in keys]).fetchone()
-    size = conn.execute(f"SELECT {storage.row_size_sql(table)} FROM (SELECT "
-                        + ",".join(f"? AS {k}" for k in proposed) + ")", tuple(proposed.values())).fetchone()[0]
+    total, count = conn.execute(
+        f"SELECT (SELECT COALESCE(SUM({_SOURCE_ROW_SIZE_SQL}),0) FROM hosted_room_work_records_source) + "
+        f"(SELECT COALESCE(SUM({_PENDING_ROW_SIZE_SQL}),0) FROM hosted_room_work_records_pending) + "
+        f"(SELECT COALESCE(SUM({_INVALID_ROW_SIZE_SQL}),0) FROM hosted_room_work_records_invalid), "
+        "(SELECT COUNT(*) FROM hosted_room_work_records_source) + "
+        "(SELECT COUNT(*) FROM hosted_room_work_records_pending) + "
+        "(SELECT COUNT(*) FROM hosted_room_work_records_invalid)"
+    ).fetchone()
+    if table == SOURCE_TABLE:
+        keys = ("room_id", "producer_gateway_id", "producer_epoch")
+        old = conn.execute(
+            f"SELECT {_SOURCE_ROW_SIZE_SQL} FROM hosted_room_work_records_source "
+            "WHERE room_id=? AND producer_gateway_id=? AND producer_epoch=?",
+            tuple(proposed[key] for key in keys),
+        ).fetchone()
+        size = conn.execute(
+            f"SELECT {_SOURCE_ROW_SIZE_SQL} FROM (SELECT ? AS room_id,? AS revision,? AS digest,? AS record_json,"
+            "? AS producer_gateway_id,? AS producer_epoch)",
+            tuple(proposed[key] for key in ("room_id", "revision", "digest", "record_json",
+                                            "producer_gateway_id", "producer_epoch")),
+        ).fetchone()[0]
+    elif table == PENDING_TABLE:
+        keys = ("room_id", "producer_gateway_id", "producer_epoch", "target_install_id")
+        old = conn.execute(
+            f"SELECT {_PENDING_ROW_SIZE_SQL} FROM hosted_room_work_records_pending "
+            "WHERE room_id=? AND producer_gateway_id=? AND producer_epoch=? AND target_install_id=?",
+            tuple(proposed[key] for key in keys),
+        ).fetchone()
+        size = conn.execute(
+            f"SELECT {_PENDING_ROW_SIZE_SQL} FROM (SELECT ? AS room_id,? AS revision,? AS digest,? AS record_json,"
+            "? AS producer_gateway_id,? AS producer_epoch,? AS target_install_id,? AS route_generation,? AS status)",
+            tuple(proposed[key] for key in ("room_id", "revision", "digest", "record_json", "producer_gateway_id",
+                                            "producer_epoch", "target_install_id", "route_generation", "status")),
+        ).fetchone()[0]
+    else:
+        raise WorkRecordError("unsupported work-record budget table")
     if total - (old[0] if old else 0) + size > MAX_STORE_BYTES or count - bool(old) + 1 > MAX_STORE_ROWS:
         raise WorkRecordCapacityError("work record storage is full")
 
