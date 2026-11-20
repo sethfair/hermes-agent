@@ -538,6 +538,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    block_subject: Optional[str] = None
     # Handoff fields forwarded to complete_task on -> 'done' (parity with ``hermes kanban complete``).
     summary: Optional[str] = None
     metadata: Optional[dict] = None
@@ -560,6 +562,9 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    block_subject: Optional[str] = None
     reclaim_first: bool = False
     # Same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -588,13 +593,32 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     return _set_status_direct(conn, task_id, s)
 
 
+def _block_from_dashboard(conn, tid: str, p) -> bool:
+    current = kanban_db.get_task(conn, tid)
+    kind = getattr(p, "block_kind", None)
+    subject = getattr(p, "block_subject", None)
+    if current is not None and current.status == "blocked" and kind and subject:
+        return kanban_db.classify_block(
+            conn, tid, kind=kind, subject=subject, actor="dashboard"
+        )
+    if kind or subject:
+        if not (kind and subject):
+            raise ValueError("block_kind and block_subject must be provided together")
+        return kanban_db.block_task_transition(
+            conn, tid, actor_scope="dashboard",
+            operation_id=f"dashboard-block:{tid}:{time.time_ns()}",
+            reason=getattr(p, "block_reason", None), kind=kind, subject=subject,
+        ).committed
+    return kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None))
+
+
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "blocked": _block_from_dashboard,
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
@@ -639,6 +663,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
+    assert s is not None
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
@@ -668,23 +693,19 @@ def _open_parent_refusal(conn, task_id: str, s: str) -> Optional[str]:
 
 
 def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Optional[str]) -> None:
-    """PATCH title/body phase: one UPDATE + ``edited`` event, then the post-commit observer
-    (field names only — values never leave the DB via this payload)."""
-    with kanban_db.write_txn(conn):
-        sets, vals = [], []
-        if payload.title is not None:
-            if not payload.title.strip():
-                raise HTTPException(status_code=400, detail="title cannot be empty")
-            sets.append("title = ?")
-            vals.append(payload.title.strip())
-        if payload.body is not None:
-            sets.append("body = ?")
-            vals.append(payload.body)
-        vals.append(task_id)
-        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'edited', NULL, ?)",
-            (task_id, int(time.time())))
+    """PATCH title/body through one receipt-backed operation, then notify observers."""
+    try:
+        edited = kanban_db.edit_task_fields(
+            conn,
+            task_id,
+            title=payload.title,
+            body=payload.body,
+            actor_scope="dashboard",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not edited:
+        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
     kanban_db.notify_task_updated(
         conn, task_id, [f for f in ("title", "body") if getattr(payload, f) is not None], board=board)
 
@@ -696,11 +717,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
+        if payload.status is not None:
+            _patch_status(conn, task_id, payload, review_assignee_deferred)
+        elif payload.block_kind is not None or payload.block_subject is not None:
+            with _map_errors(400, ValueError):
+                _require_ok(_block_from_dashboard(conn, task_id, payload))
         if payload.assignee is not None and not review_assignee_deferred:
             with _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
-        if payload.status is not None:
-            _patch_status(conn, task_id, payload, review_assignee_deferred)
         for wanted, apply, _refused in _OVERRIDE_OPS:
             if wanted(payload):
                 with _map_errors(400, ValueError, RuntimeError):
@@ -740,56 +764,8 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
 
 
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
-    """Direct status write for drag-drop moves without a structured verb (todo<->ready,
-    running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
-    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
-    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
-    effective_status = new_status
-    with kanban_db.write_txn(conn):
-        prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,)).fetchone()
-        if prev is None:
-            return False
-        if prev["status"] == "running" and new_status == "ready":
-            resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
-            if resume_status == "review":
-                effective_status = "review" if kanban_db._parents_satisfied(conn, task_id) else "todo"
-        # Never promote to 'ready' unless all parents are done/archived — otherwise the
-        # dispatcher spawns a child whose upstream work hasn't completed.
-        if effective_status == "ready" and not kanban_db._parents_satisfied(conn, task_id):
-            return False
-        was_running = prev["status"] == "running"
-        reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, "
-            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (effective_status,) * 4 + (task_id,))
-        if cur.rowcount != 1:
-            return False
-        run_id = None
-        if was_running and effective_status != "running" and prev["current_run_id"]:
-            run_id = kanban_db._end_run(
-                conn, task_id, outcome="reclaimed", status="reclaimed",
-                summary=f"status changed to {effective_status} (dashboard/direct)")
-            terminations.append((prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"]))
-        conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
-        if reopening_satisfied_parent:
-            # Domain-layer invalidation composes via a savepoint inside our txn and hands
-            # back worker terminations to perform post-commit.
-            result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
-            terminations.extend(result["terminations"])
-    for pid, claim_lock, started_at in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
-    # Re-opening something may have made children stale.
-    if effective_status in {"done", "ready", "review"}:
-        kanban_db.recompute_ready(conn)
-    return True
+    """Route dashboard drag/drop fallback moves through the typed storage boundary."""
+    return kanban_db.direct_status(conn, task_id, new_status, actor_scope="dashboard")
 
 
 # --- Comments / links -------------------------------------------------------
@@ -832,10 +808,12 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
+        return
     if payload.status is not None and not payload.archive:
         s = payload.status
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
             entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
+            return
     if payload.assignee is not None:
         try:
             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first

@@ -251,6 +251,22 @@ def test_workspaces_are_never_exported(kanban_root, tmp_path):
     assert not any("workspaces" in name for name in names)
 
 
+def test_export_backup_source_is_opened_read_only(kanban_root, tmp_path, monkeypatch):
+    _seed_board()
+    modes = []
+    original = kbc._sqlite_connect
+
+    def tracked(path, **kwargs):
+        modes.append(kwargs.get("read_only", False))
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(kbc, "_sqlite_connect", tracked)
+
+    kt.export_board("alpha", str(tmp_path / "alpha"))
+
+    assert modes == [True, False]
+
+
 # ---------------------------------------------------------------------------
 # Machine-local state does not travel
 # ---------------------------------------------------------------------------
@@ -355,6 +371,24 @@ def test_authenticated_archive_rejects_board_rebinding_without_partial_import(
     assert not kb.board_dir(target).exists()
     if mode == "collision":
         assert kb.read_board_metadata("alpha")["name"] == "Existing Alpha"
+
+
+def test_relocation_failure_never_publishes_a_partial_board(
+    kanban_root, tmp_path, monkeypatch
+):
+    _seed_board()
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+
+    kanban_root("target")
+
+    def fail_relocation(*_args, **_kwargs):
+        raise RuntimeError("forced relocation failure")
+
+    monkeypatch.setattr(kt, "_relocate_imported_rows", fail_relocation)
+    with pytest.raises(RuntimeError, match="forced relocation failure"):
+        kt.import_board(archive)
+
+    assert not kb.board_dir("alpha").exists()
 
 
 @pytest.mark.parametrize("table", kt._AUTHENTICATED_BOARD_TABLES)

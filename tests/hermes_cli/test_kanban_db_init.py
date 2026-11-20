@@ -89,7 +89,12 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert "delivery_metadata" in lei
 
         # Data preserved across the rebuild.
-        assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
+        events = conn.execute("SELECT kind FROM task_events ORDER BY id").fetchall()
+        assert [row["kind"] for row in events] == [
+            "completed",
+            "blocked",
+            "block_identity_migrated",
+        ]
         assert conn.execute("SELECT body FROM task_comments").fetchone()["body"] == "hi"
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
         # Non-numeric legacy cursor ("e-1") casts to 0.
@@ -120,7 +125,12 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
     with kbc.connect(db_path) as conn:
         id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}["id"]
         assert id_col["type"].upper() == "INTEGER"
-        assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
+        events = conn.execute("SELECT kind FROM task_events ORDER BY id").fetchall()
+        assert [row["kind"] for row in events] == [
+            "completed",
+            "blocked",
+            "block_identity_migrated",
+        ]
 
 
 

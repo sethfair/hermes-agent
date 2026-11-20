@@ -1,0 +1,1 @@
+"""Typed storage operations for dispatcher recovery."""

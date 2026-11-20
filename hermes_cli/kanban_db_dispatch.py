@@ -30,6 +30,9 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
+from hermes_cli.kanban_dispatch_recovery.storage import (
+    reconcile_pending_runtime_timeouts as _reconcile_pending_runtime_timeouts,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -681,12 +684,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
     """
+    _reconcile_pending_runtime_timeouts(conn, failure_limit=DEFAULT_FAILURE_LIMIT)
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -732,51 +736,47 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
-        with _kb.write_txn(conn):
-            # Again under the write lock, after the kill wait: an interpreter that bound
-            # meanwhile is invisible to the pid/claim CAS below. Host-local by the filter above.
-            if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
-                continue
-            retry_status = _kb._retry_status_for_run(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
-            )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": limit,
-                    "sigkill": killed,
-                    "retry_status": retry_status,
-                }
-                run_id = _kb._end_run(
-                    conn, tid, outcome="timed_out", status="timed_out",
-                    error=error, metadata=payload,
-                )
-                _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
-                timed_out.append(tid)
-        # Outside the write_txn above because ``_record_task_failure`` opens its
-        # own. If the breaker trips this flips the task to ``blocked`` and emits
-        # ``gave_up`` on top of the ``timed_out`` already emitted.
-        if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=error,
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
-            )
+        # Again after the kill wait: owner evidence may have changed while no board lock was held.
+        if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
+            continue
+        run_id = _kb._row_get(row, "current_run_id")
+        if run_id is None:
+            continue
+        retry_status = _kb._retry_status_for_run(conn, tid, run_id)
+        from hermes_cli import kanban_db_task_state as task_state
+        recovery_operation_id = f"runtime-timeout:{tid}:{run_id}"
+        recovered = task_state.runtime_timeout_transition(
+            conn, tid,
+            actor_scope="dispatcher",
+            operation_id=recovery_operation_id,
+            expected_run_id=int(run_id),
+            worker_pid=pid,
+            claim_lock=row["claim_lock"],
+            elapsed_seconds=int(elapsed),
+            limit_seconds=limit,
+            sigkill=killed,
+            retry_status=retry_status,
+            error=error,
+        )
+        if not recovered.committed:
+            continue
+        timed_out.append(tid)
+        task_state.dispatch_failure_transition(
+            conn, tid,
+            actor_scope="dispatcher",
+            operation_id=f"dispatch-failure:timed-out:{tid}:{run_id}",
+            trigger_operation_id=recovery_operation_id,
+            expected_run_id=int(run_id),
+            error=error,
+            outcome="timed_out",
+            retry_status=retry_status,
+            failure_limit=DEFAULT_FAILURE_LIMIT,
+            event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+        )
     return timed_out
 
 
 # A running task with no heartbeat for this long is inactive regardless of
-# ``dispatch_stale_timeout_seconds`` (spec: ">4h started + no commits in 1h").
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
@@ -804,7 +804,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "       t.current_run_id, COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -841,43 +841,37 @@ def detect_stale_running(
             )
             continue
 
-        with _kb.write_txn(conn):
-            # Again under the write lock, after the termination wait (see enforce_max_runtime).
-            if owner_reclaim_blocked_after_kill(conn, tid, signalled=bool(termination.get("termination_attempted"))):
-                continue
-            retry_status = _kb._retry_status_for_run(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
-                continue
-
-            payload = {
-                "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": _kb._opt_int(last_hb),
-                "heartbeat_age_seconds": _kb._opt_int(hb_age),
-                "timeout_seconds": stale_timeout_seconds,
-                "pid": int(pid) if pid else None,
-                "retry_status": retry_status,
-            }
-            payload.update(termination)
-
-            run_id = _kb._end_run(
-                conn, tid,
-                outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
-                metadata=payload,
-            )
-            _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
+        # Again after the termination wait (see enforce_max_runtime).
+        if owner_reclaim_blocked_after_kill(
+            conn, tid, signalled=bool(termination.get("termination_attempted")),
+        ):
+            continue
+        run_id = _kb._row_get(row, "current_run_id")
+        if run_id is None:
+            continue
+        retry_status = _kb._retry_status_for_run(conn, tid, run_id)
+        from hermes_cli import kanban_db_task_state as task_state
+        result = task_state.stale_running_transition(
+            conn,
+            tid,
+            actor_scope="dispatcher",
+            operation_id=f"stale-running:{tid}:{run_id}",
+            expected_run_id=int(run_id),
+            claim_lock=row["claim_lock"],
+            worker_pid=int(pid) if pid else None,
+            elapsed_seconds=int(elapsed),
+            last_heartbeat_at=_kb._opt_int(last_hb),
+            heartbeat_age_seconds=_kb._opt_int(hb_age),
+            timeout_seconds=stale_timeout_seconds,
+            termination=termination,
+            retry_status=retry_status,
+            error=(
+                f"no heartbeat for {int(hb_age)}s "
+                if hb_age is not None
+                else "no heartbeat ever"
+            ) + f" after {int(elapsed)}s running",
+        )
+        if result.committed:
             reclaimed.append(tid)
 
     return reclaimed
@@ -896,7 +890,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at, current_run_id FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
@@ -913,40 +907,28 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
-        with _kb.write_txn(conn):
-            if owner_reclaim_blocked(conn, tid):
-                continue
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
-            )
-            if cur.rowcount != 1:
-                continue
-            payload = {
-                "reason": "orphaned_running",
-                "claim_lock": row["claim_lock"],
-                "claim_expires": _kb._to_epoch(row["claim_expires"]),
-                "worker_pid": int(pid) if pid else None,
-                "now": now,
-            }
-            run_id = _kb._end_run(
-                conn, tid,
-                outcome="reclaimed", status="reclaimed",
-                error="orphaned running card (broken claim bookkeeping)",
-                metadata=payload,
-            )
-            _kb._insert_comment(
-                conn, tid, "dispatcher",
-                "reconciliation: card was 'running' with no valid claim "
-                "(dead/gone worker) — requeued to ready",
-                now,
-            )
-            _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
-            reconciled.append(tid)
+        if owner_reclaim_blocked(conn, tid):
+            continue
+        run_id = _kb._row_get(row, "current_run_id")
+        retry_status = _kb._retry_status_for_run(conn, tid, run_id)
+        from hermes_cli import kanban_db_task_state as task_state
+        operation_suffix = str(run_id) if run_id is not None else f"no-run:{now}"
+        result = task_state.orphan_running_transition(
+            conn,
+            tid,
+            actor_scope="dispatcher",
+            operation_id=f"orphan-running:{tid}:{operation_suffix}",
+            expected_run_id=int(run_id) if run_id is not None else None,
+            claim_lock=row["claim_lock"],
+            claim_expires=row["claim_expires"],
+            worker_pid=int(pid) if pid else None,
+            now=now,
+            retry_status=retry_status,
+            error="orphaned running card (broken claim bookkeeping)",
+        )
+        if not result.committed:
+            continue
+        reconciled.append(tid)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
@@ -1188,7 +1170,7 @@ class _CrashSweep:
     rate_limited: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
-    crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
+    crash_details: list[tuple[str, int, str, int, _DeadWorker]] = field(default_factory=list)
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
     exited_hook_payloads: list[dict] = field(default_factory=list)
@@ -1197,78 +1179,61 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
-    with _kb.write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
-        for row in rows:
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
-            if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
-                continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
-                continue
-            # An ambiguous receipt holds the card while the attempt may still run; once nothing
-            # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
-            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
-                continue
-
-            pid = int(row["worker_pid"])
-            # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
-            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
-            apply_attempt_note(conn, row["id"], pid, dead)
-            retry_status = _kb._retry_status_for_run(conn, row["id"])
-            dead.event_payload["retry_status"] = retry_status
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
-                continue
-            run_id = _kb._end_run(
-                conn, row["id"],
-                outcome=dead.run_outcome, status=dead.run_outcome,
-                error=dead.error_text,
-                metadata=dict(dead.event_payload),
-            )
-            _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
-            sweep.exited_hook_payloads.append({
-                "task_id": row["id"],
-                "assignee": row["assignee"],
-                "run_id": run_id,
-                "worker_pid": pid,
-                "exit_kind": dead.kind,
-                "exit_code": dead.code,
-                "outcome": dead.run_outcome,
-                "retry_status": retry_status,
-            })
-            if dead.rate_limited or dead.protocol_violation:
-                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
-                # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
-                conn.execute(
-                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                    (dead.error_text[:500], row["id"]),
-                )
-            if dead.rate_limited:
-                sweep.rate_limited.append(row["id"])
-            else:
-                sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+    rows = conn.execute(
+        "SELECT id,worker_pid,worker_started_at,claim_lock,started_at,assignee,current_run_id "
+        "FROM tasks WHERE status='running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    host_prefix = _kb._host_prefix()
+    from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+    from hermes_cli import kanban_db_task_state as task_state
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
+        if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
+            continue
+        if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+            continue
+        if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+            continue
+        run_id = _kb._row_get(row, "current_run_id")
+        if run_id is None:
+            continue
+        pid = int(row["worker_pid"])
+        exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
+        dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+        apply_attempt_note(conn, row["id"], pid, dead)
+        retry_status = _kb._retry_status_for_run(conn, row["id"], run_id)
+        dead.event_payload["retry_status"] = retry_status
+        recovered = task_state.dead_worker_transition(
+            conn,
+            row["id"],
+            actor_scope="dispatcher",
+            operation_id=f"dead-worker:{row['id']}:{run_id}",
+            expected_run_id=int(run_id),
+            worker_pid=pid,
+            claim_lock=row["claim_lock"],
+            assignee=row["assignee"],
+            retry_status=retry_status,
+            run_outcome=dead.run_outcome,
+            event_kind=dead.event_kind,
+            event_payload=dict(dead.event_payload),
+            error=dead.error_text,
+            rate_limited=dead.rate_limited,
+        )
+        if not recovered.committed:
+            continue
+        sweep.exited_hook_payloads.append({
+            "task_id": row["id"], "assignee": row["assignee"], "run_id": run_id,
+            "worker_pid": pid, "exit_kind": dead.kind, "exit_code": dead.code,
+            "outcome": dead.run_outcome, "retry_status": retry_status,
+        })
+        if dead.rate_limited:
+            sweep.rate_limited.append(row["id"])
+        else:
+            sweep.crashed.append(row["id"])
+            sweep.crash_details.append((row["id"], pid, row["claim_lock"], int(run_id), dead))
     return sweep
 
 
@@ -1281,12 +1246,16 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     terminal provider errors (credential revoked, model gone — a retry cannot
     heal them) trip immediately.
     """
+    from hermes_cli.kanban_dispatch_recovery.dead_worker import (
+        record_recovered_worker_failure as _record_recovered_worker_failure,
+    )
+
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
-    for _, _, _, dead in crash_details:
+    for _, _, _, _, dead in crash_details:
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
-    for tid, pid, claimer, dead in crash_details:
+    for tid, pid, claimer, run_id, dead in crash_details:
         error_text = dead.error_text
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
@@ -1298,22 +1267,27 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
             )
             if streak < violation_limit:
-                # Below budget: already back at ``ready`` with the error stamped.
-                # No ``_record_task_failure`` — must not consume the unified budget.
+                tripped = _record_recovered_worker_failure(
+                    conn, tid, pid, claimer, run_id, dead,
+                    default_failure_limit=DEFAULT_FAILURE_LIMIT,
+                    failure_limit=violation_limit,
+                    count_failure=False,
+                    event_payload_extra={
+                        "protocol_violations": streak,
+                        "protocol_violation_limit": violation_limit,
+                    },
+                )
+                if tripped:
+                    auto_blocked.append(tid)
                 continue
             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
             # already made against the violation streak above.
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
+            tripped = _record_recovered_worker_failure(
+                conn, tid, pid, claimer, run_id, dead,
+                default_failure_limit=DEFAULT_FAILURE_LIMIT,
                 failure_limit=violation_limit,
                 force_trip=True,
-                release_claim=False,
-                end_run=False,
                 event_payload_extra={
-                    "pid": pid,
-                    "claimer": claimer,
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
                 },
@@ -1323,28 +1297,22 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             # the whole ``failure_limit`` budget would be spent on identical
             # failures. ``force_trip`` blocks now, sticky: ``recompute_ready``
             # must not auto-resume it before the operator fixes the provider.
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
+            tripped = _record_recovered_worker_failure(
+                conn, tid, pid, claimer, run_id, dead,
+                default_failure_limit=DEFAULT_FAILURE_LIMIT,
                 force_trip=True,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
+                event_payload_extra={"terminal_provider": True},
             )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
-            extra = {"pid": pid, "claimer": claimer}
+            extra = {}
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
+            tripped = _record_recovered_worker_failure(
+                conn, tid, pid, claimer, run_id, dead,
+                default_failure_limit=DEFAULT_FAILURE_LIMIT,
                 failure_limit=1 if is_systemic else None,
-                release_claim=False,
-                end_run=False,
                 event_payload_extra=extra,
             )
         if tripped:
@@ -1362,6 +1330,13 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
+    from hermes_cli.kanban_dispatch_recovery.dead_worker import reconcile_pending_dead_workers
+
+    reconcile_pending_dead_workers(
+        conn,
+        failure_limit=DEFAULT_FAILURE_LIMIT,
+        protocol_failure_limit=_PROTOCOL_VIOLATION_FAILURE_LIMIT,
+    )
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
@@ -1489,7 +1464,7 @@ def _record_task_failure(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "consecutive_failures = ?, last_failure_error = ?, block_kind = NULL, block_identity = NULL, block_identity_state = 'unknown', block_recurrences = 0 "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
@@ -1516,10 +1491,10 @@ def _record_task_failure(
             )
         if force_trip:
             # The caller applied its own bounded policy, so the counter cannot
-            # judge this block: ``recompute_ready`` holds it for an operator.
             payload["sticky"] = True
         if event_payload_extra:
             payload.update(event_payload_extra)
+        _kb._append_event(conn, task_id, "block_identity_unknown", {"identity_state": "unknown", "unknown_cause": "failure_breaker"}, run_id=run_id)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 

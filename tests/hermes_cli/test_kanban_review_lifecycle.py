@@ -32,6 +32,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_ops
+from hermes_cli.kanban_db_task_state import block_task_transition
 
 
 @pytest.fixture
@@ -821,6 +822,36 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
 
         # Idempotent: not in review anymore -> reopening again is a no-op.
         assert kb.reopen_review_task(conn, tid) is False
+
+
+def test_reopen_review_task_parent_wait_replaces_stale_known_identity(kanban_home: Path) -> None:
+    """A review reopen that lands in todo creates a new parent wait, not a recurrence
+    of the card's previous explicitly classified hold."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        assert kb.complete_task(conn, parent, summary="done")
+        tid = kb.create_task(conn, title="reopen me", assignee="worker", parents=[parent])
+        assert block_task_transition(
+            conn, tid, actor_scope="review-test",
+            operation_id=f"review-old-decision:{tid}", reason="old decision",
+            kind="needs_input", subject="operator/old-decision",
+        ).committed
+        assert kb.unblock_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="ready", reviewer="reviewer")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+
+        assert kb.reopen_review_task(conn, tid)
+
+        row = conn.execute(
+            "SELECT status, block_kind, block_identity, block_identity_state, block_recurrences "
+            "FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "todo", "block_kind": None, "block_identity": None,
+            "block_identity_state": "unknown", "block_recurrences": 0,
+        }
+        event = _events(conn, tid, kind="block_identity_unknown")[-1][1]
+        assert event["unknown_cause"] == "review_reopened_parent_wait"
 
 
 def test_review_cycle_end_to_end(kanban_home: Path) -> None:

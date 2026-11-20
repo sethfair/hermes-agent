@@ -86,7 +86,7 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
     """The third consecutive clean exit trips the violation budget and ``recompute_ready``
     must not promote the card back the same tick (``consecutive_failures`` is still below
-    ``failure_limit``); ``unblock_task`` lifts the hold."""
+    ``failure_limit``); classification followed by ``unblock_task`` lifts the hold."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="loop", assignee="a")
         for i in range(kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT):
@@ -97,16 +97,25 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
         assert task.status == "blocked"
         assert task.consecutive_failures < 10
 
-        kb.unblock_task(conn, tid)
+        assert kb.unblock_task(conn, tid) is False
+        assert kb.classify_block(
+            conn,
+            tid,
+            kind="transient",
+            subject="protocol-violation-budget",
+            actor="operator",
+        )
+        assert kb.unblock_task(conn, tid)
         assert kb.get_task(conn, tid).status == "ready"
         kb.recompute_ready(conn, failure_limit=10)
         assert kb.get_task(conn, tid).status == "ready"
 
 
-def test_plain_budget_trip_still_auto_recovers(kanban_home):
-    """A unified-budget trip carries no ``sticky`` marker, so the two recovery paths on main
-    survive: raising the dispatcher ``failure_limit`` past the counter promotes the card, and
-    ``assign_task`` to a fresh profile (counter reset by design) promotes it too."""
+def test_plain_budget_trip_remains_fail_closed_after_policy_changes(kanban_home):
+    """Raising the dispatcher limit or reassigning cannot release an UNKNOWN breaker hold.
+
+    An operator must first classify each hold and then release it explicitly.
+    """
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=t, assignee="a") for t in ("raise-limit", "reassign")]
         for tid in tids:
@@ -118,18 +127,25 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
             assert kb.get_task(conn, tid).status == "blocked"
         assert kb.recompute_ready(conn, failure_limit=2) == 0
 
-        assert kb.recompute_ready(conn, failure_limit=5) == 2
-        assert kb.get_task(conn, tids[0]).status == "ready"
-
-        for i in range(2):
-            kbd._record_task_failure(
-                conn, tids[1], error=f"again{i}", outcome="crashed", failure_limit=2,
-                release_claim=False, end_run=False,
-            )
-        assert kb.get_task(conn, tids[1]).status == "blocked"
+        assert kb.recompute_ready(conn, failure_limit=5) == 0
+        first = kb.get_task(conn, tids[0])
+        assert first is not None and first.status == "blocked"
         kb.assign_task(conn, tids[1], "other-profile")
-        assert kb.recompute_ready(conn, failure_limit=2) == 1
-        assert kb.get_task(conn, tids[1]).status == "ready"
+        assert kb.recompute_ready(conn, failure_limit=5) == 0
+        second = kb.get_task(conn, tids[1])
+        assert second is not None and second.status == "blocked"
+
+        for tid, subject in zip(tids, ("raised-limit-crash", "reassigned-crash"), strict=True):
+            assert kb.classify_block(
+                conn,
+                tid,
+                kind="transient",
+                subject=subject,
+                actor="operator",
+            )
+            assert kb.unblock_task(conn, tid)
+            released = kb.get_task(conn, tid)
+            assert released is not None and released.status == "ready"
 
 
 def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, capsys):
