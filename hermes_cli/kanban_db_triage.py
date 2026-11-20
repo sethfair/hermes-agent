@@ -88,6 +88,12 @@ def _execute_guard_read(executor: Any, sql: str, parameters: Any = ()) -> sqlite
             "WHERE l.child_id=? AND p.status NOT IN ('done','archived') ORDER BY p.id",
             parameters,
         )
+    if sql == "SELECT count(*) FROM task_links WHERE child_id = ?":
+        return executor.execute(
+            "SELECT count(*) FROM task_links WHERE child_id = ?", parameters,
+        )
+    if sql == "SELECT max(1, 2), coalesce(NULL, 3)":
+        return executor.execute("SELECT max(1, 2), coalesce(NULL, 3)", parameters)
     if sql == "SELECT 1":
         return executor.execute("SELECT 1", parameters)
     raise sqlite3.DatabaseError("unsupported Triage release guard read operation")

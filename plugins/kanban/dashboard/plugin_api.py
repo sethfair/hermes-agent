@@ -538,6 +538,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    block_subject: Optional[str] = None
     # Handoff fields forwarded to complete_task on -> 'done' (parity with ``hermes kanban complete``).
     summary: Optional[str] = None
     metadata: Optional[dict] = None
@@ -560,6 +562,9 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    block_subject: Optional[str] = None
     reclaim_first: bool = False
     # Same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -588,13 +593,32 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     return _set_status_direct(conn, task_id, s)
 
 
+def _block_from_dashboard(conn, tid: str, p) -> bool:
+    current = kanban_db.get_task(conn, tid)
+    kind = getattr(p, "block_kind", None)
+    subject = getattr(p, "block_subject", None)
+    if current is not None and current.status == "blocked" and kind and subject:
+        return kanban_db.classify_block(
+            conn, tid, kind=kind, subject=subject, actor="dashboard"
+        )
+    if kind or subject:
+        if not (kind and subject):
+            raise ValueError("block_kind and block_subject must be provided together")
+        return kanban_db.block_task_transition(
+            conn, tid, actor_scope="dashboard",
+            operation_id=f"dashboard-block:{tid}:{time.time_ns()}",
+            reason=getattr(p, "block_reason", None), kind=kind, subject=subject,
+        ).committed
+    return kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None))
+
+
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "blocked": _block_from_dashboard,
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
@@ -639,6 +663,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
+    assert s is not None
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
@@ -669,10 +694,8 @@ def _open_parent_refusal(conn, task_id: str, s: str) -> Optional[str]:
 
 def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Optional[str]) -> None:
     """PATCH title/body through one receipt-backed operation, then notify observers."""
-    from hermes_cli.kanban_db_task_state import edit_task_fields
-
     try:
-        edited = edit_task_fields(
+        edited = kanban_db.edit_task_fields(
             conn,
             task_id,
             title=payload.title,
@@ -694,11 +717,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
+        if payload.status is not None:
+            _patch_status(conn, task_id, payload, review_assignee_deferred)
+        elif payload.block_kind is not None or payload.block_subject is not None:
+            with _map_errors(400, ValueError):
+                _require_ok(_block_from_dashboard(conn, task_id, payload))
         if payload.assignee is not None and not review_assignee_deferred:
             with _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
-        if payload.status is not None:
-            _patch_status(conn, task_id, payload, review_assignee_deferred)
         for wanted, apply, _refused in _OVERRIDE_OPS:
             if wanted(payload):
                 with _map_errors(400, ValueError, RuntimeError):
@@ -739,9 +765,7 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
 
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
     """Route dashboard drag/drop fallback moves through the typed storage boundary."""
-    from hermes_cli.kanban_db_task_state import direct_status
-
-    return direct_status(conn, task_id, new_status, actor_scope="dashboard")
+    return kanban_db.direct_status(conn, task_id, new_status, actor_scope="dashboard")
 
 
 # --- Comments / links -------------------------------------------------------
@@ -784,10 +808,12 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
+        return
     if payload.status is not None and not payload.archive:
         s = payload.status
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
             entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
+            return
     if payload.assignee is not None:
         try:
             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first

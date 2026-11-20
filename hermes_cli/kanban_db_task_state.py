@@ -413,6 +413,7 @@ class _AppliedTransition:
     attachment_paths: tuple[str, ...] = ()
     staged_copies: tuple[Path, ...] = ()
     terminations: tuple[tuple[Optional[int], Optional[str], object], ...] = ()
+    persist_refusal: bool = False
 
 
 @dataclass(frozen=True)
@@ -1576,6 +1577,8 @@ def _run_operation(
     db_path = kbc._main_db_file(conn)
     if not db_path:
         raise ValueError("protected task transition requires a file-backed Kanban database")
+    from hermes_cli import kanban_db as kb
+    kb._assert_not_delegated_child_mutation(db_path)
     request_hash = _request_hash(request)
     applied: Optional[_AppliedTransition] = None
     with kbc._protected_connection(db_path, operation=request.authority_kind) as private:
@@ -1589,7 +1592,10 @@ def _run_operation(
             applied = _OPERATION_HANDLERS[type(request)](private, request)
             assert applied is not None
             if not applied.outcome.committed:
-                _rollback(private)
+                if applied.persist_refusal:
+                    kbc._execute_boundary_with_retry(private, "COMMIT")
+                else:
+                    _rollback(private)
                 return _KernelResult(applied.outcome, False)
             outcome = _insert_receipt(
                 private, request, request_hash, applied.outcome

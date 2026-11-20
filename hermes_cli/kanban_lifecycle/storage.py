@@ -37,7 +37,10 @@ def _apply_complete(private: sqlite3.Connection, request):
     if request.acceptance is not None and not record_acceptance(
         private, request.task_id, request.acceptance
     ):
-        return _applied(_outcome(request, committed=False, refusal="acceptance_refused"))
+        return _applied(
+            _outcome(request, committed=False, refusal="acceptance_refused"),
+            persist_refusal=True,
+        )
     trow = private.execute(
         "SELECT status,claim_lock,worker_pid,worker_started_at FROM tasks WHERE id=?",
         (request.task_id,),
@@ -302,6 +305,11 @@ def complete_task_transition(
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance
 
+    if not kb._parents_satisfied(conn, task_id):
+        state = _state()
+        return state.LifecycleTransitionOutcome(
+            False, operation_id, refusal="parent_dependencies_unsatisfied"
+        )
     verified = kb._gate_created_cards(conn, task_id, created_cards, summary or result)
     kb._gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = kb._merge_completion_prose_artifacts(

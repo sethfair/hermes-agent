@@ -2807,6 +2807,27 @@ def block_task_transition(conn: sqlite3.Connection, task_id: str, **kwargs):
     return transition(conn, task_id, **kwargs)
 
 
+def direct_status(
+    conn: sqlite3.Connection, task_id: str, new_status: str, *, actor_scope: str,
+) -> bool:
+    """Public facade for a receipt-backed direct status transition."""
+    from hermes_cli.kanban_db_task_state import direct_status as operation
+
+    return operation(conn, task_id, new_status, actor_scope=actor_scope)
+
+
+def edit_task_fields(
+    conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+    body: Optional[str] = None, actor_scope: str,
+) -> bool:
+    """Public facade for receipt-backed title/body edits."""
+    from hermes_cli.kanban_db_task_state import edit_task_fields as operation
+
+    return operation(
+        conn, task_id, title=title, body=body, actor_scope=actor_scope,
+    )
+
+
 def classify_block(conn: sqlite3.Connection, task_id: str, **kwargs) -> bool:
     """Compatibility export for actor-attributed blocker classification."""
     from hermes_cli.kanban_db_task_state import classify_block as _classify
@@ -3071,7 +3092,8 @@ def invalidate_descendants_for_parent_reopen(
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
+                "current_run_id = NULL, consecutive_failures = 0, block_identity = NULL, "
+                "block_identity_state = 'unknown' WHERE id = ?", (row["id"],),
             )
             entry = {
                 "id": row["id"], "prior_status": previous_status,
