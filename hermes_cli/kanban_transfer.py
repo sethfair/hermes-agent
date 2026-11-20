@@ -127,7 +127,10 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _count_rows(conn: sqlite3.Connection) -> dict[str, int]:
-    return {t: int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]) for t in _COUNTED_TABLES}
+    counts: dict[str, int] = {}
+    for table in _COUNTED_TABLES:
+        counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    return counts
 
 
 def export_board(

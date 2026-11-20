@@ -2716,10 +2716,15 @@ def edit_task(
             return False
         assignments = []
         params = []
-        for field, value in (("title", title), ("body", body), ("priority", priority)):
-            if value is not None:
-                assignments.append(f"{field} = ?")
-                params.append(value)
+        if title is not None:
+            assignments.append("title = ?")
+            params.append(title)
+        if body is not None:
+            assignments.append("body = ?")
+            params.append(body)
+        if priority is not None:
+            assignments.append("priority = ?")
+            params.append(priority)
         if result is not None:
             assignments.append("result = ?")
             params.append(result)
