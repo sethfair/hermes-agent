@@ -377,6 +377,35 @@ def dispatch(conn, sql):
     assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
 
 
+def test_typed_command_execute_receivers_are_not_database_sinks(tmp_path):
+    repo = _repo(tmp_path, {
+        "agent/__init__.py": "",
+        "agent/runner.py": '''
+class CommandEnvironment:
+    def execute(self, command: str, **kwargs) -> dict:
+        raise NotImplementedError
+''',
+        "app/writers.py": '''
+from hermes_cli import kanban_db
+from agent.runner import CommandEnvironment
+
+class DockerEnvironment(CommandEnvironment):
+    def execute(self, command: str) -> dict:
+        return super().execute(command)
+
+def dispatch(env: CommandEnvironment, command, conn, sql):
+    env.execute(command)
+    conn.execute(sql)
+''',
+    })
+
+    result, report = _run(repo)
+
+    assert result.returncode == 1
+    assert report["inventory"] == []
+    assert [problem["kind"] for problem in report["problems"]] == ["unresolved-sql"]
+
+
 def test_imported_finite_constants_resolve_without_evaluating_imports(tmp_path):
     repo = _repo(tmp_path, {
         "agent/fragments.py": '''

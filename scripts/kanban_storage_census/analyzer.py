@@ -80,6 +80,84 @@ def _local_execute_receivers(scope: ast.Module | ast.FunctionDef, tree: ast.Modu
     }
 
 
+def _annotation_name(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _annotation_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return None
+
+
+def _typed_command_execute_class(node: ast.ClassDef) -> bool:
+    """Whether a class declares the typed command-executor contract.
+
+    SQL execute methods conventionally accept ``sql`` and return a cursor. A
+    ``command: str -> dict`` contract is instead the repository's terminal
+    environment boundary. Require every part so an untyped or cursor-returning
+    execute method remains fail-closed.
+    """
+    execute = next((item for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name == "execute"), None)
+    if execute is None or len(execute.args.args) < 2:
+        return False
+    command = execute.args.args[1]
+    return command.arg == "command" \
+        and _annotation_name(command.annotation) == "str" \
+        and _annotation_name(execute.returns) == "dict"
+
+
+def _typed_command_execute_classes(tree: ast.Module, root: Path) -> set[str]:
+    """Resolve imported command-executor contracts and local subclasses."""
+    classes = {
+        node.name for node in tree.body
+        if isinstance(node, ast.ClassDef) and _typed_command_execute_class(node)
+    }
+    for imported in (node for node in tree.body
+                     if isinstance(node, ast.ImportFrom) and node.module):
+        path = _module_path(root, imported.module)
+        if path is None:
+            continue
+        try:
+            imported_tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=path.as_posix())
+        except (OSError, SyntaxError):
+            continue
+        definitions = {
+            node.name: node for node in imported_tree.body if isinstance(node, ast.ClassDef)
+        }
+        classes.update(
+            alias.asname or alias.name for alias in imported.names
+            if alias.name in definitions and _typed_command_execute_class(definitions[alias.name])
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        for node in (item for item in tree.body if isinstance(item, ast.ClassDef)):
+            if node.name in classes:
+                continue
+            if any(_annotation_name(base) in classes for base in node.bases):
+                classes.add(node.name)
+                changed = True
+    return classes
+
+
+def _typed_command_execute_receivers(scope: ast.Module | ast.FunctionDef,
+                                     classes: set[str],
+                                     parents: dict[ast.AST, ast.AST]) -> set[str]:
+    if not isinstance(scope, ast.FunctionDef) or not classes:
+        return set()
+    receivers = {
+        argument.arg for argument in scope.args.args
+        if _annotation_name(argument.annotation) in classes
+    }
+    owner = parents.get(scope)
+    if isinstance(owner, ast.ClassDef) and owner.name in classes:
+        receivers.update(("self", "super()"))
+    return receivers
+
+
 def _imported_module_aliases(tree: ast.Module, root: Path) -> set[str]:
     """Names proven to refer to modules rather than connection-like objects."""
     aliases: set[str] = set()
@@ -537,12 +615,13 @@ def _sink_argument(call: ast.Call, aliases: dict[str, tuple[bool, bool]],
     return None
 
 
-def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
+def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module, root: Path,
                 parents: dict[ast.AST, ast.AST], functions: dict[str, ast.FunctionDef],
                 module_assignments: dict[str, list[ast.AST]], relative: str,
                 kanban_relevant: bool, module_aliases: set[str],
                 imported_assignments: dict[str, dict[str, list[ast.AST]]],
-                name_uses: dict[str, list[ast.Name]]) -> tuple[list[InventoryItem], list[Problem]]:
+                name_uses: dict[str, list[ast.Name]],
+                typed_command_classes: set[str]) -> tuple[list[InventoryItem], list[Problem]]:
     function = scope if isinstance(scope, ast.FunctionDef) else None
     owner = _function_name(scope, parents) if function else "<module>"
     assignments = {name: list(values) for name, values in module_assignments.items()}
@@ -562,6 +641,9 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
         function, tree, parents, evaluator, name_uses,
     ) if function else None
     local_execute_receivers = _local_execute_receivers(scope, tree, parents)
+    typed_command_receivers = _typed_command_execute_receivers(
+        scope, typed_command_classes, parents,
+    )
     aliases: dict[str, tuple[bool, bool]] = {}
     for node in ast.walk(scope):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute) \
@@ -581,6 +663,13 @@ def _scan_scope(scope: ast.Module | ast.FunctionDef, tree: ast.Module,
             continue
         if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) \
                 and call.func.value.id in local_execute_receivers:
+            continue
+        if isinstance(call.func, ast.Attribute) and (
+            isinstance(call.func.value, ast.Name) and call.func.value.id in typed_command_receivers
+            or isinstance(call.func.value, ast.Call)
+            and isinstance(call.func.value.func, ast.Name) and call.func.value.func.id == "super"
+            and "super()" in typed_command_receivers
+        ):
             continue
         sink = _sink_argument(call, aliases, functions, parameters)
         if sink is None:
@@ -635,10 +724,14 @@ def _scan_file(root: Path, path: Path) -> tuple[list[InventoryItem], list[Proble
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             name_uses[node.id].append(node)
+    typed_command_classes = (
+        _typed_command_execute_classes(tree, root)
+        if kanban_relevant and ".execute" in source else set()
+    )
     for scope in [tree, *functions.values()]:
         found, refused = _scan_scope(
-            scope, tree, parents, functions, module_assignments, relative, kanban_relevant,
-            module_aliases, imported_assignments, name_uses,
+            scope, tree, root, parents, functions, module_assignments, relative, kanban_relevant,
+            module_aliases, imported_assignments, name_uses, typed_command_classes,
         )
         inventory.extend(found)
         problems.extend(refused)
