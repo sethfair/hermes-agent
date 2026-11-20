@@ -28,9 +28,11 @@ _PHASES = {"queued", "running", "indeterminate", "stopping", "deferred", "settle
 _TASK_FIELDS = {
     "task_id", "thread_id", "turn_id", "source_event_seq", "payload_sha256", "member_id", "profile",
     "execution_generation", "cancel_generation", "phase", "settlement_id", "cancel_id"}
-_RECEIPT_FIELDS = {
-    "room_id", "home_install_id", "authority_gateway_id", "authority_epoch", "member_id", "target_install_id",
-    "target_profile", "task_id", "execution_generation", "run_id", "session_id"}
+_RECEIPT_COLUMNS = (
+    "authority_epoch", "authority_gateway_id", "execution_generation", "home_install_id", "member_id",
+    "room_id", "run_id", "session_id", "target_install_id", "target_profile", "task_id",
+)
+_RECEIPT_FIELDS = set(_RECEIPT_COLUMNS)
 _FIELDS = {"version", "room_id", "home_install_id", "authority", "roster_sha256", "history", "revision", "digest",
            "availability", "reason", "tasks", "receipts", "stop", "limitations"}
 
@@ -193,11 +195,11 @@ def _budget(conn, table, proposed):
         raise WorkRecordCapacityError("work record storage is full")
 
 
-def history_anchor(conn, table: str, room_id: str, seq: int) -> str:
+def history_anchor(conn, room_id: str, seq: int) -> str:
     if seq == 0:
         return digest([])
-    row = conn.execute(f"""SELECT seq,event_id,kind,actor_json,authority_epoch,payload_json,created_at
-        FROM {table} WHERE room_id=? AND seq=?""", (room_id, seq)).fetchone()
+    row = conn.execute("""SELECT seq,event_id,kind,actor_json,authority_epoch,payload_json,created_at
+        FROM hosted_room_events WHERE room_id=? AND seq=?""", (room_id, seq)).fetchone()
     if row is None:
         raise WorkRecordPrefixError("work record history prefix is unavailable")
     return digest([row["seq"], row["event_id"], row["kind"], json.loads(row["actor_json"]),
@@ -220,7 +222,7 @@ def _capture_tasks(conn, room_id):
         FROM hosted_room_driver_tasks AS t WHERE room_id=?""" + task_filter + " ORDER BY task_id LIMIT ?",
         (room_id, MAX_TASKS + 1)).fetchall()
     receipts = [dict(row) for row in conn.execute(
-        f"SELECT {','.join(sorted(_RECEIPT_FIELDS))} FROM hosted_room_remote_runs AS t WHERE room_id=?"
+        f"SELECT {','.join(_RECEIPT_COLUMNS)} FROM hosted_room_remote_runs AS t WHERE room_id=?"
         + (f" AND {published}" if published else "") + " ORDER BY task_id,execution_generation,member_id LIMIT ?",
         (room_id, MAX_RECEIPTS + 1))]
     if len(rows) > MAX_TASKS or len(receipts) > MAX_RECEIPTS:
@@ -290,7 +292,7 @@ def capture_locked(conn, *, room_id, local_gateway_id, through_seq=None):
         "version": 1 if room["authority_epoch"] == 1 else 2, "room_id": room_id, "home_install_id": local_gateway_id,
         "authority": {"gateway_id": local_gateway_id, "epoch": room["authority_epoch"]},
         "roster_sha256": roster_digest(json.loads(room["members_json"])),
-        "history": {"seq": seq, "event_sha256": history_anchor(conn, "hosted_room_events", room_id, seq)},
+        "history": {"seq": seq, "event_sha256": history_anchor(conn, room_id, seq)},
         "availability": "unavailable" if reason else "available", "reason": reason,
         "tasks": tasks, "receipts": receipts, "limitations": LIMITATIONS,
         "stop": {"closing": fence is not None, "revocation_complete": fence is not None and fence[0] is not None,
