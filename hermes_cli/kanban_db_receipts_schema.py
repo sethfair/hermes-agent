@@ -4,6 +4,53 @@ import sqlite3
 import time
 import uuid
 
+
+DRIFT_TABLES = (
+    "task_events",
+    "task_comments",
+    "task_runs",
+    "kanban_notify_subs",
+)
+
+READY_CLAIM_TRIGGER_SQL = """CREATE TRIGGER kanban_ready_claim_admission
+BEFORE UPDATE OF status ON tasks
+WHEN OLD.status = 'ready' AND NEW.status = 'running'
+ AND EXISTS (SELECT 1 FROM kanban_monitor_scope_activation s
+             WHERE s.profile = COALESCE(OLD.assignee, '') AND s.disabled_at IS NULL
+               AND s.state IN ('pending','active','faulted'))
+BEGIN
+ INSERT INTO kanban_writer_faults(board_scope_id, profile, activation_epoch, diagnostic_code, created_at)
+ SELECT s.board_scope_id, s.profile, s.activation_epoch, 'unadmitted_ready_claim_refused', strftime('%s','now')
+ FROM kanban_monitor_scope_activation s
+ WHERE s.profile = COALESCE(OLD.assignee, '') AND s.disabled_at IS NULL
+   AND s.state IN ('pending','active','faulted')
+   AND NOT EXISTS (SELECT 1 FROM kanban_claim_admissions a
+                   WHERE a.token = NEW.dispatch_admission_id AND a.state = 'armed'
+                     AND a.task_id = OLD.id AND a.profile = OLD.assignee
+                     AND a.activation_epoch = s.activation_epoch
+                     AND a.attempt_id IN (SELECT id FROM kanban_dispatch_attempts WHERE state = 'open'));
+ SELECT RAISE(IGNORE)
+ WHERE NOT EXISTS (SELECT 1 FROM kanban_claim_admissions a
+                   JOIN kanban_dispatch_attempts d ON d.id = a.attempt_id
+                   JOIN kanban_monitor_scope_activation s
+                     ON s.board_scope_id = a.board_scope_id AND s.profile = a.profile
+                    AND s.activation_epoch = a.activation_epoch AND s.disabled_at IS NULL
+                   WHERE a.token = NEW.dispatch_admission_id AND a.state = 'armed'
+                     AND d.state = 'open' AND a.task_id = OLD.id AND a.profile = OLD.assignee
+                     AND d.board_scope_id = a.board_scope_id AND d.profile = a.profile
+                     AND d.activation_epoch = a.activation_epoch
+                     AND d.writer_ref_digest = a.writer_ref_digest
+                     AND d.controller_generation = a.controller_generation
+                     AND a.ready_generation = COALESCE((SELECT MAX(id) FROM task_events
+                         WHERE task_id=OLD.id AND kind IN ('created','promoted','promoted_manual',
+                         'unblocked','changes_requested','review_reopened','status','reclaimed',
+                         'timed_out','stale','protocol_violation','rate_limited','crashed',
+                         'spawn_failed','reconciled','imported')), 0)
+                     AND a.run_generation = COALESCE((SELECT MAX(id) FROM task_runs WHERE task_id=OLD.id), 0));
+ UPDATE kanban_claim_admissions SET state='consumed', consumed_at=strftime('%s','now')
+ WHERE token = NEW.dispatch_admission_id AND state='armed';
+END"""
+
 ACTION_RECEIPT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kanban_board_identity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

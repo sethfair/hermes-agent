@@ -153,7 +153,7 @@ def test_ordinary_facade_denies_protected_writes_across_statement_caches(
         for attempt in attempts:
             with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
                 attempt()
-        assert conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "ready"
+        assert conn.execute(kbc.OrdinaryRead.TASK_STATUS, (task_id,)).fetchone()[0] == "ready"
 
 
 @pytest.mark.parametrize(
@@ -181,7 +181,7 @@ def test_ordinary_facade_denies_transaction_schema_and_attachment_control(home, 
 
 def test_ordinary_facade_and_results_hide_physical_control_surfaces(home):
     with kbc._ordinary_connection(kb.kanban_db_path()) as conn:
-        result = conn.execute("SELECT 1 AS value")
+        result = conn.execute(kbc.OrdinaryRead.ONE)
         cursor = conn.cursor()
 
         assert result.fetchone()["value"] == 1
@@ -204,9 +204,7 @@ def test_ordinary_facade_and_results_hide_physical_control_surfaces(home):
 
 def test_ordinary_facade_returns_safe_iterable_results(home):
     with kbc.KanbanConnection(kb.kanban_db_path()) as conn:
-        result = conn.execute(
-            "SELECT value FROM (SELECT 2 AS value UNION ALL SELECT 1) ORDER BY value"
-        )
+        result = conn.execute(kbc.OrdinaryRead.ORDERED_VALUES)
         assert [row["value"] for row in result] == [1, 2]
         assert result.description[0][0] == "value"
 

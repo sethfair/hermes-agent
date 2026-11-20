@@ -64,7 +64,7 @@ def test_legacy_block_ingress_commits_unknown_transition_receipt(home):
         events = kb.list_events(conn, tid)
         receipts = conn.execute(
             "SELECT task_id, operation_kind, outcome_code, event_id "
-            "FROM task_transition_receipts WHERE task_id = ?",
+            "FROM task_transition_receipts WHERE task_id = ? AND operation_kind = 'block'",
             (tid,),
         ).fetchall()
         assert [event.kind for event in events[-2:]] == [

@@ -68,7 +68,8 @@ def test_check_registers_kanban_storage_writer_guard():
     )
     output = result.stdout + result.stderr
     assert "unknown or no check name" not in output
-    assert "kanban-storage-writers" in output
+    assert result.returncode == 0, output
+    assert "scripts/check: 1 checks, ok" in output
     assert result.returncode != 2
 
 

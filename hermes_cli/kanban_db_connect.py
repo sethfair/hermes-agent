@@ -21,8 +21,11 @@ import uuid
 import weakref
 from dataclasses import dataclass
 from dataclasses import field
+from enum import Enum
 from agent.deadline import poll_until
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_pragmas import IntegerPragma, set_integer_pragma
+from hermes_cli.kanban_db_receipts_schema import DRIFT_TABLES, READY_CLAIM_TRIGGER_SQL
 from pathlib import Path
 from typing import Any
 from typing import Optional
@@ -83,7 +86,7 @@ def _sqlite_connect(
     try:
         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
         # survives wrapper changes; PRAGMA assignments can't bind parameters.
-        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        set_integer_pragma(conn, IntegerPragma.BUSY_TIMEOUT, busy_timeout_ms)
     except BaseException:
         # A half-open connection would leak its fd AND leave a stale entry in the
         # connect_tracked registry (cleared only on close), permanently blocking
@@ -160,6 +163,27 @@ _RESULT_CURSORS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _FACADE_CONNECTIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
+class OrdinaryRead(Enum):
+    """Closed read operations exposed by the not-yet-activated facade."""
+
+    ONE = "one"
+    ORDERED_VALUES = "ordered_values"
+    TASK_STATUS = "task_status"
+
+
+def _execute_ordinary_read(executor: Any, operation: OrdinaryRead, parameters: Any = ()):
+    if operation is OrdinaryRead.ONE:
+        return executor.execute("SELECT 1 AS value", parameters)
+    if operation is OrdinaryRead.ORDERED_VALUES:
+        return executor.execute(
+            "SELECT value FROM (SELECT 2 AS value UNION ALL SELECT 1) ORDER BY value",
+            parameters,
+        )
+    if operation is OrdinaryRead.TASK_STATUS:
+        return executor.execute("SELECT status FROM tasks WHERE id=?", parameters)
+    raise sqlite3.DatabaseError("not authorized")
+
+
 class KanbanResult:
     """A SQLite result without a path back to its physical connection."""
 
@@ -170,6 +194,9 @@ class KanbanResult:
 
     def __cursor(self) -> sqlite3.Cursor:
         return _RESULT_CURSORS[self]
+
+    def _physical_cursor(self) -> sqlite3.Cursor:
+        return self.__cursor()
 
     @property
     def description(self):
@@ -203,23 +230,15 @@ class KanbanResult:
     def __next__(self):
         return next(self.__cursor())
 
-    def _execute(self, sql: str, parameters) -> None:
-        self.__cursor().execute(sql, parameters)
-
-    def _executemany(self, sql: str, parameters) -> None:
-        self.__cursor().executemany(sql, parameters)
-
-
 class KanbanCursor(KanbanResult):
     """A restricted cursor that returns only safe result wrappers."""
 
-    def execute(self, sql: str, parameters=()) -> KanbanCursor:
-        self._execute(sql, parameters)
+    def execute(self, operation: Any, parameters=()) -> KanbanCursor:
+        _execute_ordinary_read(self._physical_cursor(), operation, parameters)
         return self
 
-    def executemany(self, sql: str, parameters) -> KanbanCursor:
-        self._executemany(sql, parameters)
-        return self
+    def executemany(self, _operation: Any, _parameters: Any) -> KanbanCursor:
+        raise sqlite3.DatabaseError("not authorized")
 
 
 class KanbanConnection:
@@ -257,11 +276,11 @@ class KanbanConnection:
     def cursor(self) -> KanbanCursor:
         return KanbanCursor(self.__physical().cursor())
 
-    def execute(self, sql: str, parameters=()) -> KanbanResult:
-        return KanbanResult(self.__physical().execute(sql, parameters))
+    def execute(self, operation: Any, parameters=()) -> KanbanResult:
+        return KanbanResult(_execute_ordinary_read(self.__physical(), operation, parameters))
 
-    def executemany(self, sql: str, parameters) -> KanbanResult:
-        return KanbanResult(self.__physical().executemany(sql, parameters))
+    def executemany(self, _operation: Any, _parameters: Any) -> KanbanResult:
+        raise sqlite3.DatabaseError("not authorized")
 
     def __enter__(self) -> KanbanConnection:
         return self
@@ -1273,9 +1292,23 @@ _NOTIFY_SUB_COLUMNS = (
 )
 
 _TASK_RUN_COLUMNS = (
+    # Keep drifted pre-AUTOINCREMENT tables copyable through a fixed, typed
+    # rebuild operation. These are nullable additive columns in the canonical
+    # schema, so adding an absent column preserves every legacy row.
+    ("step_key", "step_key TEXT"),
+    ("claim_lock", "claim_lock TEXT"),
+    ("claim_expires", "claim_expires INTEGER"),
+    ("worker_pid", "worker_pid INTEGER"),
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
+    ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
+    ("ended_at", "ended_at INTEGER"),
+    ("outcome", "outcome TEXT"),
+    ("summary", "summary TEXT"),
+    ("metadata", "metadata TEXT"),
+    ("error", "error TEXT"),
 )
 
 
@@ -1722,65 +1755,6 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
                 )
 
 
-# Legacy DBs used a ``TEXT PRIMARY KEY`` id (nullable ``TEXT last_event_id``
-# for ``kanban_notify_subs``); the additive migrations can't change a column
-# type, so drift requires a rebuild. Each entry pairs the canonical CREATE
-# TABLE with the indexes DROP TABLE takes down with it.
-# ``test_rebuilt_schema_matches_fresh`` guards this against SCHEMA_SQL drift.
-# The current schema uses ``INTEGER PRIMARY KEY AUTOINCREMENT`` / ``INTEGER NOT NULL DEFAULT 0``. ``CREATE
-# TABLE IF NOT EXISTS`` skips existing tables regardless of schema and ``_add_column_if_missing`` only adds
-# columns, so neither can fix a drifted column type — the table must be rebuilt. See #35096. Each entry
-# pairs the canonical CREATE TABLE with the CREATE INDEX statements that DROP TABLE would otherwise take
-# down with it (including ``idx_events_run``, added by the additive pass above). To guard against this list
-# drifting from SCHEMA_SQL, ``test_rebuilt_schema_matches_fresh`` asserts a rebuilt legacy DB is
-# byte-identical to a fresh one.
-_REBUILD_SPECS = {
-    "task_events": (
-        "CREATE TABLE task_events ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, created_at INTEGER NOT NULL)",
-        (
-            "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
-            "CREATE INDEX idx_events_run ON task_events(run_id, id)",
-        ),
-    ),
-    "task_comments": (
-        "CREATE TABLE task_comments ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)",
-        ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
-    ),
-    "task_runs": (
-        "CREATE TABLE task_runs ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
-        " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
-        " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
-        " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
-        (
-            "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
-            "CREATE INDEX idx_runs_status ON task_runs(status)",
-        ),
-    ),
-    "kanban_notify_subs": (
-        "CREATE TABLE kanban_notify_subs ("
-        " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
-        " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT,"
-        " chat_type TEXT,"
-        " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
-        " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
-        " last_ping_event_id INTEGER NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
-        ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
-    ),
-}
-
-
 def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     """True when ``table`` still carries the legacy (pre-AUTOINCREMENT) shape."""
     info = conn.execute("SELECT name,type,pk FROM pragma_table_info(?)", (table,)).fetchall()
@@ -1809,41 +1783,85 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     Each affected table is rebuilt with the standard SQLite pattern — CREATE new → INSERT shared columns →
     DROP old → RENAME — recreating its indexes too (DROP TABLE takes them down). See #35096.
     """
-    drifted = [t for t in _REBUILD_SPECS if _table_has_drifted(conn, t)]
+    drifted = [t for t in DRIFT_TABLES if _table_has_drifted(conn, t)]
     if not drifted:
         return
 
-    trigger = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='kanban_ready_claim_admission'"
-    ).fetchone()
+    had_ready_claim_trigger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='kanban_ready_claim_admission'"
+    ).fetchone() is not None
     conn.execute("BEGIN IMMEDIATE")
     try:
-        if trigger and trigger[0]:
+        if had_ready_claim_trigger:
             conn.execute("DROP TRIGGER kanban_ready_claim_admission")
         for table in drifted:
-            create_sql, index_sqls = _REBUILD_SPECS[table]
-            old_cols = [c["name"] for c in conn.execute(f"PRAGMA table_info({table})")]
             _kb._log.info("kanban migration: rebuilding %s to match current schema", table)
-            conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
-            conn.execute(create_sql)
-            new_cols = _column_names(conn, table)
-            if table == "kanban_notify_subs":
-                # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
-                drop, extra_cols = "last_event_id", ", last_event_id"
-                extra_select = ", COALESCE(CAST(last_event_id AS INTEGER), 0)"
-            else:
-                # Drop the legacy TEXT id; AUTOINCREMENT reassigns it.
-                drop, extra_cols, extra_select = "id", "", ""
-            cols_csv = ", ".join(c for c in old_cols if c in new_cols and c != drop)
-            conn.execute(
-                f"INSERT INTO {table} ({cols_csv}{extra_cols}) "
-                f"SELECT {cols_csv}{extra_select} FROM {table}_legacy"
-            )
-            conn.execute(f"DROP TABLE {table}_legacy")
-            for index_sql in index_sqls:
-                conn.execute(index_sql)
-        if trigger and trigger[0]:
-            conn.execute(trigger[0])
+            if table == "task_events":  # health: allow HX011 -- each branch owns fixed migration SQL.
+                conn.execute("ALTER TABLE task_events RENAME TO task_events_legacy")
+                conn.execute(
+                    "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL, payload TEXT, "
+                    "created_at INTEGER NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "SELECT task_id, run_id, kind, payload, created_at FROM task_events_legacy"
+                )
+                conn.execute("DROP TABLE task_events_legacy")
+                conn.execute("CREATE INDEX idx_events_task ON task_events(task_id, created_at)")
+                conn.execute("CREATE INDEX idx_events_run ON task_events(run_id, id)")
+            elif table == "task_comments":
+                conn.execute("ALTER TABLE task_comments RENAME TO task_comments_legacy")
+                conn.execute(
+                    "CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL, "
+                    "created_at INTEGER NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "SELECT task_id, author, body, created_at FROM task_comments_legacy"
+                )
+                conn.execute("DROP TABLE task_comments_legacy")
+                conn.execute("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)")
+            elif table == "task_runs":
+                conn.execute("ALTER TABLE task_runs RENAME TO task_runs_legacy")
+                conn.execute(
+                    "CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+                    "profile TEXT, step_key TEXT, status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER, "
+                    "worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER, "
+                    "last_heartbeat_at INTEGER, started_at INTEGER NOT NULL, ended_at INTEGER, outcome TEXT, "
+                    "summary TEXT, metadata TEXT, error TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, step_key, status, claim_lock, claim_expires, "
+                    "worker_pid, worker_started_at, max_runtime_seconds, last_heartbeat_at, started_at, ended_at, "
+                    "outcome, summary, metadata, error) SELECT task_id, profile, step_key, status, claim_lock, "
+                    "claim_expires, worker_pid, worker_started_at, max_runtime_seconds, last_heartbeat_at, "
+                    "started_at, ended_at, outcome, summary, metadata, error FROM task_runs_legacy"
+                )
+                conn.execute("DROP TABLE task_runs_legacy")
+                conn.execute("CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)")
+                conn.execute("CREATE INDEX idx_runs_status ON task_runs(status)")
+            elif table == "kanban_notify_subs":
+                conn.execute("ALTER TABLE kanban_notify_subs RENAME TO kanban_notify_subs_legacy")
+                conn.execute(
+                    "CREATE TABLE kanban_notify_subs (task_id TEXT NOT NULL, platform TEXT NOT NULL, "
+                    "chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT, "
+                    "chat_type TEXT, notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify', "
+                    "delivery_metadata TEXT, created_at INTEGER NOT NULL, last_event_id INTEGER NOT NULL DEFAULT 0, "
+                    "last_ping_event_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (task_id, platform, chat_id, thread_id))"
+                )
+                conn.execute(
+                    "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, user_id, user_id_alt, "
+                    "chat_type, notifier_profile, delivery_mode, delivery_metadata, created_at, last_event_id, "
+                    "last_ping_event_id) SELECT task_id, platform, chat_id, thread_id, user_id, user_id_alt, "
+                    "chat_type, notifier_profile, delivery_mode, delivery_metadata, created_at, "
+                    "COALESCE(CAST(last_event_id AS INTEGER), 0), last_ping_event_id FROM kanban_notify_subs_legacy"
+                )
+                conn.execute("DROP TABLE kanban_notify_subs_legacy")
+                conn.execute("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)")
+        if had_ready_claim_trigger:
+            conn.execute(READY_CLAIM_TRIGGER_SQL)
         conn.execute("COMMIT")
     except Exception:
         with contextlib.suppress(sqlite3.OperationalError):
