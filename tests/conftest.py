@@ -719,6 +719,32 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
 
     monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
 
+    # ``board.json`` is written before any DB connect (create_board writes it first, and
+    # rename/default-workdir edits never connect), so guard the metadata writer too. Both
+    # bindings are patched: callers reach it as ``kanban_db.write_board_metadata`` and
+    # ``create_board`` through its own module global.
+    _kdbb = sys.modules.get("hermes_cli.kanban_db_boards")
+    _orig_write_meta = getattr(_kdbb, "write_board_metadata", None)
+    if _kdbb is None or _orig_write_meta is None or getattr(_kdbb, "board_metadata_path", None) is None:
+        return
+
+    def _guarded_write_board_metadata(board, *args, **kwargs):
+        resolved = _kdbb.board_metadata_path(board).expanduser().resolve()
+        try:
+            resolved.relative_to(_REAL_KANBAN_ROOT)
+        except ValueError:
+            return _orig_write_meta(board, *args, **kwargs)
+        raise RuntimeError(
+            f"kanban_write_guard: board.json path resolved to {resolved}, "
+            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
+            f"Hermetic isolation has been bypassed — refusing to write "
+            f"to the real ~/.hermes. See #69283."
+        )
+
+    monkeypatch.setattr(_kdbb, "write_board_metadata", _guarded_write_board_metadata)
+    if getattr(_kdb, "write_board_metadata", None) is _orig_write_meta:
+        monkeypatch.setattr(_kdb, "write_board_metadata", _guarded_write_board_metadata)
+
 
 @pytest.fixture(autouse=True)
 def scratch_prune_spawns(monkeypatch):
