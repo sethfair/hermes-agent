@@ -1280,12 +1280,12 @@ _TASK_RUN_COLUMNS = (
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    return {row["name"] for row in conn.execute("SELECT name FROM pragma_table_info(?)", (table,))}
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute(
-        f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
     ).fetchone() is not None
 
 
@@ -1783,7 +1783,7 @@ _REBUILD_SPECS = {
 
 def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     """True when ``table`` still carries the legacy (pre-AUTOINCREMENT) shape."""
-    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    info = conn.execute("SELECT name,type,pk FROM pragma_table_info(?)", (table,)).fetchall()
     if not info:
         return False  # table absent — nothing to rebuild
     if table == "kanban_notify_subs":
