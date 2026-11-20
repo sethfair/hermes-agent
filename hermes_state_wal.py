@@ -733,7 +733,14 @@ def _apply_synchronous_pragma(conn: sqlite3.Connection, raw_value: Any, *, db_la
                        "to prevent.", db_label, _SYNCHRONOUS_NAMES[level])
         return
     with contextlib.suppress(sqlite3.OperationalError):
-        conn.execute(f"PRAGMA synchronous={level}")
+        if level == 0:
+            conn.execute("PRAGMA synchronous=0")
+        elif level == 1:
+            conn.execute("PRAGMA synchronous=1")
+        elif level == 2:
+            conn.execute("PRAGMA synchronous=2")
+        else:
+            conn.execute("PRAGMA synchronous=3")
 
 
 def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.db") -> None:

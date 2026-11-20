@@ -12,7 +12,7 @@ import hashlib
 import json
 import random
 import re
-import secrets
+
 import shutil
 import sqlite3
 import threading
@@ -821,13 +821,10 @@ def _attempt_index_reindex_repair(path: Path, index_names: list[str]) -> tuple[b
     except sqlite3.Error as exc:
         return False, [f"could not reopen for REINDEX: {exc}"]
     try:
-        try:
-            for name in index_names:
-                escaped = name.replace('"', '""')
-                conn.execute(f'REINDEX "{escaped}"')
-        except sqlite3.Error:
-            # Per-index rebuild failed — bare REINDEX rebuilds every index.
-            conn.execute("REINDEX")
+        # Every reported name is already known to be index-only corruption.
+        # Bare REINDEX avoids interpolating identifiers and rebuilds the same
+        # affected indexes plus any healthy peers before the mandatory recheck.
+        conn.execute("REINDEX")
         messages = _run_integrity_check(conn)
     except sqlite3.Error as exc:
         return False, [f"REINDEX failed: {exc}"]
@@ -1223,7 +1220,7 @@ _RENAMED_TASK_COLUMNS = (
         "consecutive_failures", "consecutive_failures INTEGER NOT NULL DEFAULT 0",
         "spawn_failures", "UPDATE tasks SET consecutive_failures = COALESCE(spawn_failures, 0)",
     ),
-    ("worker_pid", "worker_pid INTEGER", None, None),
+    ("worker_pid", "worker_pid INTEGER", "", ""),
     (
         "last_failure_error", "last_failure_error TEXT",
         "last_spawn_error", "UPDATE tasks SET last_failure_error = last_spawn_error",
@@ -1361,7 +1358,7 @@ def _migrate_add_optional_columns(
     for name, ddl, legacy, copy_sql in _RENAMED_TASK_COLUMNS:
         if name not in cols:
             added = _add_column_if_missing(conn, "tasks", name, ddl)
-            if added and legacy is not None and legacy in cols:
+            if added and legacy and legacy in cols:
                 conn.execute(copy_sql)
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
@@ -1942,17 +1939,16 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 "(savepoint semantics; the inner RELEASE is not durable until "
                 "the outer transaction commits)."
             )
-        savepoint = f"hermes_nested_{secrets.token_hex(8)}"
-        conn.execute(f"SAVEPOINT {savepoint}")
+        conn.execute("SAVEPOINT hermes_nested")
         try:
             yield conn
         except Exception:
             with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute(f"ROLLBACK TO {savepoint}")
-                conn.execute(f"RELEASE {savepoint}")
+                conn.execute("ROLLBACK TO hermes_nested")
+                conn.execute("RELEASE hermes_nested")
             raise
         else:
-            conn.execute(f"RELEASE {savepoint}")
+            conn.execute("RELEASE hermes_nested")
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
