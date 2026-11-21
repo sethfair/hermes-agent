@@ -73,7 +73,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || 'warp-ubuntu-latest-x64-2x' }}
     timeout-minutes: 3
     outputs:
       python: ${{ steps.gate-lanes.outputs.python }}
