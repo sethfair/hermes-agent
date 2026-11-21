@@ -142,11 +142,13 @@ events made with the default `GITHUB_TOKEN`. `workflow_dispatch` and
 
 ### Runners
 
-All workflows use standard GitHub-hosted runners: `ubuntu-latest`,
-`ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm`, `macos-latest`, and
-`macos-15`.
-No workflow uses paid or self-hosted runner labels, and no workflow runs on
-Intel macOS.
+The `ci.yaml` classifier uses the paid WarpBuild
+`warp-ubuntu-latest-x64-2x` runner for trusted same-repository pull requests,
+pushes, dispatches, and workflow calls. True fork and Dependabot pull requests
+fall back to the GitHub-hosted `ubuntu-latest` runner. Every other job keeps its
+existing GitHub-hosted or dynamic runner label, including `ubuntu-24.04-arm`,
+`windows-latest`, `windows-11-arm`, `macos-latest`, and `macos-15`. No workflow
+runs on Intel macOS.
 
 ---
 
