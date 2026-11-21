@@ -127,13 +127,16 @@ def reconcile_pending_dead_workers(
         retry_status = payload.get("retry_status")
         if retry_status not in {"ready", "review"}:
             continue
+        infrastructure = bool(payload.get("infrastructure"))
         protocol = bool(payload.get("protocol_violation"))
         terminal = bool(payload.get("terminal_provider"))
-        count_failure = True
-        force_trip = terminal
+        count_failure = not infrastructure
+        force_trip = terminal and not infrastructure
         effective_limit = failure_limit
         extra = {"pid": payload.get("pid"), "claimer": payload.get("claimer")}
-        if protocol:
+        if infrastructure:
+            extra["infrastructure"] = True
+        elif protocol:
             streak = dispatch._protocol_violation_streak(conn, row["task_id"])
             override = kb._row_get(row, "max_retries")
             effective_limit = int(override) if override is not None else protocol_failure_limit
@@ -143,7 +146,7 @@ def reconcile_pending_dead_workers(
                 "protocol_violations": streak,
                 "protocol_violation_limit": effective_limit,
             })
-        if terminal:
+        if terminal and not infrastructure:
             extra["terminal_provider"] = True
         result = _state().dispatch_failure_transition(
             conn,

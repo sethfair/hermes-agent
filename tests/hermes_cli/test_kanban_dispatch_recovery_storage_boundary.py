@@ -377,3 +377,39 @@ def test_pending_dead_worker_failure_accounting_is_reconciled(board, monkeypatch
     recovered = kb.get_task(board, task_id)
     assert recovered is not None and recovered.status == "ready"
     assert recovered.consecutive_failures == 1
+
+
+def test_pending_host_loss_accounting_is_reconciled_without_spending_failure_budget(
+    board, monkeypatch,
+) -> None:
+    task_id, _run_id = _dead_worker(board)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    def mark_infrastructure(_conn, _task_id, _pid, dead) -> None:
+        dead.infrastructure = True
+        dead.event_payload["infrastructure"] = True
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_owner_recovery.apply_attempt_note",
+        mark_infrastructure,
+    )
+    board.execute("UPDATE tasks SET consecutive_failures=1 WHERE id=?", (task_id,))
+    board.execute(
+        "CREATE TRIGGER refuse_host_loss_accounting BEFORE INSERT ON task_transition_receipts "
+        "WHEN NEW.operation_kind='dispatch_failure' "
+        "BEGIN SELECT RAISE(ABORT, 'forced host-loss accounting failure'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced host-loss accounting failure"):
+        kbd.detect_crashed_workers(board)
+    interrupted = kb.get_task(board, task_id)
+    assert interrupted is not None and interrupted.status == "recovering"
+
+    board.execute("DROP TRIGGER refuse_host_loss_accounting")
+    assert kbd.detect_crashed_workers(board) == []
+    recovered = kb.get_task(board, task_id)
+    run = kb.latest_run(board, task_id)
+    assert recovered is not None and recovered.status == "ready"
+    assert recovered.consecutive_failures == 1
+    assert run is not None and run.metadata is not None
+    assert run.metadata["infrastructure"] is True
