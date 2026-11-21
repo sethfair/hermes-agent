@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 
+class TransactionOutcomeUnknown(RuntimeError):
+    """COMMIT failed after SQLite stopped reporting an active transaction."""
+
+
 def open_db(
     path: Path | str,
     *,
@@ -110,4 +114,13 @@ def write_txn(conn: sqlite3.Connection):
             pass
         raise
     else:
-        conn.execute("COMMIT")
+        try:
+            conn.execute("COMMIT")
+        except Exception as exc:
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            raise TransactionOutcomeUnknown("commit outcome is unknown") from exc

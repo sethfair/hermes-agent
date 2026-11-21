@@ -15,6 +15,8 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Optional
+
+from hermes_cli.sqlite_readonly import connect_readonly
 from typing import TYPE_CHECKING
 import contextlib
 
@@ -154,13 +156,9 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
 
 
 def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
-    uri = db_file.as_uri() + "?mode=ro"
-    other = sqlite3.connect(uri, uri=True, timeout=1.0)
-    try:
+    with connect_readonly(db_file, timeout=1.0) as other:
         other.row_factory = sqlite3.Row
         return _conn_uses_path(other, task_id, key, exclude_task_id=False)
-    finally:
-        other.close()
 
 
 def _workspace_in_use_by_other(

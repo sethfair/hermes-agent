@@ -13,23 +13,30 @@ def account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """
     from hermes_cli import kanban_db as _kb
     from hermes_cli.kanban_db_dispatch import (
-        _error_fingerprint, _protocol_violation_streak, _record_task_failure,
+        DEFAULT_FAILURE_LIMIT,
+        _error_fingerprint,
+        _protocol_violation_streak,
         _PROTOCOL_VIOLATION_FAILURE_LIMIT,
+    )
+    from hermes_cli.kanban_dispatch_recovery.dead_worker import (
+        record_recovered_worker_failure,
     )
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
-    for _, _, _, dead in crash_details:
+    for _, _, _, _, dead in crash_details:
         if dead.infrastructure:
             continue  # a stalled host kills every worker at once: not a systemic card fault
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
-    for tid, pid, claimer, dead in crash_details:
+    for tid, pid, claimer, run_id, dead in crash_details:
         error_text = dead.error_text
         if dead.infrastructure:
-            # Host-side loss: stamp the error, leave ``consecutive_failures`` alone.
-            _record_task_failure(
-                conn, tid, error=error_text, outcome="crashed", release_claim=False, end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer}, infrastructure=True,
+            # Host-side loss: finalize the reclaim without consuming the task's failure budget.
+            record_recovered_worker_failure(
+                conn, tid, pid, claimer, run_id, dead,
+                default_failure_limit=DEFAULT_FAILURE_LIMIT,
+                count_failure=False,
+                event_payload_extra={"infrastructure": True},
             )
             continue
         if dead.protocol_violation:
@@ -42,22 +49,25 @@ def account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
                 int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
             )
             if streak < violation_limit:
-                # Below budget: already back at ``ready`` with the error stamped.
-                # No ``_record_task_failure`` — must not consume the unified budget.
+                record_recovered_worker_failure(
+                    conn, tid, pid, claimer, run_id, dead,
+                    default_failure_limit=DEFAULT_FAILURE_LIMIT,
+                    failure_limit=violation_limit,
+                    count_failure=False,
+                    event_payload_extra={
+                        "protocol_violations": streak,
+                        "protocol_violation_limit": violation_limit,
+                    },
+                )
                 continue
             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
             # already made against the violation streak above.
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
+            tripped = record_recovered_worker_failure(
+                conn, tid, pid, claimer, run_id, dead,
+                default_failure_limit=DEFAULT_FAILURE_LIMIT,
                 failure_limit=violation_limit,
                 force_trip=True,
-                release_claim=False,
-                end_run=False,
                 event_payload_extra={
-                    "pid": pid,
-                    "claimer": claimer,
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
                 },
@@ -67,28 +77,22 @@ def account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
             # the whole ``failure_limit`` budget would be spent on identical
             # failures. ``force_trip`` blocks now, sticky: ``recompute_ready``
             # must not auto-resume it before the operator fixes the provider.
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
+            tripped = record_recovered_worker_failure(
+                conn, tid, pid, claimer, run_id, dead,
+                default_failure_limit=DEFAULT_FAILURE_LIMIT,
                 force_trip=True,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
+                event_payload_extra={"terminal_provider": True},
             )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
-            extra = {"pid": pid, "claimer": claimer}
+            extra = {}
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
+            tripped = record_recovered_worker_failure(
+                conn, tid, pid, claimer, run_id, dead,
+                default_failure_limit=DEFAULT_FAILURE_LIMIT,
                 failure_limit=1 if is_systemic else None,
-                release_claim=False,
-                end_run=False,
                 event_payload_extra=extra,
             )
         if tripped:

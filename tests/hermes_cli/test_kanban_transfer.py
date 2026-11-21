@@ -110,6 +110,79 @@ def _tasks_by_title(slug: str) -> dict[str, dict]:
         }
 
 
+def _seed_authenticated_state(
+    slug: str, task_id: str, *, only: str | None = None
+) -> None:
+    with kbc.connect_closing(board=slug) as conn:
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id LIMIT 1",
+            (task_id,),
+        ).fetchone()[0]
+        inserts = {
+            "service_principals": (
+            "INSERT INTO service_principals "
+            "(board, principal_id, credential_id, operation_scope, enabled, registry_revision, created_at) "
+            "VALUES (?, 'office', 'office-local', 'task.transition', 1, 1, 1)",
+                (slug,),
+            ),
+            "configured_callers": (
+            "INSERT INTO configured_callers "
+            "(board, operation_scope, principal_id, credential_id) "
+            "VALUES (?, 'task.transition', 'office', 'office-local')",
+                (slug,),
+            ),
+            "principal_registry_events": (
+                "INSERT INTO principal_registry_events "
+                "(board, operation_scope, principal_id, credential_id, registry_revision, action, created_at) "
+                "VALUES (?, 'task.transition', 'office', 'office-local', 1, 'provisioned', 1)",
+                (slug,),
+            ),
+            "kanban_capabilities": (
+            "INSERT INTO kanban_capabilities "
+            "(board, capability, mode, required_consumer_version, cutover_evidence, updated_at) "
+            "VALUES (?, 'action_receipts', 'live', '1.0.0', '{}', 1)",
+                (slug,),
+            ),
+            "kanban_capability_events": (
+                "INSERT INTO kanban_capability_events "
+                "(board, capability, previous_mode, mode, required_consumer_version, cutover_evidence, created_at) "
+                "VALUES (?, 'action_receipts', 'off', 'live', '1.0.0', '{}', 1)",
+                (slug,),
+            ),
+            "action_receipts": (
+            "INSERT INTO action_receipts "
+            "(receipt_id, schema_version, board, task_id, operation_id, operation, "
+            "principal_id, credential_id, action_generation, resulting_generation, "
+            "park_generation, action_class, from_status, to_status, transition_json, "
+            "transition_digest, request_digest, guard_fingerprint, outcome, event_id, committed_at) "
+            "VALUES ('receipt-1', 1, ?, ?, 'operation-1', 'task.transition', "
+            "'office', 'office-local', 0, 1, 0, 'office.approval', 'ready', 'todo', "
+            "'{}', 'transition-digest', 'request-digest', 'guard-digest', 'committed', ?, 1)",
+                (slug, task_id, event_id),
+            ),
+            "advisory_notices": (
+                "INSERT INTO advisory_notices "
+                "(notice_id, schema_version, board, task_id, operation_id, notice_kind, "
+                "principal_id, credential_id, action_generation, park_generation, "
+                "guard_fingerprint, content, content_digest, request_digest, event_id, committed_at) "
+                "VALUES ('notice-1', 1, ?, ?, 'notice-operation-1', 'review', "
+                "'office', 'office-local', 0, 0, 'guard-digest', 'Review', "
+                "'content-digest', 'notice-request-digest', ?, 1)",
+                (slug, task_id, event_id),
+            ),
+            "operation_keys": (
+            "INSERT INTO operation_keys "
+            "(board, operation_id, kind, record_id, principal_id, credential_id, digest) "
+            "VALUES (?, 'operation-1', 'action', 'receipt-1', 'office', 'office-local', 'request-digest')",
+                (slug,),
+            ),
+        }
+        selected = inserts.items() if only is None else ((only, inserts[only]),)
+        for _table, (sql, params) in selected:
+            conn.execute(sql, params)
+        conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Round trip
 # ---------------------------------------------------------------------------
@@ -176,6 +249,22 @@ def test_workspaces_are_never_exported(kanban_root, tmp_path):
     with tarfile.open(archive, "r:gz") as tf:
         names = tf.getnames()
     assert not any("workspaces" in name for name in names)
+
+
+def test_export_backup_source_is_opened_read_only(kanban_root, tmp_path, monkeypatch):
+    _seed_board()
+    modes = []
+    original = kbc._sqlite_connect
+
+    def tracked(path, **kwargs):
+        modes.append(kwargs.get("read_only", False))
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(kbc, "_sqlite_connect", tracked)
+
+    kt.export_board("alpha", str(tmp_path / "alpha"))
+
+    assert modes == [True, False]
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +346,64 @@ def test_board_metadata_loses_exporter_local_paths(kanban_root, tmp_path):
 # ---------------------------------------------------------------------------
 # Import never overwrites
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["rename", "collision"])
+def test_authenticated_archive_rejects_board_rebinding_without_partial_import(
+    kanban_root, tmp_path, mode
+):
+    ids = _seed_board()
+    _seed_authenticated_state("alpha", ids["scratch"])
+    archive = kt.export_board("alpha", str(tmp_path / "alpha-auth"))["archive"]
+
+    kanban_root("target")
+    if mode == "collision":
+        kb.create_board("alpha", name="Existing Alpha")
+        target = "alpha-2"
+        import_kwargs = {}
+    else:
+        target = "beta"
+        import_kwargs = {"slug": target}
+
+    with pytest.raises(ValueError, match="authenticated.*cannot be imported as"):
+        kt.import_board(archive, **import_kwargs)
+
+    assert not kb.board_dir(target).exists()
+    if mode == "collision":
+        assert kb.read_board_metadata("alpha")["name"] == "Existing Alpha"
+
+
+def test_relocation_failure_never_publishes_a_partial_board(
+    kanban_root, tmp_path, monkeypatch
+):
+    _seed_board()
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+
+    kanban_root("target")
+
+    def fail_relocation(*_args, **_kwargs):
+        raise RuntimeError("forced relocation failure")
+
+    monkeypatch.setattr(kt, "_relocate_imported_rows", fail_relocation)
+    with pytest.raises(RuntimeError, match="forced relocation failure"):
+        kt.import_board(archive)
+
+    assert not kb.board_dir("alpha").exists()
+
+
+@pytest.mark.parametrize("table", kt._AUTHENTICATED_BOARD_TABLES)
+def test_each_authenticated_table_independently_prevents_rebinding(
+    kanban_root, tmp_path, table
+):
+    ids = _seed_board()
+    _seed_authenticated_state("alpha", ids["scratch"], only=table)
+    archive = kt.export_board("alpha", str(tmp_path / f"alpha-{table}"))["archive"]
+
+    kanban_root("target")
+    with pytest.raises(ValueError, match="authenticated.*cannot be imported as"):
+        kt.import_board(archive, slug="beta")
+
+    assert not kb.board_dir("beta").exists()
 
 def test_slug_collision_creates_a_new_board(kanban_root, tmp_path):
     _seed_board()

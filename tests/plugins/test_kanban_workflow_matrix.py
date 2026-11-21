@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_workflow as kw
+from hermes_cli.kanban_db_task_state import block_task_transition
 
 W = kw.DEFAULT_WORKFLOW
 
@@ -55,7 +56,11 @@ def _task_in(client, src: str) -> str:
         elif src == "running":
             assert kb.claim_task(conn, tid) is not None
         elif src == "blocked":
-            assert kb.block_task(conn, tid, reason="x")
+            assert block_task_transition(
+                conn, tid, actor_scope="workflow-matrix",
+                operation_id=f"workflow-matrix:block:{tid}", reason="x",
+                kind="transient", subject="workflow-matrix",
+            ).committed
         elif src == "scheduled":
             assert kb.schedule_task(conn, tid, reason="x")
         elif src == "review":

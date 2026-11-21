@@ -44,13 +44,6 @@ def _init_git_repo(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
 @pytest.mark.platforms("windows")
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
@@ -270,7 +263,7 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
             assert row["consecutive_failures"] == expected
         assert row["status"] == "blocked"
         kinds = [e.kind for e in kb.list_events(conn, t)]
-        assert kinds[-2:] == ["reclaimed", "gave_up"]
+        assert kinds[-3:] == ["reclaimed", "block_identity_unknown", "gave_up"]
 
 
 def test_stale_claim_extend_live_worker_does_not_count_failure(
@@ -1532,7 +1525,14 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL,"
         " status TEXT NOT NULL, created_at INTEGER NOT NULL)"
     )
-    seed.execute(kbc._REBUILD_SPECS["task_runs"][0])
+    seed.execute(
+        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "task_id TEXT NOT NULL, profile TEXT, step_key TEXT, status TEXT NOT NULL, "
+        "claim_lock TEXT, claim_expires INTEGER, worker_pid INTEGER, "
+        "worker_started_at INTEGER, max_runtime_seconds INTEGER, last_heartbeat_at INTEGER, "
+        "started_at INTEGER NOT NULL, ended_at INTEGER, "
+        "outcome TEXT, summary TEXT, metadata TEXT, error TEXT)"
+    )
     seed.commit()
     seed.close()
 

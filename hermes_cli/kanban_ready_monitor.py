@@ -5,6 +5,8 @@ observation is a controller fact; it is not evidence that a worker was sent.
 """
 from __future__ import annotations
 
+from hermes_cli.kanban_db_receipts_schema import ensure_board_identity_schema
+
 import hashlib
 import json
 import secrets
@@ -352,9 +354,10 @@ END;
 """
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: sqlite3.Connection, *, identity_board: str = "default") -> None:
     conn.execute("DROP TRIGGER IF EXISTS kanban_ready_claim_admission")
     conn.executescript(MONITOR_SCHEMA_SQL)
+    ensure_board_identity_schema(conn, identity_board=identity_board)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_ready_episodes)")}
     if "authority_set_digest" not in columns:
         conn.execute("ALTER TABLE kanban_ready_episodes ADD COLUMN authority_set_digest TEXT")
@@ -372,10 +375,24 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE kanban_controller_observations ADD COLUMN {name} {definition}")
     row = conn.execute("SELECT board_scope_id FROM kanban_board_identity WHERE singleton=1").fetchone()
     if row is None:
-        conn.execute(
-            "INSERT INTO kanban_board_identity VALUES (1, ?, ?, 1)",
-            (str(uuid.uuid4()), int(time.time())),
-        )
+        scope_id = str(uuid.uuid4())
+        created_at = int(time.time())
+        identity_columns = {
+            item["name"] for item in conn.execute("PRAGMA table_info(kanban_board_identity)")
+        }
+        if "board" in identity_columns:
+            conn.execute(
+                "INSERT INTO kanban_board_identity "
+                "(singleton, board, board_scope_id, created_at, identity_version) "
+                "VALUES (1, ?, ?, ?, 1)",
+                (identity_board, scope_id, created_at),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO kanban_board_identity "
+                "(singleton, board_scope_id, created_at, identity_version) VALUES (1, ?, ?, 1)",
+                (scope_id, created_at),
+            )
     conn.commit()
 
 

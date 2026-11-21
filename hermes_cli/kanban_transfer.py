@@ -22,7 +22,6 @@ default board's split on-disk layout.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import shutil
 import sqlite3
@@ -34,6 +33,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.sqlite_private_copy import connect_private_copy
 from hermes_cli.archive_safe import (
     archive_root_dirs,
     copy_regular_files,
@@ -50,6 +50,16 @@ ARCHIVE_FORMAT_VERSION = 1
 # alone rather than having their history rewritten.
 _DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled")
 _COUNTED_TABLES = ("tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments")
+_AUTHENTICATED_BOARD_TABLES = (
+    "service_principals",
+    "configured_callers",
+    "principal_registry_events",
+    "kanban_capabilities",
+    "kanban_capability_events",
+    "operation_keys",
+    "action_receipts",
+    "advisory_notices",
+)
 
 
 def _placeholders(items) -> str:
@@ -61,11 +71,8 @@ def _placeholders(items) -> str:
 # ---------------------------------------------------------------------------
 
 def _snapshot_db(source: Path, target: Path) -> None:
-    """Consistent copy of ``source`` via the online-backup API (a file copy
-    would miss pages still in the ``-wal`` sidecar and could tear)."""
-    with contextlib.closing(sqlite3.connect(str(source))) as src, \
-            contextlib.closing(sqlite3.connect(str(target))) as dst:
-        src.backup(dst)
+    """Consistent copy of ``source`` through storage's read-only backup seam."""
+    kbc.backup_database(source, target)
 
 
 def _scrub_local_state(conn: sqlite3.Connection) -> None:
@@ -120,7 +127,10 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _count_rows(conn: sqlite3.Connection) -> dict[str, int]:
-    return {t: int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]) for t in _COUNTED_TABLES}
+    counts: dict[str, int] = {}
+    for table in _COUNTED_TABLES:
+        counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    return counts
 
 
 def export_board(
@@ -151,7 +161,7 @@ def export_board(
         _snapshot_db(db_path, staged / "kanban.db")
         # The snapshot is a private file with no other writers, so plain
         # commit/close is enough — no need for the board DB's WAL dance.
-        with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
+        with connect_private_copy(staged / "kanban.db", private_root=staged) as snapshot:
             _scrub_local_state(snapshot)
             snapshot.commit()
             counts = _count_rows(snapshot)
@@ -239,7 +249,41 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[str, int], list[str]]:
+def _refuse_authenticated_board_rebinding(
+    db_path: Path, target: str, *, private_root: Path,
+) -> None:
+    """Fail before publication when import would strand board-keyed authority."""
+    with connect_private_copy(db_path, private_root=private_root) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        bound_boards: set[str] = set()
+        for table in _AUTHENTICATED_BOARD_TABLES:
+            if table not in tables:
+                continue
+            bound_boards.update(
+                str(row[0])
+                for row in conn.execute(
+                    f"SELECT DISTINCT board FROM {table} WHERE board IS NOT NULL"
+                ).fetchall()
+            )
+    if bound_boards and bound_boards != {target}:
+        sources = ", ".join(sorted(bound_boards))
+        raise ValueError(
+            f"authenticated board state for {sources!r} cannot be imported as "
+            f"{target!r}; import under its original unused slug"
+        )
+
+
+def _relocate_imported_rows(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    attachments_source: Optional[Path] = None,
+) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine; returns ``(stats, warnings)``.
 
     * Attachment rows are repointed at this board's tree; rows whose blob
@@ -257,16 +301,36 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
 
     with kb.write_txn(conn):
         _scrub_local_state(conn)
+        # Import is the one authorized identity replacement: the copied board
+        # must receive this machine's fresh scope before it becomes visible.
+        conn.execute("DROP TRIGGER kanban_board_identity_immutable_update")
+        conn.execute("DROP TRIGGER kanban_board_identity_immutable_delete")
         conn.execute("DELETE FROM kanban_board_identity")
         conn.execute(
-            "INSERT INTO kanban_board_identity(singleton,board_scope_id,created_at,identity_version) VALUES(1,?,?,1)",
-            (str(uuid.uuid4()), now),
+            "INSERT INTO kanban_board_identity(singleton,board,board_scope_id,created_at,identity_version) "
+            "VALUES(1,?,?,?,1)",
+            (slug, str(uuid.uuid4()), now),
+        )
+        conn.execute(
+            "CREATE TRIGGER kanban_board_identity_immutable_update "
+            "BEFORE UPDATE ON kanban_board_identity "
+            "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER kanban_board_identity_immutable_delete "
+            "BEFORE DELETE ON kanban_board_identity "
+            "BEGIN SELECT RAISE(ABORT, 'immutable_board_identity'); END"
         )
 
         dropped = rehomed = 0
         for row in conn.execute("SELECT id, task_id, stored_path FROM task_attachments").fetchall():
             landed = attachments_dir / row["task_id"] / Path(row["stored_path"]).name
-            if landed.is_file():
+            source = (
+                attachments_source / row["task_id"] / Path(row["stored_path"]).name
+                if attachments_source is not None
+                else landed
+            )
+            if source.is_file():
                 conn.execute("UPDATE task_attachments SET stored_path = ? WHERE id = ?", (str(landed), row["id"]))
                 rehomed += 1
             else:
@@ -336,34 +400,52 @@ def import_board(
             )
         target = _available_slug(requested)
 
+        # Receipt and principal history is authoritative and board-keyed. Until
+        # import has an explicit history-preserving rekey protocol, reject a
+        # rename/collision before creating target metadata or moving any files.
+        _refuse_authenticated_board_rebinding(
+            staged_db, target, private_root=extracted
+        )
+
         staged_meta = _read_board_metadata(extracted / "board.json")
 
+        # Migrate and normalize the private extracted copy. No board becomes
+        # discoverable until every protected row and the fresh physical board
+        # identity have committed successfully.
+        kbc.init_db(db_path=staged_db)
+        with connect_private_copy(staged_db, private_root=extracted) as staged:
+            staged.row_factory = sqlite3.Row
+            stats, warnings = _relocate_imported_rows(
+                staged,
+                target,
+                attachments_source=extracted / "attachments",
+            )
+            counts = _count_rows(staged)
+
+        # Rewritten rather than moved across: the archive's copy names a slug
+        # and a workdir that belong to the exporting machine. Publish the DB
+        # last, after all other files are in place; cleanup keeps failed
+        # imports invisible and retryable.
+        name = str(staged_meta.get("name") or manifest.get("board_name") or target)
         board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
-        for tree in ("attachments", "logs"):
-            src = extracted / tree
-            if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))
-
-    # Rewritten rather than moved across: the archive's copy names a slug
-    # and a workdir that belong to the exporting machine.
-    name = str(staged_meta.get("name") or manifest.get("board_name") or target)
-    kb.write_board_metadata(
-        target,
-        name=name,
-        description=str(staged_meta.get("description") or ""),
-        icon=str(staged_meta.get("icon") or ""),
-        color=str(staged_meta.get("color") or ""),
-        archived=False,
-    )
-    # Bring the imported schema up to this install's version before the
-    # relocation pass writes to it.
-    kb.init_db(board=target)
-
-    with kbc.connect_closing(board=target) as conn:
-        stats, warnings = _relocate_imported_rows(conn, target)
-        counts = _count_rows(conn)
+        board_root.mkdir(parents=True, exist_ok=False)
+        try:
+            for tree in ("attachments", "logs"):
+                src = extracted / tree
+                if src.is_dir():
+                    shutil.move(str(src), str(board_root / tree))
+            kb.write_board_metadata(
+                target,
+                name=name,
+                description=str(staged_meta.get("description") or ""),
+                icon=str(staged_meta.get("icon") or ""),
+                color=str(staged_meta.get("color") or ""),
+                archived=False,
+            )
+            shutil.move(str(staged_db), str(board_root / "kanban.db"))
+        except Exception:
+            shutil.rmtree(board_root, ignore_errors=True)
+            raise
 
     if activate:
         kb.set_current_board(target)
