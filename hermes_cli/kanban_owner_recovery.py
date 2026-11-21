@@ -207,10 +207,10 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
 
 
 # What the owner records when the HOST, not the card's own code, lost the attempt: a gateway too
-# stalled to answer the worker's write inside its receipt window (``worker_receipt_timeout``, which
-# the owner books under the exception's type, ``TimeoutError``) or whose pipe closed under it
-# (``EOFError``), and an admission the owner itself settled ``interrupted``. ``managed_worker_failed``
-# is deliberately absent: it is the worker's own uncaught exception, a genuine error.
+# stalled to answer inside the receipt window, a pipe closed under it, or an admission the owner
+# settled ``interrupted``. ``TimeoutError`` and ``EOFError`` retain compatibility with historical
+# owner events; current workers emit the other fixed tokens. ``managed_worker_failed`` is absent:
+# it is the worker's own uncaught exception, a genuine error.
 HOST_LOSS_REASONS = frozenset({'worker_receipt_timeout', 'TimeoutError', 'EOFError', 'managed_worker_pipe_closed'})
 _LOST_PREFIX = 'managed worker lost: '
 _ADMISSION_INTERRUPTED_NOTE = 'owner admission settled interrupted'

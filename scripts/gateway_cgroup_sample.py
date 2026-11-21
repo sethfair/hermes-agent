@@ -5,7 +5,7 @@ I/O fields are lifetime counters, NOT rates. No argv, environments or file conte
 are collected. Sampling races with exit/migration; unavailable fields remain null.
 """
 import argparse
-from datetime import datetime, timezone, UTC
+from datetime import datetime, UTC
 import json
 from pathlib import Path
 import subprocess
