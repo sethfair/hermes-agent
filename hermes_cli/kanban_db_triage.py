@@ -71,6 +71,34 @@ def _require_read_statement(sql: str) -> None:
         raise RuntimeError("Triage release guard connection is read-only")
 
 
+def _execute_guard_read(executor: Any, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+    """Execute one of the finite reads exposed to a trusted release guard."""
+    _require_read_statement(sql)
+    if sql == "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC":
+        return executor.execute(
+            "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
+            parameters,
+        )
+    if sql == (
+        "SELECT p.id,p.status FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+        "WHERE l.child_id=? AND p.status NOT IN ('done','archived') ORDER BY p.id"
+    ):
+        return executor.execute(
+            "SELECT p.id,p.status FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND p.status NOT IN ('done','archived') ORDER BY p.id",
+            parameters,
+        )
+    if sql == "SELECT count(*) FROM task_links WHERE child_id = ?":
+        return executor.execute(
+            "SELECT count(*) FROM task_links WHERE child_id = ?", parameters,
+        )
+    if sql == "SELECT max(1, 2), coalesce(NULL, 3)":
+        return executor.execute("SELECT max(1, 2), coalesce(NULL, 3)", parameters)
+    if sql == "SELECT 1":
+        return executor.execute("SELECT 1", parameters)
+    raise sqlite3.DatabaseError("unsupported Triage release guard read operation")
+
+
 class _ReadOnlyCursor:
     """Cursor view that cannot turn a previously allowed read into a write."""
 
@@ -93,8 +121,7 @@ class _ReadOnlyCursor:
         return self.__cursor.rowcount
 
     def execute(self, sql: str, parameters: Any = ()) -> _ReadOnlyCursor:
-        _require_read_statement(sql)
-        self.__cursor.execute(sql, parameters)
+        _execute_guard_read(self.__cursor, sql, parameters)
         return self
 
     def executemany(self, _sql: str, _parameters: Any) -> None:
@@ -136,8 +163,7 @@ class _ReadOnlyConnection:
         return self.__connection.total_changes
 
     def execute(self, sql: str, parameters: Any = ()) -> _ReadOnlyCursor:
-        _require_read_statement(sql)
-        return _ReadOnlyCursor(self.__connection.execute(sql, parameters), self)
+        return _ReadOnlyCursor(_execute_guard_read(self.__connection, sql, parameters), self)
 
     def cursor(self) -> _ReadOnlyCursor:
         return _ReadOnlyCursor(self.__connection.cursor(), self)
@@ -306,6 +332,9 @@ def _release_triage_task(
 ) -> TriageReleaseReceipt:
     """Release one Triage task; run ``guard`` (when given) inside the write transaction."""
     from hermes_cli import kanban_db as kb
+
+    if kb._has_unknown_block_identity(conn, task_id):
+        return TriageReleaseReceipt(False, "block_identity_unknown", kb._task_status(conn, task_id))
 
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")

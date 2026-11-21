@@ -1,0 +1,589 @@
+from pathlib import Path
+import json
+import sqlite3
+
+import pytest
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_graph as kbg
+from hermes_cli import kanban_db_task_state as task_state
+from hermes_cli.kanban_db_task_state import block_task_transition
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+
+def test_subject_interface(home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="identity interface", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert _typed_block(
+            conn,
+            tid,
+            kind="needs_input",
+            subject="adrian/decision-a",
+            reason="same",
+        )
+
+
+def test_legacy_block_ingress_commits_unknown_transition_receipt(home):
+    """Regression tracer for the legacy public block ingress.
+
+    The compatibility call has no durable actor/subject identity.  It must
+    therefore enter the typed owner as UNKNOWN while still committing the
+    task transition, event, and receipt as one operation.
+    """
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn, "legacy block tracer")
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="legacy failure",
+            kind="capability",
+        ) is True
+
+        receipt_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='task_transition_receipts'"
+        ).fetchone()
+        assert receipt_table is not None
+        row = kb.get_task(conn, tid)
+        assert (row.status, row.block_identity_state, row.block_identity) == (
+            "blocked",
+            "unknown",
+            None,
+        )
+        events = kb.list_events(conn, tid)
+        receipts = conn.execute(
+            "SELECT task_id, operation_kind, outcome_code, event_id "
+            "FROM task_transition_receipts WHERE task_id = ? AND operation_kind = 'block'",
+            (tid,),
+        ).fetchall()
+        assert [event.kind for event in events[-2:]] == [
+            "block_identity_unknown",
+            "blocked",
+        ]
+        assert len(receipts) == 1
+        assert tuple(receipts[0]) == (
+            tid,
+            "block",
+            "committed",
+            events[-1].id,
+        )
+
+
+def test_distinct_identity(home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="identity behavior", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert _typed_block(
+            conn,
+            tid,
+            kind="needs_input",
+            subject="adrian/decision-a",
+            reason="same",
+        )
+        assert kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert _typed_block(
+            conn,
+            tid,
+            kind="needs_input",
+            subject="adrian/decision-b",
+            reason="same",
+        )
+        row = kb.get_task(conn, tid)
+        assert (row.status, row.block_recurrences) == ("blocked", 1)
+
+
+def _ready_task(conn, title="identity behavior"):
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    return tid
+
+
+def _typed_block(conn, task_id, *, kind, subject, reason=None, actor="test"):
+    operation_id = f"test-block:{task_id}:{kind}:{subject}:{reason}"
+    return block_task_transition(
+        conn,
+        task_id,
+        actor_scope=actor,
+        operation_id=operation_id,
+        kind=kind,
+        subject=subject,
+        reason=reason,
+    ).committed
+
+
+def test_same_identity_changed_reason_hits_existing_limit(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        assert _typed_block(
+            conn, tid, kind="needs_input", subject="Adrian/Decision-A", reason="first prose"
+        )
+        first = kb.get_task(conn, tid)
+        assert first.block_identity == (
+            '{"kind":"needs_input","subject":"adrian/decision-a","v":1}'
+        )
+        assert kb.unblock_task(conn, tid)
+        assert _typed_block(
+            conn, tid, kind="needs_input", subject="adrian/decision-a", reason="different prose"
+        )
+        row = kb.get_task(conn, tid)
+        assert (row.status, row.block_recurrences) == ("triage", kb.BLOCK_RECURRENCE_LIMIT)
+        event = kb.list_events(conn, tid)[-1]
+        assert event.kind == "block_loop_detected"
+        assert event.payload["identity"] == row.block_identity
+        assert event.payload["identity_state"] == "known"
+
+
+def test_invalid_explicit_subject_is_unknown_and_redacted(home):
+    secret = "Owner/decision\nBearer private-value"
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        assert _typed_block(
+            conn, tid, kind="needs_input", subject=secret, reason="safe explanation"
+        )
+        row = kb.get_task(conn, tid)
+        assert (row.status, row.block_identity_state, row.block_identity) == (
+            "blocked", "unknown", None
+        )
+        events = kb.list_events(conn, tid)
+        assert [event.kind for event in events[-2:]] == ["block_identity_unknown", "blocked"]
+        encoded = json.dumps([event.payload for event in events])
+        assert "private-value" not in encoded
+        assert events[-1].payload["unknown_cause"] == "invalid_subject"
+
+
+def test_invalid_raw_subjects_collide_instead_of_replaying(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        operation_id = "invalid-subject-collision"
+        first = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="needs_input",
+            subject="invalid subject one",
+        )
+        second = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="needs_input",
+            subject="invalid subject two",
+        )
+
+        assert first.committed is True
+        assert (second.committed, second.refusal) == (False, "operation_id_collision")
+        receipt = conn.execute(
+            "SELECT request_hash FROM task_transition_receipts WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        assert receipt is not None
+        assert "invalid subject" not in receipt[0]
+
+
+def test_block_replay_returns_validated_result_tuple_receipt(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        operation_id = "block-result-tuple"
+        first = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="capability",
+            subject="missing-access",
+        )
+        replay = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="capability",
+            subject="missing-access",
+        )
+
+        assert replay == first
+        receipt = conn.execute(
+            "SELECT tuple_version, result_tuple_hash FROM task_transition_receipts "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        assert receipt[0] == 1
+        assert len(receipt[1]) == 64
+        int(receipt[1], 16)
+
+
+def test_replay_returns_recorded_landed_identity_state(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        operation_id = "landed-identity-state"
+        first = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="dependency",
+            subject="t_deadbeef",
+        )
+        replay = block_task_transition(
+            conn,
+            tid,
+            actor_scope="test",
+            operation_id=operation_id,
+            kind="dependency",
+            subject="t_deadbeef",
+        )
+
+        assert first.identity_state == "unknown"
+        assert replay == first
+        assert conn.execute(
+            "SELECT result_identity_state FROM task_transition_receipts "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()[0] == "unknown"
+
+
+def test_classification_operation_replays_and_refuses_collision(home):
+    assert callable(task_state.classify_block_transition)
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        assert kb.block_task(conn, tid, kind="needs_input", reason="classification required")
+        before_events = len(kb.list_events(conn, tid))
+        operation_id = "classify-operation"
+
+        first = task_state.classify_block_transition(
+            conn,
+            tid,
+            operation_id=operation_id,
+            actor_scope="operator",
+            kind="needs_input",
+            subject="owner/decision-a",
+        )
+        replay = task_state.classify_block_transition(
+            conn,
+            tid,
+            operation_id=operation_id,
+            actor_scope="operator",
+            kind="needs_input",
+            subject="owner/decision-a",
+        )
+        collision = task_state.classify_block_transition(
+            conn,
+            tid,
+            operation_id=operation_id,
+            actor_scope="operator",
+            kind="needs_input",
+            subject="owner/decision-b",
+        )
+
+        assert replay == first
+        assert first.committed is True
+        assert (collision.committed, collision.refusal) == (False, "operation_id_collision")
+        assert len(kb.list_events(conn, tid)) == before_events + 1
+        receipt = conn.execute(
+            "SELECT operation_kind, tuple_version, result_tuple_hash "
+            "FROM task_transition_receipts WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        assert tuple(receipt[:2]) == ("classify_block", 1)
+        assert len(receipt[2]) == 64
+
+
+def test_unknown_requires_classification_before_unblock(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        assert kb.block_task(conn, tid, kind="needs_input", reason="owner is not yet classified")
+        before = kb.get_task(conn, tid)
+        assert before.block_identity_state == "unknown"
+        assert kb.unblock_task(conn, tid) is False
+        assert kb.classify_block(
+            conn,
+            tid,
+            kind="needs_input",
+            subject="adrian/decision-a",
+            actor="operator",
+        )
+        classified = kb.get_task(conn, tid)
+        assert classified.status == "blocked"
+        assert classified.block_identity_state == "known"
+        assert classified.block_recurrences == 1
+        assert kb.unblock_task(conn, tid)
+
+
+def _unknown_triage(conn):
+    tid = kb.create_task(conn, title="unknown triage", assignee="worker", triage=True)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET block_identity_state='unknown', block_kind='needs_input', "
+            "block_recurrences=1 WHERE id=?",
+            (tid,),
+        )
+    return tid
+
+
+def _state_snapshot(conn, tid):
+    return {
+        "task": tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()),
+        "runs": [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (tid,)
+        )],
+        "comments": [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_comments WHERE task_id=? ORDER BY id", (tid,)
+        )],
+        "links": [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_links WHERE parent_id=? OR child_id=? ORDER BY parent_id, child_id",
+            (tid, tid),
+        )],
+        "events": [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,)
+        )],
+    }
+
+
+def test_unknown_triage_refuses_guarded_and_unguarded_release_without_effects(home):
+    with kbc.connect_closing() as conn:
+        tid = _unknown_triage(conn)
+        before = _state_snapshot(conn, tid)
+        guard_called = False
+
+        def guard(_conn, _task_id):
+            nonlocal guard_called
+            guard_called = True
+            return kb.TriageReleaseGuardResult(True)
+
+        receipt = kb.guarded_specify_triage_task(
+            conn, tid, guard=guard, title="must not apply", author="operator"
+        )
+        assert (receipt.released, receipt.outcome, receipt.status) == (
+            False, "block_identity_unknown", "triage"
+        )
+        assert guard_called is False
+        assert _state_snapshot(conn, tid) == before
+        assert kb.specify_triage_task(conn, tid, title="must not apply", author="operator") is False
+        assert _state_snapshot(conn, tid) == before
+
+
+def test_unknown_triage_refuses_decomposition_without_fanout(home):
+    with kbc.connect_closing() as conn:
+        tid = _unknown_triage(conn)
+        before = _state_snapshot(conn, tid)
+        assert kbg.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "must not exist", "assignee": "worker"}],
+            author="operator",
+        ) is None
+        assert _state_snapshot(conn, tid) == before
+        assert conn.execute(
+            "SELECT 1 FROM tasks WHERE title='must not exist'"
+        ).fetchone() is None
+
+
+def test_dependency_identity_requires_named_open_direct_parent(home):
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id IN (?, ?)", (parent, child))
+        assert _typed_block(
+            conn, child, kind="dependency", subject="t_deadbeef", reason="wrong parent"
+        )
+        row = kb.get_task(conn, child)
+        assert (row.status, row.block_identity_state, row.block_kind) == (
+            "blocked", "unknown", "dependency"
+        )
+        assert kb.recompute_ready(conn) == 0
+
+
+def test_dependency_identity_waits_for_all_parents(home):
+    with kbc.connect_closing() as conn:
+        first = kb.create_task(conn, title="first parent", assignee="worker")
+        second = kb.create_task(conn, title="second parent", assignee="worker")
+        child = kb.create_task(
+            conn, title="child", assignee="worker", parents=[first, second]
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        assert _typed_block(
+            conn, child, kind="dependency", subject=first, reason="waiting"
+        )
+        parked = kb.get_task(conn, child)
+        assert (parked.status, parked.block_identity_state) == ("todo", "known")
+        assert kb.complete_task(conn, first, summary="first done")
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.complete_task(conn, second, summary="second done")
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_dependency_with_terminal_parent_becomes_unknown_sticky(home):
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="done parent", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        assert kb.complete_task(conn, parent, summary="done")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        assert _typed_block(
+            conn, child, kind="dependency", subject=parent, reason="stale wait"
+        )
+        row = kb.get_task(conn, child)
+        assert (row.status, row.block_identity_state, row.block_kind) == (
+            "blocked", "unknown", "dependency"
+        )
+        assert kb.recompute_ready(conn) == 0
+
+
+def test_unknown_todo_cannot_recompute_promote_or_claim(home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy dependency hold", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', block_kind='dependency', "
+                "block_recurrences=1, block_identity_state='unknown' WHERE id=?",
+                (tid,),
+            )
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb.promote_task(conn, tid, actor="operator", dry_run=True)[0] is False
+        assert kb.promote_task(conn, tid, actor="operator")[0] is False
+        assert kb.claim_task(conn, tid, claimer="worker") is None
+
+
+def test_failure_breaker_replaces_stale_known_identity_with_unknown(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn, "failure breaker identity")
+        assert _typed_block(
+            conn,
+            tid,
+            kind="needs_input",
+            subject="owner/decision",
+            reason="first hold",
+        )
+        assert kb.unblock_task(conn, tid)
+
+        assert kbd._record_task_failure(
+            conn,
+            tid,
+            "unrelated crash",
+            outcome="crashed",
+            force_trip=True,
+        )
+
+        blocked = kb.get_task(conn, tid)
+        assert blocked.status == "blocked"
+        assert blocked.block_identity_state == "unknown"
+        assert blocked.block_identity is None
+        assert blocked.block_kind is None
+        assert blocked.block_recurrences == 0
+        assert kb.unblock_task(conn, tid) is False
+        unknown = [event for event in kb.list_events(conn, tid) if event.kind == "block_identity_unknown"]
+        assert unknown[-1].payload["unknown_cause"] == "failure_breaker"
+
+
+def test_completion_clears_block_identity(home):
+    with kbc.connect_closing() as conn:
+        tid = _ready_task(conn)
+        assert _typed_block(
+            conn, tid, kind="capability", subject="missing-access", reason="waiting"
+        )
+        assert kb.complete_task(conn, tid, summary="operator closed the work")
+        row = kb.get_task(conn, tid)
+        assert (row.block_kind, row.block_recurrences, row.block_identity, row.block_identity_state) == (
+            None, 0, None, "none"
+        )
+
+
+def test_legacy_migration_uses_adjacent_graph_evidence_and_is_idempotent(tmp_path):
+    db_path = tmp_path / "legacy-kanban.db"
+    with sqlite3.connect(db_path) as legacy:
+        legacy.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+                created_at INTEGER NOT NULL, workspace_kind TEXT NOT NULL,
+                block_kind TEXT, block_recurrences INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL
+            );
+            CREATE TABLE task_links (
+                parent_id TEXT NOT NULL, child_id TEXT NOT NULL,
+                PRIMARY KEY (parent_id, child_id)
+            );
+            """
+        )
+        tasks = [
+            ("t_00000001", "parent", "ready", None, 0),
+            ("t_00000002", "ordinary", "todo", None, 0),
+            ("t_00000003", "blocked", "blocked", "needs_input", 1),
+            ("t_00000004", "graph child", "todo", None, 0),
+            ("t_00000005", "malformed", "todo", None, 0),
+        ]
+        legacy.executemany(
+            "INSERT INTO tasks (id,title,status,created_at,workspace_kind,block_kind,block_recurrences) "
+            "VALUES (?,?,?,1,'scratch',?,?)",
+            tasks,
+        )
+        events = [
+            ("t_00000001", "created", "{}"),
+            ("t_00000002", "created", "{}"),
+            ("t_00000003", "created", "{}"),
+            ("t_00000003", "blocked", '{"kind":"needs_input"}'),
+            ("t_00000004", "created", "{}"),
+            (
+                "t_00000004",
+                "dependency_wait",
+                '{"reason":"parent_not_done","demoted":true,"parent":"t_00000001"}',
+            ),
+            (
+                "t_00000004",
+                "linked",
+                '{"parent":"t_00000001","child":"t_00000004"}',
+            ),
+            ("t_00000005", "created", "{}"),
+            ("t_00000005", "edited", "{"),
+        ]
+        legacy.executemany(
+            "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,1)", events
+        )
+        legacy.execute(
+            "INSERT INTO task_links (parent_id,child_id) VALUES ('t_00000001','t_00000004')"
+        )
+
+    kb.init_db(db_path)
+    kb.init_db(db_path)
+    with kbc.connect_closing(db_path) as conn:
+        states = dict(conn.execute(
+            "SELECT id, block_identity_state FROM tasks ORDER BY id"
+        ).fetchall())
+        assert states == {
+            "t_00000001": "none",
+            "t_00000002": "none",
+            "t_00000003": "unknown",
+            "t_00000004": "none",
+            "t_00000005": "unknown",
+        }
+        migration_counts = dict(conn.execute(
+            "SELECT task_id, COUNT(*) FROM task_events "
+            "WHERE kind IN ('block_identity_migrated','block_identity_unknown') GROUP BY task_id"
+        ).fetchall())
+        assert migration_counts == {task_id: 1 for task_id in states}

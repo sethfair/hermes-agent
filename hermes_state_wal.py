@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+from hermes_cli.sqlite_pragmas import IntegerPragma, set_integer_pragma
+
 from hermes_cli.sqlite_runtime import is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable
 from hermes_state_errors import is_sqlite_lock_error
 
@@ -503,7 +505,7 @@ def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
         return _mode_from_row(conn.execute(f"PRAGMA journal_mode={mode}").fetchone())
     finally:
         with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
+            set_integer_pragma(conn, IntegerPragma.BUSY_TIMEOUT, previous_timeout)
 
 
 def _warn_existing_wal_on_cross_vm_fs(conn: sqlite3.Connection) -> None:
@@ -733,7 +735,14 @@ def _apply_synchronous_pragma(conn: sqlite3.Connection, raw_value: Any, *, db_la
                        "to prevent.", db_label, _SYNCHRONOUS_NAMES[level])
         return
     with contextlib.suppress(sqlite3.OperationalError):
-        conn.execute(f"PRAGMA synchronous={level}")
+        if level == 0:
+            conn.execute("PRAGMA synchronous=0")
+        elif level == 1:
+            conn.execute("PRAGMA synchronous=1")
+        elif level == 2:
+            conn.execute("PRAGMA synchronous=2")
+        else:
+            conn.execute("PRAGMA synchronous=3")
 
 
 def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.db") -> None:
@@ -749,7 +758,14 @@ def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.d
         cfg = load_config_readonly()
     except Exception:
         return
-    for pragma_name in ("cache_size", "mmap_size", "temp_store", "wal_autocheckpoint", "journal_size_limit"):
+    integer_pragmas = {
+        "cache_size": IntegerPragma.CACHE_SIZE,
+        "mmap_size": IntegerPragma.MMAP_SIZE,
+        "temp_store": IntegerPragma.TEMP_STORE,
+        "wal_autocheckpoint": IntegerPragma.WAL_AUTOCHECKPOINT,
+        "journal_size_limit": IntegerPragma.JOURNAL_SIZE_LIMIT,
+    }
+    for pragma_name, pragma in integer_pragmas.items():
         if (raw_value := cfg_get(cfg, "database", pragma_name, default=None)) is None:
             continue
         try:
@@ -758,7 +774,7 @@ def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.d
             logger.warning("%s: ignoring non-integer database.%s=%r", db_label, pragma_name, raw_value)
             continue
         with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute(f"PRAGMA {pragma_name}={value}")
+            set_integer_pragma(conn, pragma, value)
     # Last: sizing pragmas cannot change durability (see _apply_synchronous_pragma).
     if (raw_synchronous := cfg_get(cfg, "database", "synchronous", default=None)) is not None:
         _apply_synchronous_pragma(conn, raw_synchronous, db_label=db_label)

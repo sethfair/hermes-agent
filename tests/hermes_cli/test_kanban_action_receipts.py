@@ -18,6 +18,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_receipts as receipts
+from hermes_cli.sqlite_util import TransactionOutcomeUnknown
 try:  # Base-RED compatibility: the selected first test must collect before these modules exist.
     from hermes_cli.kanban_db_receipts import (
         ActionRequest,
@@ -293,6 +294,12 @@ def test_action_commit_is_atomic_exactly_replayable_and_conflict_safe(conn):
     assert task["status"] == "todo"
     assert receipt.resulting_generation == task["action_generation"]
     assert conn.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0] == 1
+    transition_receipt = conn.execute(
+        "SELECT operation_kind, event_id FROM task_transition_receipts "
+        "WHERE operation_id = ?",
+        (request.operation_id,),
+    ).fetchone()
+    assert tuple(transition_receipt) == ("authenticated_action", receipt.event_id)
     assert conn.execute(
         "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'authenticated_action'",
         (task_id,),
@@ -496,7 +503,7 @@ def test_storage_failure_rolls_back_action_event_receipt_and_projection(conn):
     before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
     conn.execute(
         """
-        CREATE TEMP TRIGGER reject_receipt BEFORE INSERT ON action_receipts
+        CREATE TRIGGER reject_receipt BEFORE INSERT ON action_receipts
         BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END
         """
     )
@@ -881,19 +888,19 @@ def test_lost_commit_ack_is_transaction_unknown_and_same_key_recovers_action(
     with closing(kbc.connect(db_path)) as connection:
         _task_id, context, request = _live_transition_setup(connection)
         _enable_live(connection)
-        original = receipts.write_txn
+        original = kbc._execute_boundary_with_retry
 
-        @contextmanager
-        def commit_then_lose_ack(conn):
-            with original(conn):
-                yield conn
-            raise RuntimeError("injected lost commit acknowledgement")
+        def commit_then_lose_ack(conn, sql):
+            result = original(conn, sql)
+            if sql == "COMMIT":
+                raise TransactionOutcomeUnknown("injected lost commit acknowledgement")
+            return result
 
-        monkeypatch.setattr(receipts, "write_txn", commit_then_lose_ack)
+        monkeypatch.setattr(kbc, "_execute_boundary_with_retry", commit_then_lose_ack)
         with pytest.raises(ActionReceiptError, match="transaction_unknown"):
             commit_action(connection, request, caller_context=context)
 
-    monkeypatch.setattr(receipts, "write_txn", original)
+    monkeypatch.setattr(kbc, "_execute_boundary_with_retry", original)
     with closing(kbc.connect(db_path)) as retry:
         recovered = commit_action(retry, request, caller_context=context)
         assert recovered.operation_id == request.operation_id

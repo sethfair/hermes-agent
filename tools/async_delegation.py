@@ -830,18 +830,24 @@ def failed_delegations_for_session(
     task (a batch unit that "completed" can still carry failed tasks) with ``delegation_id``,
     ``task_index``, ``goal``, ``status``, ``error``, ``dispatched_at`` and ``completed_at``. Either selector claims a row:
     the UI session id at dispatch, or the spawner's durable session id (survives a reload re-mint)."""
-    selectors = [(col, val) for col, val in (
-        ("origin_ui_session_id", origin_ui_session_id), ("parent_session_id", parent_session_id)) if val]
-    if not selectors:
+    if not origin_ui_session_id and not parent_session_id:
         return []
     cutoff = (now if now is not None else time.time()) - _FAILURE_SURFACE_WINDOW_S
-    owner_sql = " OR ".join(f"{col}=?" for col, _ in selectors)
+    if origin_ui_session_id and parent_session_id:
+        owner_sql = "(origin_ui_session_id=? OR parent_session_id=?)"
+        owner_params = (origin_ui_session_id, parent_session_id)
+    elif origin_ui_session_id:
+        owner_sql = "origin_ui_session_id=?"
+        owner_params = (origin_ui_session_id,)
+    else:
+        owner_sql = "parent_session_id=?"
+        owner_params = (parent_session_id,)
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             f"""SELECT delegation_id, state, dispatched_at, completed_at, task_json, result_json FROM async_delegations
                 WHERE ({owner_sql}) AND state!='running' AND completed_at >= ?
                 ORDER BY completed_at DESC LIMIT ?""",
-            (*(val for _, val in selectors), cutoff, limit)).fetchall()
+            (*owner_params, cutoff, limit)).fetchall()
     failed: list[dict[str, Any]] = []
     for delegation_id, state, dispatched_at, completed_at, task_json, result_json in rows:
         task, result = _json_object(task_json), redact_child_result(_json_object(result_json))

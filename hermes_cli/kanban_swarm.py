@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+from pathlib import Path
+import secrets
 import sqlite3
 import time
 from typing import Any, Iterable, Optional
@@ -58,51 +60,6 @@ def _require_text(value: str, field_name: str) -> str:
     return text
 
 
-def _swarm_context(root_id: str, goal: str) -> str:
-    return (
-        f"\n\n## Swarm protocol\n- Swarm root / shared blackboard: `{root_id}`.\n- Read "
-        f"sibling/parent handoffs from Kanban context before working.\n- Put machine-readable "
-        f"facts in completion metadata.\n- Put cross-worker notes on the root task using "
-        f"structured comments.\n- Goal: {goal.strip()}\n"
-    )
-
-
-def _activate_root_inline(
-    conn: sqlite3.Connection,
-    root_id: str,
-    *,
-    summary: str,
-    metadata: dict[str, Any],
-) -> bool:
-    """Inline blocked→done CAS flip + event insert for the swarm root.
-
-    Runs INSIDE create_swarm's write_txn, so it must not call
-    ``kb.complete_task`` (own transaction + post-commit side effects that
-    would run while the outer txn can still roll back). The caller runs
-    ``recompute_ready`` after the outer commit.
-    """
-    cur = conn.execute(
-        """
-        UPDATE tasks
-           SET status       = 'done',
-               completed_at = ?,
-               claim_lock   = NULL,
-               claim_expires= NULL,
-               worker_pid   = NULL
-         WHERE id = ?
-           AND status = 'blocked'
-        """,
-        (int(time.time()), root_id),
-    )
-    if cur.rowcount != 1:
-        return False
-    run_id = kb._synthesize_ended_run(conn, root_id, outcome="completed", summary=summary, metadata=metadata)
-    kb._append_event(
-        conn, root_id, "completed", {"result_len": 0, "summary": summary[:400] or None}, run_id=run_id,
-    )
-    return True
-
-
 def create_swarm(
     conn: sqlite3.Connection,
     *,
@@ -121,140 +78,109 @@ def create_swarm(
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
-    activation_summary = "Swarm topology planned; root remains the shared blackboard."
-    activated = False
-    with kb.write_txn(conn):
-        created = _create_swarm_uncommitted(
-            conn, goal=goal, workers=workers, verifier_assignee=verifier_assignee,
-            synthesizer_assignee=synthesizer_assignee, root_title=root_title,
-            verifier_title=verifier_title, synthesizer_title=synthesizer_title, tenant=tenant,
-            created_by=created_by, workspace_kind=workspace_kind, workspace_path=workspace_path,
-            priority=priority, idempotency_key=idempotency_key,
-        )
-        root = kb.get_task(conn, created.root_id)
-        if root is not None and root.status == "blocked":
-            if not _activate_root_inline(
-                conn,
-                created.root_id,
-                summary=activation_summary,
-                metadata={
-                    "kind": "kanban_swarm_v1",
-                    "goal": goal.strip(),
-                    "worker_count": len(created.worker_ids),
-                },
-            ):
-                raise RuntimeError("could not activate the completed swarm topology")
-            activated = True
-    if activated:
-        # After commit: recompute_ready opens its own txn and must never run
-        # under an open write_txn.
-        kb.recompute_ready(conn)
-        root = kb.get_task(conn, created.root_id)
-        run = kb.latest_run(conn, created.root_id)
-        kb._fire_kanban_lifecycle_hook(
-            "kanban_task_completed",
-            created.root_id,
-            board=kb.get_current_board(),
-            assignee=root.assignee if root else None,
-            run_id=run.id if run else None,
-            summary=activation_summary,
-        )
-    return created
-
-
-def _create_swarm_uncommitted(
-    conn: sqlite3.Connection, *, goal: str, workers: Iterable[SwarmWorkerSpec],
-    verifier_assignee: str, synthesizer_assignee: str, root_title: Optional[str],
-    verifier_title: str, synthesizer_title: str, tenant: Optional[str], created_by: str,
-    workspace_kind: Optional[str], workspace_path: Optional[str], priority: int, idempotency_key: Optional[str],
-) -> SwarmCreated:
-    """Create the swarm graph inside the caller's transaction: planning root
-    (``blocked`` until the caller activates it), parallel workers, a verifier
-    waiting on every worker, and a synthesizer waiting on the verifier."""
     goal = _require_text(goal, "goal")
     verifier_assignee = _require_text(verifier_assignee, "verifier_assignee")
     synthesizer_assignee = _require_text(synthesizer_assignee, "synthesizer_assignee")
     worker_specs = list(workers)
     if not worker_specs:
         raise ValueError("at least one worker is required")
-    for i, spec in enumerate(worker_specs, start=1):
-        _require_text(spec.profile, f"workers[{i}].profile")
-        _require_text(spec.title, f"workers[{i}].title")
+    for index, spec in enumerate(worker_specs, start=1):
+        _require_text(spec.profile, f"workers[{index}].profile")
+        _require_text(spec.title, f"workers[{index}].title")
 
-    common = dict(
-        created_by=created_by, tenant=tenant,
-        workspace_kind=workspace_kind, workspace_path=workspace_path,
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived' "
+            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+        ).fetchone()
+        if row:
+            existing = latest_blackboard(conn, row["id"]).get("topology")
+            if isinstance(existing, dict):
+                existing_workers = [str(item) for item in existing.get("worker_ids", []) if item]
+                if existing_workers and existing.get("verifier_id") and existing.get("synthesizer_id"):
+                    return SwarmCreated(
+                        row["id"], existing_workers, str(existing["verifier_id"]),
+                        str(existing["synthesizer_id"]),
+                    )
+
+    project_id = None
+    if workspace_kind != "scratch":
+        project_id = (kb._board_meta_for(None).get("project_id") or "").strip() or None
+    resolved_kind = workspace_kind or "scratch"
+    project_id, project_obj, project_repo, resolved_kind = kb._resolve_project_link(
+        conn, project_id, None, resolved_kind, workspace_path
     )
-    root = kb.create_task(
+    if workspace_path is None and project_repo is None and resolved_kind in {"dir", "worktree"}:
+        workspace_path = kb._board_meta_for(None).get("default_workdir") or None
+
+    root_id = kb._new_task_id()
+    worker_ids = tuple(kb._new_task_id() for _ in worker_specs)
+    verifier_id = kb._new_task_id()
+    synthesizer_id = kb._new_task_id()
+    all_ids = (root_id, *worker_ids, verifier_id, synthesizer_id)
+    paths: list[Optional[str]] = []
+    branches: list[Optional[str]] = []
+    for task_id in all_ids:
+        path = workspace_path
+        branch = None
+        if project_obj is not None and resolved_kind == "worktree":
+            if project_repo and not path:
+                path = str(Path(project_repo) / ".worktrees" / task_id)
+            branch = kb._project_branch_name(project_obj, task_id, root_title or goal)
+        paths.append(path)
+        branches.append(branch)
+
+    from hermes_cli.kanban_db_task_state import create_swarm_transition
+
+    operation_id = f"create-swarm:{root_id}:{secrets.token_hex(8)}"
+    outcome = create_swarm_transition(
         conn,
-        title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",
-        body="Kanban Swarm v1 planning/root card. This card is completed "
-             "immediately so parallel workers can start while it remains the "
-             f"shared blackboard and audit anchor.\n\nGoal:\n{goal}",
-        assignee=created_by,
+        actor_scope="legacy",
+        operation_id=operation_id,
+        root_id=root_id,
+        worker_ids=worker_ids,
+        verifier_id=verifier_id,
+        synthesizer_id=synthesizer_id,
+        goal=goal,
+        workers=tuple(
+            (
+                spec.profile, spec.title, spec.body or "", tuple(spec.skills),
+                spec.priority, spec.max_runtime_seconds,
+            )
+            for spec in worker_specs
+        ),
+        verifier_assignee=verifier_assignee,
+        synthesizer_assignee=synthesizer_assignee,
+        root_title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",
+        verifier_title=verifier_title,
+        synthesizer_title=synthesizer_title,
+        tenant=tenant,
+        created_by=created_by,
+        workspace_kind=resolved_kind,
+        workspace_paths=tuple(paths),
+        branch_names=tuple(branches),
+        project_id=project_id,
         priority=priority,
         idempotency_key=idempotency_key,
-        initial_status="blocked",
-        **common,
+        created_at=int(time.time()),
     )
-
-    # Idempotency may return an existing root: recover its topology from the
-    # blackboard instead of duplicating the graph.
-    existing = latest_blackboard(conn, root).get("topology")
-    if isinstance(existing, dict):
-        worker_ids = [str(x) for x in existing.get("worker_ids", []) if x]
-        verifier_id = existing.get("verifier_id")
-        synthesizer_id = existing.get("synthesizer_id")
-        if worker_ids and verifier_id and synthesizer_id:
-            return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
-
-    context_suffix = _swarm_context(root, goal)
-    worker_ids = [
-        kb.create_task(
-            conn,
-            title=spec.title,
-            body=(spec.body or "") + context_suffix,
-            assignee=spec.profile,
-            parents=[root],
-            priority=spec.priority or priority,
-            skills=spec.skills or None,
-            max_runtime_seconds=spec.max_runtime_seconds,
-            **common,
-        )
-        for spec in worker_specs
-    ]
-    verifier = kb.create_task(
-        conn,
-        title=verifier_title,
-        body=(
-            "Review every worker handoff and blackboard update. Gate the swarm: "
-            "complete only with metadata {\"gate\": \"pass\"} when evidence is "
-            "sufficient; otherwise block with exact missing work."
-            + context_suffix
-        ),
-        assignee=verifier_assignee,
-        parents=worker_ids,
-        priority=priority,
-        skills=["requesting-code-review"],
-        **common,
+    if not outcome.committed:
+        raise RuntimeError(outcome.refusal or "could not create swarm")
+    created = SwarmCreated(
+        outcome.root_id, list(outcome.worker_ids), outcome.verifier_id,
+        outcome.synthesizer_id,
     )
-    synthesizer = kb.create_task(
-        conn,
-        title=synthesizer_title,
-        body=(
-            "Synthesize the verified worker outputs into the final deliverable. "
-            "Do not start until the verifier has passed the gate."
-            + context_suffix
-        ),
-        assignee=synthesizer_assignee,
-        parents=[verifier],
-        priority=priority,
-        skills=["humanizer"],
-        **common,
+    kb.recompute_ready(conn)
+    root = kb.get_task(conn, created.root_id)
+    run = kb.latest_run(conn, created.root_id)
+    kb._fire_kanban_lifecycle_hook(
+        "kanban_task_completed",
+        created.root_id,
+        board=kb.get_current_board(),
+        assignee=root.assignee if root else None,
+        run_id=run.id if run else None,
+        summary="Swarm topology planned; root remains the shared blackboard.",
     )
-
-    created = SwarmCreated(root, worker_ids, verifier, synthesizer)
-    post_blackboard_update(conn, root, author=created_by, key="topology", value=created.as_dict() | {"goal": goal})
     return created
 
 

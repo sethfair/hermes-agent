@@ -31,6 +31,15 @@ LOSS_RECORD_WAIT_S = 10
 # _die_with_owner); on Windows it exits itself.
 # detached-spawn: ok — covered: the worker kills its own group when its owner dies (_die_with_owner)
 WORKER_POPEN = {'start_new_session': True, 'close_fds': True}
+_WORKER_ERROR_REASONS = frozenset({'managed_worker_failed', 'worker_receipt_timeout', 'managed_worker_pipe_closed'})
+
+
+def _worker_error_reason(frame):
+    """Return a bounded worker error token, or ``None`` for ordinary frames."""
+    if frame.get('type') != 'error':
+        return None
+    reason = frame.get('reason')
+    return reason if isinstance(reason, str) and reason in _WORKER_ERROR_REASONS else None
 
 
 class ManagedExecutionUnknown(RuntimeError):
@@ -742,8 +751,9 @@ async def execute_managed(authority, ref, row, policy):
             with authority.sessions[ref.session_id].event_stream.lock:
                 if _prompt_frame(authority, ref, row, worker, frame):
                     continue
-            if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
-                raise RuntimeStoreError('managed_worker_failed')
+            reason = _worker_error_reason(frame)
+            if reason is not None:
+                raise RuntimeStoreError(reason)
             kind = frame.get('type')
             if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
                 continue

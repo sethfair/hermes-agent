@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -513,7 +514,21 @@ def _projection_binding(
     )
 
 
-def commit_action(
+@contextlib.contextmanager
+def _action_write_transaction(conn: sqlite3.Connection):
+    from hermes_cli import kanban_db_connect as kbc
+
+    if (
+        conn.in_transaction
+        and kbc._protected_connection_operation(conn) == "authenticated_action"
+    ):
+        yield
+        return
+    with write_txn(conn):
+        yield
+
+
+def _commit_action_in_transaction(
     conn: sqlite3.Connection,
     request: ActionRequest,
     *,
@@ -521,7 +536,7 @@ def commit_action(
 ) -> ActionReceipt:
     """Commit one guarded transition, event, receipt, and optional projection."""
     try:
-        with write_txn(conn):
+        with _action_write_transaction(conn):
             context = validate_caller_context(
                 conn,
                 caller_context,
@@ -722,6 +737,43 @@ def commit_action(
             error=exc,
         )
         raise AssertionError("unreachable")
+
+
+def commit_action(
+    conn: sqlite3.Connection,
+    request: ActionRequest,
+    *,
+    caller_context: AuthenticatedCallerContext | None,
+) -> ActionReceipt:
+    """Commit an authenticated action and both receipt classes atomically."""
+    from hermes_cli import kanban_db_task_state as task_state
+
+    try:
+        outcome = task_state.authenticated_action_transition(
+            conn,
+            request,
+            caller_context=caller_context,
+        )
+    except TransactionOutcomeUnknown as exc:
+        raise ActionReceiptError("transaction_unknown") from exc
+    if not outcome.committed:
+        reason = (
+            "operation_conflict"
+            if outcome.refusal == "operation_id_collision"
+            else outcome.refusal or "storage_unavailable"
+        )
+        raise ActionReceiptError(reason)
+    if caller_context is None:
+        raise ActionReceiptError("unauthenticated_session")
+    receipt = lookup_action_receipt(
+        conn,
+        board=request.board,
+        operation_id=request.operation_id,
+        caller_context=caller_context,
+    )
+    if receipt is None:
+        raise ActionReceiptError("receipt_missing")
+    return receipt
 
 
 def _projection_from_json(raw: str | None) -> ProjectionBinding | None:

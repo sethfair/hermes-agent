@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -55,25 +57,13 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
     db_path = tmp_path / "kanban.db"
     writer = kbc.connect(db_path)
     reader = kbc.connect(db_path)
-    original_create = kb.create_task
-    calls = 0
-
-    def observed_create(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        task_id = original_create(*args, **kwargs)
-        if calls == 1:
-            # Releasing the nested create_task savepoint must not expose the
-            # root before the whole graph's outer transaction commits.
-            visible = reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-            assert visible == 0
-        if calls == 3:
-            raise RuntimeError("synthetic graph-construction failure")
-        return task_id
-
-    monkeypatch.setattr(kb, "create_task", observed_create)
     try:
-        with pytest.raises(RuntimeError, match="synthetic graph-construction failure"):
+        writer.execute(
+            "CREATE TRIGGER refuse_swarm_receipt BEFORE INSERT ON task_transition_receipts "
+            "WHEN NEW.operation_kind='create_swarm' "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic graph-construction failure'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic graph-construction failure"):
             create_swarm(
                 writer,
                 goal="Build atomically",
@@ -87,14 +77,13 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
         assert writer.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
-        monkeypatch.setattr(kb, "create_task", original_create)
-        import hermes_cli.kanban_swarm as ks
-
-        original_activate = ks._activate_root_inline
-        monkeypatch.setattr(
-            ks, "_activate_root_inline", lambda *args, **kwargs: False
+        writer.execute("DROP TRIGGER refuse_swarm_receipt")
+        writer.execute(
+            "CREATE TRIGGER refuse_swarm_activation BEFORE INSERT ON task_events "
+            "WHEN NEW.kind='completed' "
+            "BEGIN SELECT RAISE(ABORT, 'could not activate'); END"
         )
-        with pytest.raises(RuntimeError, match="could not activate"):
+        with pytest.raises(sqlite3.IntegrityError, match="could not activate"):
             create_swarm(
                 writer,
                 goal="Fail activation atomically",
@@ -107,8 +96,8 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
         assert writer.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
+        writer.execute("DROP TRIGGER refuse_swarm_activation")
         hooks: list[tuple[str, bool]] = []
-        monkeypatch.setattr(ks, "_activate_root_inline", original_activate)
         monkeypatch.setattr(
             kb,
             "_fire_kanban_lifecycle_hook",

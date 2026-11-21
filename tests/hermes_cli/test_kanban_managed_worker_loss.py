@@ -8,8 +8,8 @@ lost attempt:
   A1  a killed worker under a live claim is booked ``crashed`` within one tick;
   A2  an elapsed ``claim_expires`` never leaves the card ``running`` after one tick, even
       with no heartbeat and no pid (and even behind a settled owner receipt);
-  A3  every such booking increments ``consecutive_failures``, so ``kanban.failure_limit``
-      covers this outcome class and the card blocks at the limit.
+  A3  genuine worker failures increment ``consecutive_failures`` and block at the limit;
+      owner-recorded host losses preserve the budget and delay respawn.
 """
 
 from __future__ import annotations
@@ -222,7 +222,11 @@ def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape, error
     assert row["status"] == "ready"
     assert run["outcome"] == "reclaimed"
     assert error in run["error"]
-    assert row["consecutive_failures"] == 1
+    infrastructure = error == "owner admission settled interrupted"
+    assert row["consecutive_failures"] == (0 if infrastructure else 1)
+    assert bool(json.loads(run["metadata"] or "{}").get("infrastructure")) is infrastructure
+    if infrastructure:
+        assert kbd.check_respawn_guard(board.conn, "t_lapsed") == "infrastructure_cooldown"
 
 
 def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(board):
@@ -269,11 +273,13 @@ def _owner_policy(board, tid, run_id):
 
 
 @pytest.mark.asyncio
-async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_it(board):
+async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_it(board, monkeypatch):
     """Through the gateway's loss handler: a Stop, a superseded generation or a cancellation
     records nothing; a real loss leaves one worker_lost event that the next tick books."""
     import asyncio
-    from types import SimpleNamespace
+    import sys
+    from types import ModuleType, SimpleNamespace
+    monkeypatch.setitem(sys.modules, "hermes_bootstrap", ModuleType("hermes_bootstrap"))
     from gateway.session_managed_worker import _record_lost_attempt
     run_id = board.running("t_owner", claim_expires_in=900, heartbeat_age=30)
     policy = _owner_policy(board, "t_owner", run_id)

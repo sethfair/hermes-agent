@@ -997,6 +997,23 @@ def _cmd_block(args: argparse.Namespace) -> int:
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
+        subject = getattr(args, "subject", None)
+
+        def block_one(tid):
+            run_id = _worker_run_id_for(tid)
+            if subject is not None and str(subject).strip():
+                from hermes_cli.kanban_db_task_state import block_task_transition
+
+                return block_task_transition(
+                    conn, tid, actor_scope=author or "operator",
+                    operation_id=f"cli-block:{tid}:{run_id or 'manual'}",
+                    kind=kind, subject=subject, reason=reason,
+                    expected_run_id=run_id,
+                ).committed
+            return kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=run_id,
+            )
+
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
             landed = kb.get_task(conn, tid)
@@ -1012,8 +1029,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+        op = _commented(conn, reason, author, "BLOCKED", block_one)
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
 

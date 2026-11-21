@@ -852,10 +852,35 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        run_id = _worker_run_id(tid)
+        subject = args.get("subject")
+        if subject is not None:
+            _check(isinstance(subject, str) and subject.strip(),
+                   "subject must be a non-empty string when provided")
+            from hermes_cli.kanban_db_task_state import block_task_transition
+
+            outcome = block_task_transition(
+                conn,
+                tid,
+                actor_scope="kanban-tool",
+                operation_id=f"kanban-tool:block:{tid}:{run_id or 'manual'}",
+                reason=reason,
+                kind=kind,
+                subject=subject,
+                expected_run_id=run_id,
+            )
+            ok = outcome.committed
+        else:
+            ok = kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=run_id,
+            )
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        landed_kind = kb.get_task(conn, tid).block_kind
-        extra: dict = {"block_kind": landed_kind}
+        landed = kb.get_task(conn, tid)
+        landed_kind = landed.block_kind
+        extra: dict = {
+            "block_kind": landed_kind,
+            "block_identity_state": landed.block_identity_state,
+        }
         if kind == "dependency" and landed_kind != kind:
             # block_task re-kinds a dependency wait that no open parent can satisfy.
             extra["requested_kind"] = kind

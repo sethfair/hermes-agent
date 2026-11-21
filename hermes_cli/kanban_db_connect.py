@@ -9,18 +9,23 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import random
 import re
-import secrets
+
 import shutil
 import sqlite3
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from dataclasses import field
+from enum import Enum
 from agent.deadline import poll_until
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_pragmas import IntegerPragma, set_integer_pragma
+from hermes_cli.kanban_db_receipts_schema import DRIFT_TABLES, READY_CLAIM_TRIGGER_SQL
 from pathlib import Path
 from typing import Any
 from typing import Optional
@@ -56,23 +61,32 @@ def _resolve_busy_timeout_ms() -> int:
     return _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
 
 
-def _sqlite_connect(path: Path) -> sqlite3.Connection:
+def _sqlite_connect(
+    path: Path, *, cached_statements: int = 128, read_only: bool = False
+) -> sqlite3.Connection:
     """Open a Kanban SQLite connection via ``connect_tracked``: while registered,
     byte-level probes of the file are refused because an ``open()``/``close()``
     would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``)."""
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
+    target = path.resolve().as_uri() + "?mode=ro" if read_only else path
+    connect_kwargs = {
+        "isolation_level": None,
+        "timeout": busy_timeout_ms / 1000.0,
+        "cached_statements": cached_statements,
+    }
+    if read_only:
+        connect_kwargs["uri"] = True
     conn = connect_tracked(
-        path,
+        target,
         connect_fn=sqlite3.connect,
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
+        **connect_kwargs,
     )
     try:
         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
         # survives wrapper changes; PRAGMA assignments can't bind parameters.
-        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        set_integer_pragma(conn, IntegerPragma.BUSY_TIMEOUT, busy_timeout_ms)
     except BaseException:
         # A half-open connection would leak its fd AND leave a stale entry in the
         # connect_tracked registry (cleared only on close), permanently blocking
@@ -81,6 +95,367 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
             conn.close()
         raise
     return conn
+
+
+_PROTECTED_ORDINARY_TABLES = frozenset(
+    {
+        "tasks",
+        "task_links",
+        "task_events",
+        "task_runs",
+        "task_comments",
+        "task_attachments",
+        "task_transition_receipts",
+        "action_receipts",
+        "operation_keys",
+        "kanban_claim_admissions",
+        "kanban_writer_faults",
+    }
+)
+_SCHEMA_ACTIONS = frozenset(
+    action
+    for name in (
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_REINDEX",
+    )
+    if (action := getattr(sqlite3, name, None)) is not None
+)
+_CONTROL_ACTIONS = frozenset(
+    action
+    for name in ("SQLITE_TRANSACTION", "SQLITE_SAVEPOINT")
+    if (action := getattr(sqlite3, name, None)) is not None
+)
+
+
+def _ordinary_authorizer(action, table, argument, _db_name, _trigger):
+    if action in _SCHEMA_ACTIONS or action in _CONTROL_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA and argument is not None:
+        return sqlite3.SQLITE_DENY
+    if (
+        action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
+        and table in _PROTECTED_ORDINARY_TABLES
+    ):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+_RESULT_CURSORS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_FACADE_CONNECTIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+class OrdinaryRead(Enum):
+    """Closed read operations exposed by the not-yet-activated facade."""
+
+    ONE = "one"
+    ORDERED_VALUES = "ordered_values"
+    TASK_STATUS = "task_status"
+
+
+def _execute_ordinary_read(executor: Any, operation: OrdinaryRead, parameters: Any = ()):
+    if operation is OrdinaryRead.ONE:
+        return executor.execute("SELECT 1 AS value", parameters)
+    if operation is OrdinaryRead.ORDERED_VALUES:
+        return executor.execute(
+            "SELECT value FROM (SELECT 2 AS value UNION ALL SELECT 1) ORDER BY value",
+            parameters,
+        )
+    if operation is OrdinaryRead.TASK_STATUS:
+        return executor.execute("SELECT status FROM tasks WHERE id=?", parameters)
+    raise sqlite3.DatabaseError("not authorized")
+
+
+class KanbanResult:
+    """A SQLite result without a path back to its physical connection."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        _RESULT_CURSORS[self] = cursor
+
+    def __cursor(self) -> sqlite3.Cursor:
+        return _RESULT_CURSORS[self]
+
+    def _physical_cursor(self) -> sqlite3.Cursor:
+        return self.__cursor()
+
+    @property
+    def description(self):
+        return self.__cursor().description
+
+    @property
+    def lastrowid(self):
+        return self.__cursor().lastrowid
+
+    @property
+    def rowcount(self):
+        return self.__cursor().rowcount
+
+    def close(self) -> None:
+        self.__cursor().close()
+        _RESULT_CURSORS.pop(self, None)
+
+    def fetchone(self):
+        return self.__cursor().fetchone()
+
+    def fetchmany(self, size: Optional[int] = None):
+        cursor = self.__cursor()
+        return cursor.fetchmany() if size is None else cursor.fetchmany(size)
+
+    def fetchall(self):
+        return self.__cursor().fetchall()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.__cursor())
+
+class KanbanCursor(KanbanResult):
+    """A restricted cursor that returns only safe result wrappers."""
+
+    def execute(self, operation: Any, parameters=()) -> KanbanCursor:
+        _execute_ordinary_read(self._physical_cursor(), operation, parameters)
+        return self
+
+    def executemany(self, _operation: Any, _parameters: Any) -> KanbanCursor:
+        raise sqlite3.DatabaseError("not authorized")
+
+
+class KanbanConnection:
+    """Ordinary reusable Kanban access with permanently denied capabilities."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, path: str | Path, *, cached_statements: int = 128) -> None:
+        physical = _sqlite_connect(Path(path), cached_statements=cached_statements)
+        try:
+            physical.row_factory = sqlite3.Row
+            physical.text_factory = _kb._lossy_text
+            physical.set_authorizer(_ordinary_authorizer)
+        except BaseException:
+            physical.close()
+            raise
+        _FACADE_CONNECTIONS[self] = physical
+
+    def __physical(self) -> sqlite3.Connection:
+        return _FACADE_CONNECTIONS[self]
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.__physical().in_transaction
+
+    @property
+    def total_changes(self) -> int:
+        return self.__physical().total_changes
+
+    def close(self) -> None:
+        physical = _FACADE_CONNECTIONS.pop(self, None)
+        if physical is not None:
+            physical.close()
+
+    def cursor(self) -> KanbanCursor:
+        return KanbanCursor(self.__physical().cursor())
+
+    def execute(self, operation: Any, parameters=()) -> KanbanResult:
+        return KanbanResult(_execute_ordinary_read(self.__physical(), operation, parameters))
+
+    def executemany(self, _operation: Any, _parameters: Any) -> KanbanResult:
+        raise sqlite3.DatabaseError("not authorized")
+
+    def __enter__(self) -> KanbanConnection:
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+
+@contextlib.contextmanager
+def _ordinary_connection(path: str | Path, *, cached_statements: int = 128):
+    """Open the non-activated ordinary facade on an initialized board."""
+    facade = KanbanConnection(path, cached_statements=cached_statements)
+    try:
+        yield facade
+    finally:
+        facade.close()
+
+
+@contextlib.contextmanager
+def _migration_connection(path: str | Path):
+    """Open one fresh physical connection reserved for versioned migrations."""
+    conn = _sqlite_connect(Path(path), cached_statements=0)
+    conn.row_factory = sqlite3.Row
+    conn.text_factory = _kb._lossy_text
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def backup_database(source: str | Path, target: str | Path) -> None:
+    """Create a consistent snapshot while holding only read authority on source."""
+    source_conn = _sqlite_connect(Path(source), cached_statements=0, read_only=True)
+    try:
+        with _migration_connection(target) as target_conn:
+            source_conn.backup(target_conn)
+    finally:
+        source_conn.close()
+
+
+_PROTECTED_CONNECTION_OPERATIONS: dict[int, str] = {}
+
+
+def _protected_connection_operation(conn: sqlite3.Connection) -> str | None:
+    return _PROTECTED_CONNECTION_OPERATIONS.get(id(conn))
+
+
+@contextlib.contextmanager
+def _claim_connection(conn: sqlite3.Connection):
+    """Open a protected claim boundary, retaining in-memory compatibility."""
+    db_path = _main_db_file(conn)
+    if not db_path:
+        _migrate_add_optional_columns(conn)
+    connection = (
+        _protected_connection(db_path, operation="claim")
+        if db_path else contextlib.nullcontext(conn)
+    )
+    with connection as private:
+        nested = not db_path and private.in_transaction
+        if nested:
+            private.execute("SAVEPOINT protected_claim")
+        else:
+            _execute_boundary_with_retry(private, "BEGIN IMMEDIATE")
+        yield private, nested
+
+
+def _finish_claim_boundary(private: sqlite3.Connection, nested: bool) -> None:
+    if nested:
+        private.execute("RELEASE SAVEPOINT protected_claim")
+    else:
+        _execute_boundary_with_retry(private, "COMMIT")
+
+
+def _rollback_claim_boundary(private: sqlite3.Connection, nested: bool) -> None:
+    if nested:
+        private.execute("ROLLBACK TO SAVEPOINT protected_claim")
+        private.execute("RELEASE SAVEPOINT protected_claim")
+    else:
+        with contextlib.suppress(sqlite3.OperationalError):
+            private.rollback()
+
+
+@contextlib.contextmanager
+def _protected_connection(path: str | Path, *, operation: str):
+    """Yield a short-lived connection for one closed typed operation.
+
+    The connection is never returned to callers and is closed before the
+    operation outcome is delivered.  The authorizer is deliberately static;
+    ordinary connections cannot acquire this capability.
+    """
+    conn = _sqlite_connect(Path(path), cached_statements=0)
+    conn.row_factory = sqlite3.Row
+    conn.text_factory = _kb._lossy_text
+    _PROTECTED_CONNECTION_OPERATIONS[id(conn)] = operation
+
+    writable_tables = {
+        "block": {
+            "tasks", "task_runs", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "classify_block": {
+            "tasks", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "archive": {
+            "tasks", "task_runs", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "delete": {
+            "tasks", "task_links", "task_comments", "task_events", "task_runs",
+            "kanban_notify_subs", "task_attachments", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "claim": {
+            "tasks", "task_runs", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+            "kanban_ready_state", "kanban_ready_episodes",
+        },
+        "graph": {
+            "tasks", "task_links", "task_comments", "task_events",
+            "task_transition_receipts", "kanban_notify_subs", "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "create": {
+            "tasks", "task_runs", "task_links", "task_comments", "task_events",
+            "task_transition_receipts", "kanban_notify_subs", "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "lifecycle": {
+            "tasks", "task_runs", "task_events", "task_attachments",
+            "task_transition_receipts", "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "direct_status": {
+            "tasks", "task_runs", "task_comments", "task_events",
+            "task_transition_receipts", "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "edit_fields": {
+            "tasks", "task_events", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "recovery": {
+            "tasks", "task_runs", "task_events", "task_comments", "task_transition_receipts",
+            "kanban_claim_admissions", "kanban_writer_faults",
+        },
+        "authenticated_action": {
+            "tasks", "task_events", "task_comments", "action_receipts",
+            "operation_keys", "task_transition_receipts", "kanban_claim_admissions",
+            "kanban_writer_faults",
+        },
+    }.get(operation, set())
+    schema_actions = {
+        sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_VIEW,
+    }
+
+    def _authorize(action, table, _column, _db_name, _trigger):
+        safe_control_schema_read = (
+            action == sqlite3.SQLITE_PRAGMA
+            and table == "table_info"
+            and _column in {"kanban_dispatch_control", "kanban_dispatch_control_events"}
+        )
+        if action in schema_actions or (action == sqlite3.SQLITE_PRAGMA and not safe_control_schema_read):
+            return sqlite3.SQLITE_DENY
+        if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
+            return sqlite3.SQLITE_OK if table in writable_tables else sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(_authorize)
+    try:
+        yield conn
+    finally:
+        _PROTECTED_CONNECTION_OPERATIONS.pop(id(conn), None)
+        with contextlib.suppress(Exception):
+            conn.close()
 
 
 def _try_lock_nb(handle) -> bool:
@@ -465,13 +840,10 @@ def _attempt_index_reindex_repair(path: Path, index_names: list[str]) -> tuple[b
     except sqlite3.Error as exc:
         return False, [f"could not reopen for REINDEX: {exc}"]
     try:
-        try:
-            for name in index_names:
-                escaped = name.replace('"', '""')
-                conn.execute(f'REINDEX "{escaped}"')
-        except sqlite3.Error:
-            # Per-index rebuild failed — bare REINDEX rebuilds every index.
-            conn.execute("REINDEX")
+        # Every reported name is already known to be index-only corruption.
+        # Bare REINDEX avoids interpolating identifiers and rebuilds the same
+        # affected indexes plus any healthy peers before the mandatory recheck.
+        conn.execute("REINDEX")
         messages = _run_integrity_check(conn)
     except sqlite3.Error as exc:
         return False, [f"REINDEX failed: {exc}"]
@@ -867,7 +1239,7 @@ _RENAMED_TASK_COLUMNS = (
         "consecutive_failures", "consecutive_failures INTEGER NOT NULL DEFAULT 0",
         "spawn_failures", "UPDATE tasks SET consecutive_failures = COALESCE(spawn_failures, 0)",
     ),
-    ("worker_pid", "worker_pid INTEGER", None, None),
+    ("worker_pid", "worker_pid INTEGER", "", ""),
     (
         "last_failure_error", "last_failure_error TEXT",
         "last_spawn_error", "UPDATE tasks SET last_failure_error = last_spawn_error",
@@ -898,6 +1270,8 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    ("block_identity", "block_identity TEXT"),
+    ("block_identity_state", "block_identity_state TEXT NOT NULL DEFAULT 'none'"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
     # Default-inert fencing state for authenticated action receipts.
@@ -918,19 +1292,33 @@ _NOTIFY_SUB_COLUMNS = (
 )
 
 _TASK_RUN_COLUMNS = (
+    # Keep drifted pre-AUTOINCREMENT tables copyable through a fixed, typed
+    # rebuild operation. These are nullable additive columns in the canonical
+    # schema, so adding an absent column preserves every legacy row.
+    ("step_key", "step_key TEXT"),
+    ("claim_lock", "claim_lock TEXT"),
+    ("claim_expires", "claim_expires INTEGER"),
+    ("worker_pid", "worker_pid INTEGER"),
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
+    ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
+    ("ended_at", "ended_at INTEGER"),
+    ("outcome", "outcome TEXT"),
+    ("summary", "summary TEXT"),
+    ("metadata", "metadata TEXT"),
+    ("error", "error TEXT"),
 )
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    return {row["name"] for row in conn.execute("SELECT name FROM pragma_table_info(?)", (table,))}
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute(
-        f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
     ).fetchone() is not None
 
 
@@ -1003,11 +1391,13 @@ def _migrate_add_optional_columns(
     for name, ddl, legacy, copy_sql in _RENAMED_TASK_COLUMNS:
         if name not in cols:
             added = _add_column_if_missing(conn, "tasks", name, ddl)
-            if added and legacy is not None and legacy in cols:
+            if added and legacy and legacy in cols:
                 conn.execute(copy_sql)
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
+
+    _migrate_legacy_block_identity(conn)
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
@@ -1062,6 +1452,92 @@ def _migrate_add_optional_columns(
 
     _rebuild_drifted_tables(conn)
     _install_action_receipt_guards(conn)
+
+    _migrate_storage_version_fences(conn)
+
+
+def _migrate_storage_version_fences(conn: sqlite3.Connection) -> None:
+    """Add operation/tuple version columns without changing legacy rows."""
+    for table, columns in {
+        "operation_keys": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
+                            ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1")),
+        "action_receipts": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
+                            ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1")),
+        "task_transition_receipts": (("operation_version", "operation_version INTEGER NOT NULL DEFAULT 1"),
+                                     ("tuple_version", "tuple_version INTEGER NOT NULL DEFAULT 1"),
+                                     ("result_tuple_hash", "result_tuple_hash TEXT"),
+                                     ("result_identity_state", "result_identity_state TEXT")),
+    }.items():
+        if not _table_exists(conn, table):
+            continue
+        present = _column_names(conn, table)
+        for name, ddl in columns:
+            if name not in present:
+                _add_column_if_missing(conn, table, name, ddl)
+
+
+def _migrate_legacy_block_identity(conn: sqlite3.Connection) -> None:
+    """Classify legacy blocker evidence conservatively and idempotently.
+
+    Historical prose is never promoted to a known identity.  Rows with a
+    blocker-shaped status, recurrence, or malformed event evidence become
+    UNKNOWN; ordinary graph-only dependency waits remain ``none``.  A single
+    redacted migration event per task makes the decision auditable without
+    copying historical reason text into the new identity fields.
+    """
+    if not _table_exists(conn, "tasks") or not _table_exists(conn, "task_events"):
+        return
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kanban_storage_migrations "
+        "(name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)"
+    )
+    if conn.execute(
+        "SELECT 1 FROM kanban_storage_migrations WHERE name = 'block_identity_v1'"
+    ).fetchone():
+        return
+    rows = conn.execute(
+        "SELECT id, status, block_kind, block_recurrences, block_identity_state "
+        "FROM tasks"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        state = row["block_identity_state"] or "none"
+        malformed = False
+        for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ?", (task_id,)
+        ):
+            payload = event["payload"]
+            if payload:
+                try:
+                    json.loads(payload)
+                except (TypeError, ValueError):
+                    malformed = True
+                    break
+        unknown = state == "unknown" or malformed or row["status"] == "blocked" \
+            or row["block_kind"] is not None or int(row["block_recurrences"] or 0) > 0
+        target = "unknown" if unknown else "none"
+        if target != state:
+            conn.execute(
+                "UPDATE tasks SET block_identity = NULL, block_identity_state = ? WHERE id = ?",
+                (target, task_id),
+            )
+        event_kind = "block_identity_unknown" if target == "unknown" else "block_identity_migrated"
+        exists = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, event_kind),
+        ).fetchone()
+        if exists is None:
+            payload = {"identity_state": target, "source": "legacy_migration"}
+            if target == "unknown":
+                payload["unknown_cause"] = "legacy_evidence"
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, event_kind, json.dumps(payload, sort_keys=True), int(time.time())),
+            )
+    conn.execute(
+        "INSERT INTO kanban_storage_migrations (name, applied_at) VALUES ('block_identity_v1', ?)",
+        (int(time.time()),),
+    )
 
 
 def _install_action_receipt_guards(conn: sqlite3.Connection) -> None:
@@ -1236,7 +1712,7 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     write_txn serializes against concurrent dispatchers, and the per-row
     UPDATE uses ``current_run_id IS NULL`` as a CAS guard so a racing claim
     can't produce an orphaned row."""
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         inflight = conn.execute(
             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
             "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -1279,68 +1755,9 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
                 )
 
 
-# Legacy DBs used a ``TEXT PRIMARY KEY`` id (nullable ``TEXT last_event_id``
-# for ``kanban_notify_subs``); the additive migrations can't change a column
-# type, so drift requires a rebuild. Each entry pairs the canonical CREATE
-# TABLE with the indexes DROP TABLE takes down with it.
-# ``test_rebuilt_schema_matches_fresh`` guards this against SCHEMA_SQL drift.
-# The current schema uses ``INTEGER PRIMARY KEY AUTOINCREMENT`` / ``INTEGER NOT NULL DEFAULT 0``. ``CREATE
-# TABLE IF NOT EXISTS`` skips existing tables regardless of schema and ``_add_column_if_missing`` only adds
-# columns, so neither can fix a drifted column type — the table must be rebuilt. See #35096. Each entry
-# pairs the canonical CREATE TABLE with the CREATE INDEX statements that DROP TABLE would otherwise take
-# down with it (including ``idx_events_run``, added by the additive pass above). To guard against this list
-# drifting from SCHEMA_SQL, ``test_rebuilt_schema_matches_fresh`` asserts a rebuilt legacy DB is
-# byte-identical to a fresh one.
-_REBUILD_SPECS = {
-    "task_events": (
-        "CREATE TABLE task_events ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, created_at INTEGER NOT NULL)",
-        (
-            "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
-            "CREATE INDEX idx_events_run ON task_events(run_id, id)",
-        ),
-    ),
-    "task_comments": (
-        "CREATE TABLE task_comments ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)",
-        ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
-    ),
-    "task_runs": (
-        "CREATE TABLE task_runs ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
-        " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
-        " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
-        " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
-        (
-            "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
-            "CREATE INDEX idx_runs_status ON task_runs(status)",
-        ),
-    ),
-    "kanban_notify_subs": (
-        "CREATE TABLE kanban_notify_subs ("
-        " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
-        " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT,"
-        " chat_type TEXT,"
-        " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
-        " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
-        " last_ping_event_id INTEGER NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
-        ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
-    ),
-}
-
-
 def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     """True when ``table`` still carries the legacy (pre-AUTOINCREMENT) shape."""
-    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    info = conn.execute("SELECT name,type,pk FROM pragma_table_info(?)", (table,)).fetchall()
     if not info:
         return False  # table absent — nothing to rebuild
     if table == "kanban_notify_subs":
@@ -1366,41 +1783,85 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     Each affected table is rebuilt with the standard SQLite pattern — CREATE new → INSERT shared columns →
     DROP old → RENAME — recreating its indexes too (DROP TABLE takes them down). See #35096.
     """
-    drifted = [t for t in _REBUILD_SPECS if _table_has_drifted(conn, t)]
+    drifted = [t for t in DRIFT_TABLES if _table_has_drifted(conn, t)]
     if not drifted:
         return
 
-    trigger = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='kanban_ready_claim_admission'"
-    ).fetchone()
+    had_ready_claim_trigger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='kanban_ready_claim_admission'"
+    ).fetchone() is not None
     conn.execute("BEGIN IMMEDIATE")
     try:
-        if trigger and trigger[0]:
+        if had_ready_claim_trigger:
             conn.execute("DROP TRIGGER kanban_ready_claim_admission")
         for table in drifted:
-            create_sql, index_sqls = _REBUILD_SPECS[table]
-            old_cols = [c["name"] for c in conn.execute(f"PRAGMA table_info({table})")]
             _kb._log.info("kanban migration: rebuilding %s to match current schema", table)
-            conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
-            conn.execute(create_sql)
-            new_cols = _column_names(conn, table)
-            if table == "kanban_notify_subs":
-                # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
-                drop, extra_cols = "last_event_id", ", last_event_id"
-                extra_select = ", COALESCE(CAST(last_event_id AS INTEGER), 0)"
-            else:
-                # Drop the legacy TEXT id; AUTOINCREMENT reassigns it.
-                drop, extra_cols, extra_select = "id", "", ""
-            cols_csv = ", ".join(c for c in old_cols if c in new_cols and c != drop)
-            conn.execute(
-                f"INSERT INTO {table} ({cols_csv}{extra_cols}) "
-                f"SELECT {cols_csv}{extra_select} FROM {table}_legacy"
-            )
-            conn.execute(f"DROP TABLE {table}_legacy")
-            for index_sql in index_sqls:
-                conn.execute(index_sql)
-        if trigger and trigger[0]:
-            conn.execute(trigger[0])
+            if table == "task_events":  # health: allow HX011 -- each branch owns fixed migration SQL.
+                conn.execute("ALTER TABLE task_events RENAME TO task_events_legacy")
+                conn.execute(
+                    "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL, payload TEXT, "
+                    "created_at INTEGER NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "SELECT task_id, run_id, kind, payload, created_at FROM task_events_legacy"
+                )
+                conn.execute("DROP TABLE task_events_legacy")
+                conn.execute("CREATE INDEX idx_events_task ON task_events(task_id, created_at)")
+                conn.execute("CREATE INDEX idx_events_run ON task_events(run_id, id)")
+            elif table == "task_comments":
+                conn.execute("ALTER TABLE task_comments RENAME TO task_comments_legacy")
+                conn.execute(
+                    "CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL, "
+                    "created_at INTEGER NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "SELECT task_id, author, body, created_at FROM task_comments_legacy"
+                )
+                conn.execute("DROP TABLE task_comments_legacy")
+                conn.execute("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)")
+            elif table == "task_runs":
+                conn.execute("ALTER TABLE task_runs RENAME TO task_runs_legacy")
+                conn.execute(
+                    "CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+                    "profile TEXT, step_key TEXT, status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER, "
+                    "worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER, "
+                    "last_heartbeat_at INTEGER, started_at INTEGER NOT NULL, ended_at INTEGER, outcome TEXT, "
+                    "summary TEXT, metadata TEXT, error TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, step_key, status, claim_lock, claim_expires, "
+                    "worker_pid, worker_started_at, max_runtime_seconds, last_heartbeat_at, started_at, ended_at, "
+                    "outcome, summary, metadata, error) SELECT task_id, profile, step_key, status, claim_lock, "
+                    "claim_expires, worker_pid, worker_started_at, max_runtime_seconds, last_heartbeat_at, "
+                    "started_at, ended_at, outcome, summary, metadata, error FROM task_runs_legacy"
+                )
+                conn.execute("DROP TABLE task_runs_legacy")
+                conn.execute("CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)")
+                conn.execute("CREATE INDEX idx_runs_status ON task_runs(status)")
+            elif table == "kanban_notify_subs":
+                conn.execute("ALTER TABLE kanban_notify_subs RENAME TO kanban_notify_subs_legacy")
+                conn.execute(
+                    "CREATE TABLE kanban_notify_subs (task_id TEXT NOT NULL, platform TEXT NOT NULL, "
+                    "chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT, "
+                    "chat_type TEXT, notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify', "
+                    "delivery_metadata TEXT, created_at INTEGER NOT NULL, last_event_id INTEGER NOT NULL DEFAULT 0, "
+                    "last_ping_event_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (task_id, platform, chat_id, thread_id))"
+                )
+                conn.execute(
+                    "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, user_id, user_id_alt, "
+                    "chat_type, notifier_profile, delivery_mode, delivery_metadata, created_at, last_event_id, "
+                    "last_ping_event_id) SELECT task_id, platform, chat_id, thread_id, user_id, user_id_alt, "
+                    "chat_type, notifier_profile, delivery_mode, delivery_metadata, created_at, "
+                    "COALESCE(CAST(last_event_id AS INTEGER), 0), last_ping_event_id FROM kanban_notify_subs_legacy"
+                )
+                conn.execute("DROP TABLE kanban_notify_subs_legacy")
+                conn.execute("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)")
+        if had_ready_claim_trigger:
+            conn.execute(READY_CLAIM_TRIGGER_SQL)
         conn.execute("COMMIT")
     except Exception:
         with contextlib.suppress(sqlite3.OperationalError):
@@ -1496,17 +1957,16 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 "(savepoint semantics; the inner RELEASE is not durable until "
                 "the outer transaction commits)."
             )
-        savepoint = f"hermes_nested_{secrets.token_hex(8)}"
-        conn.execute(f"SAVEPOINT {savepoint}")
+        conn.execute("SAVEPOINT hermes_nested")
         try:
             yield conn
         except Exception:
             with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute(f"ROLLBACK TO {savepoint}")
-                conn.execute(f"RELEASE {savepoint}")
+                conn.execute("ROLLBACK TO hermes_nested")
+                conn.execute("RELEASE hermes_nested")
             raise
         else:
-            conn.execute(f"RELEASE {savepoint}")
+            conn.execute("RELEASE hermes_nested")
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
