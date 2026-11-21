@@ -34,7 +34,7 @@ class _EnvReads:
     """Records which thread each ``load_env_file`` call ran on."""
 
     def __init__(self, monkeypatch, before=None):
-        import agent.secret_scope as secret_scope
+        from agent import secret_scope
 
         self.threads = []
         real = secret_scope.load_env_file
