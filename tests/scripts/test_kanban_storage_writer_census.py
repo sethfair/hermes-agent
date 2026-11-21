@@ -186,7 +186,7 @@ def test_finite_branches_and_cte_dml_are_all_inventoried(tmp_path):
     repo = _repo(tmp_path, {
         "app/writers.py": """
 def write(conn, replace):
-    sql = ("WITH chosen AS (SELECT 1) UPDATE tasks SET status='blocked'"
+    sql = ("WITH chosen AS (SELECT 1) UPDATE tasks SET status='blocked'" 
            if replace else 'InSeRt Or RePlAcE INTO "task_events" (task_id) VALUES (?)')
     conn.execute(sql)
 """,
