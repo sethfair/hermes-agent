@@ -326,6 +326,56 @@ def get_default_hermes_root(*, home: str | Path | None = None) -> Path:
     return result
 
 
+def _in_kanban_disposable_tree(parts: list[str]) -> bool:
+    """True when *parts* (normcased components below the native home) sit in a disposable tree.
+
+    The trees are a home's ``cache`` (``cache`` or ``profiles/<name>/cache``, where ``<name>``
+    does not start with ``.``; TMPDIR and ``get_scratch_dir()`` live there) and the Kanban
+    scratch workspaces (``kanban/workspaces`` or ``kanban/boards/<slug>/workspaces``).
+    """
+    cache, profiles, kanban = (os.path.normcase(n) for n in ("cache", "profiles", "kanban"))
+    workspaces, boards = os.path.normcase("workspaces"), os.path.normcase("boards")
+    if parts[:1] == [cache]:
+        return True
+    if len(parts) >= 3 and parts[0] == profiles and not parts[1].startswith(".") and parts[2] == cache:
+        return True
+    if parts[:2] == [kanban, workspaces]:
+        return True
+    return len(parts) >= 4 and parts[:2] == [kanban, boards] and parts[3] == workspaces
+
+
+def kanban_probe_root_of(native_home: Path, env_path: Path | None) -> Path | None:
+    """The Kanban root of a probe home in a disposable tree of *native_home*, else None.
+
+    A probe home (a throwaway ``HERMES_HOME`` in a home's ``cache`` or a Kanban scratch
+    workspace, matched by whole path components) keeps its own board instead of the live
+    one (t_b525b742). None means "not recognised": the caller keeps the shared root from
+    ``get_default_hermes_root()``, so a miss can only reproduce the old behaviour. The
+    returned root is the unresolved *env_path* in its custom-root form.
+    """
+    if env_path is None:
+        return None
+    try:
+        resolved = env_path.resolve(strict=False)
+        native = native_home.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    native_parts = [os.path.normcase(p) for p in native.parts]
+    parts = [os.path.normcase(p) for p in resolved.parts]
+    if parts[: len(native_parts)] != native_parts:
+        return None
+    if not _in_kanban_disposable_tree(parts[len(native_parts):]):
+        return None
+    return env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+
+
+def kanban_probe_root() -> Path | None:
+    """``kanban_probe_root_of`` for this process's ``HERMES_HOME``, read as ``get_default_hermes_root``."""
+    env_home = os.environ.get("HERMES_HOME", "").strip()
+    env_path = _expand_hermes_home(env_home) if env_home else None
+    return kanban_probe_root_of(_get_platform_default_hermes_home(), env_path)
+
+
 # Tombstone lives beside the profile dir (not inside) so a stale mkdir or rmtree cannot erase it.
 _DELETED_PROFILES_DIR = ".deleted"
 # Files marking a real Hermes home; arbitrary dirs with a ``profiles`` segment lack them.

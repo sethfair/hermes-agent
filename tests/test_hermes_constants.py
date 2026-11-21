@@ -667,3 +667,115 @@ def test_is_launch_only_env_key_folds_case(name):
 @pytest.mark.parametrize("name", ["HERMES_MANAGED_DIRX", "HERMES_HOMEDIR", "PATH", ""])
 def test_is_launch_only_env_key_rejects_other_names(name):
     assert not hermes_constants.is_launch_only_env_key(name)
+
+
+class TestKanbanProbeRoot:
+    """``kanban_probe_root()``: a home inside a disposable tree of the native root keeps its own
+    Kanban root (t_b525b742). The disposable trees are a home's ``cache`` and the Kanban scratch
+    workspaces, matched by whole path components. Every other home returns None, so
+    ``kanban_home()`` keeps today's shared root, and ``get_default_hermes_root()`` is unchanged
+    for every input (the pins below pass before and after the fix)."""
+
+    # (case id, HERMES_HOME relative to native or a special form, expected probe root relative
+    # to native or None, expected get_default_hermes_root()).
+    # Special HERMES_HOME forms: None = unset, "@elsewhere" = a home outside native,
+    # "@link-profile" / "@link-probe" = symlinks, a "/" suffix and whitespace are literal text.
+    CASES = [
+        # probe homes: their own root
+        ("incident", "profiles/p/cache/scratch/h", "profiles/p/cache/scratch/h", "native"),
+        ("shallow-cache", "cache/h", "cache/h", "native"),
+        ("cache-scratch", "cache/scratch/h", "cache/scratch/h", "native"),
+        ("kanban-workspace", "kanban/workspaces/t_x/home", "kanban/workspaces/t_x/home", "native"),
+        ("board-workspace", "kanban/boards/b/workspaces/t_x/home",
+         "kanban/boards/b/workspaces/t_x/home", "native"),
+        ("probe-profile-slot", "profiles/p/cache/scratch/x/profiles/q",
+         "profiles/p/cache/scratch/x", "native"),
+        ("whitespace-padded-probe", "  profiles/p/cache/scratch/h\t\n",
+         "profiles/p/cache/scratch/h", "native"),
+        # real or unrecognised homes: None, so kanban_home() keeps the shared root
+        ("native", "", None, "native"),
+        ("profile", "profiles/p", None, "native"),
+        ("profile-trailing-slash", "profiles/p/", None, "native"),
+        ("whitespace-padded-profile", "  profiles/p  ", None, "native"),
+        ("profiles-dir", "profiles", None, "native"),
+        ("work", "work", None, "native"),
+        ("custom-home", "custom-home", None, "native"),
+        ("loose", "loose", None, "native"),
+        ("nested-under-profile", "profiles/work/nested", None, "native"),  # three deep, not a probe
+        ("hidden-slot", "profiles/.hidden", None, "native"),
+        ("hidden-slot-cache", "profiles/.hidden/cache/h", None, "native"),  # not a profile slot
+        ("cachex", "profiles/p/cachex/h", None, "native"),
+        ("board-dir", "kanban/boards/b", None, "native"),
+        ("workspaces2", "kanban/workspaces2/h", None, "native"),
+        ("outside-native", "@elsewhere", None, "elsewhere"),
+        ("unset", None, None, "native"),
+        ("blank", "   ", None, "native"),
+    ]
+    LINUX_CASES = [
+        ("symlink-to-profile", "@link-profile", None, "native"),
+        ("symlink-to-probe", "@link-probe", "@link-probe", "native"),  # the link, unresolved
+    ]
+
+    @pytest.fixture
+    def native(self, tmp_path, monkeypatch):
+        native = tmp_path / "native" / ".hermes"
+        (native / "profiles" / "p" / "cache" / "scratch" / "h").mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: native)
+        monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+        return native
+
+    @staticmethod
+    def _apply(native, tmp_path, monkeypatch, home, probe, default):
+        specials = {
+            "@elsewhere": tmp_path / "elsewhere" / ".hermes",
+            "@link-profile": tmp_path / "link-to-profile",
+            "@link-probe": tmp_path / "link-to-probe",
+        }
+        if home == "@link-profile":
+            specials[home].symlink_to(native / "profiles" / "p")
+        elif home == "@link-probe":
+            specials[home].symlink_to(native / "profiles" / "p" / "cache" / "scratch" / "h")
+        if home is None:
+            monkeypatch.delenv("HERMES_HOME", raising=False)
+        elif home in specials:
+            monkeypatch.setenv("HERMES_HOME", str(specials[home]))
+        elif home == "":
+            monkeypatch.setenv("HERMES_HOME", str(native))
+        elif not home.strip():
+            monkeypatch.setenv("HERMES_HOME", home)  # blank stays blank
+        else:
+            core = home.strip()
+            path = str(native / core) + ("/" if core.endswith("/") else "")  # Path drops a "/"
+            lead = home[: len(home) - len(home.lstrip())]
+            trail = home[len(home.rstrip()):]
+            monkeypatch.setenv("HERMES_HOME", f"{lead}{path}{trail}")
+        expected_probe = None if probe is None else specials.get(probe, native / probe)
+        expected_default = native if default == "native" else specials["@elsewhere"]
+        return expected_probe, expected_default
+
+    @pytest.mark.parametrize("case,home,probe,default", CASES, ids=[c[0] for c in CASES])
+    def test_default_root_is_unchanged(self, native, tmp_path, monkeypatch, case, home, probe, default):
+        _, expected_default = self._apply(native, tmp_path, monkeypatch, home, probe, default)
+        assert get_default_hermes_root() == expected_default
+
+    @pytest.mark.parametrize("case,home,probe,default", CASES, ids=[c[0] for c in CASES])
+    def test_kanban_probe_root(self, native, tmp_path, monkeypatch, case, home, probe, default):
+        expected_probe, _ = self._apply(native, tmp_path, monkeypatch, home, probe, default)
+        assert hermes_constants.kanban_probe_root() == expected_probe
+
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("case,home,probe,default", LINUX_CASES, ids=[c[0] for c in LINUX_CASES])
+    def test_default_root_is_unchanged_for_symlinks(self, native, tmp_path, monkeypatch, case, home,
+                                                    probe, default):
+        _, expected_default = self._apply(native, tmp_path, monkeypatch, home, probe, default)
+        assert get_default_hermes_root() == expected_default
+
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("case,home,probe,default", LINUX_CASES, ids=[c[0] for c in LINUX_CASES])
+    def test_kanban_probe_root_for_symlinks(self, native, tmp_path, monkeypatch, case, home, probe,
+                                            default):
+        expected_probe, _ = self._apply(native, tmp_path, monkeypatch, home, probe, default)
+        assert hermes_constants.kanban_probe_root() == expected_probe
+
+    def test_pure_function_without_a_home_is_not_a_probe(self, native):
+        assert hermes_constants.kanban_probe_root_of(native, None) is None

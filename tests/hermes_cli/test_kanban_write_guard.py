@@ -45,3 +45,22 @@ def test_connect_raises_for_explicit_db_path_under_real_root():
 
     with pytest.raises(RuntimeError, match="kanban_write_guard"):
         kbc.connect(_conftest._REAL_KANBAN_ROOT / "kanban.db")
+
+
+@pytest.mark.parametrize("write", [
+    lambda: kanban_db.write_board_metadata("one", name="One"),
+    lambda: kanban_db.create_board("one"),
+])
+def test_board_metadata_write_under_real_root_is_refused(write, tmp_path, monkeypatch):
+    """``board.json`` writes are refused too, not only DB connects (t_b525b742).
+
+    A temp dir plays the real root, so a RED run cannot touch ``~/.hermes``.
+    """
+    import tests.conftest as _conftest
+
+    fake_real = tmp_path / "real-root"
+    monkeypatch.setattr(_conftest, "_REAL_KANBAN_ROOT", fake_real.resolve())
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(fake_real))
+    with pytest.raises(RuntimeError, match="kanban_write_guard"):
+        write()
+    assert not (fake_real / "kanban" / "boards" / "one" / "board.json").exists()

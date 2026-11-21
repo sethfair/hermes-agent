@@ -379,14 +379,14 @@ def _require_slug(slug: str) -> str:
 
 
 def kanban_home() -> Path:
-    """``HERMES_KANBAN_HOME`` else ``get_default_hermes_root()``. Shared across
-    profiles BY DESIGN: resolving through the active profile's HERMES_HOME would
-    fork the board per profile and break the dispatcher/worker handoff."""
+    """Share real homes' board; isolate cache/workspace probes to prevent live writes.
+    Override wins; other nested homes retain the default root (see ``kanban_probe_root``)."""
     override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
     if override:
         return Path(override).expanduser()
-    from hermes_constants import get_default_hermes_root
-    return get_default_hermes_root()
+    from hermes_constants import get_default_hermes_root, kanban_probe_root
+    probe = kanban_probe_root()
+    return probe if probe is not None else get_default_hermes_root()
 
 
 def boards_root() -> Path:

@@ -217,6 +217,109 @@ class TestCurrentBoard:
 
 
 # ---------------------------------------------------------------------------
+# Probe homes inside a disposable tree of the native root
+# ---------------------------------------------------------------------------
+
+class TestScratchProbeHome:
+    """A standalone probe with ``HERMES_HOME=<native>/profiles/<p>/cache/scratch/h``
+    wrote boards ``one``/``two``/``source``/``renamed``/``metadata-only`` into the
+    live ``~/.hermes/kanban/boards`` (t_b525b742). Here a temp dir stands in for
+    the native root and its ``kanban`` dir is the write guard's "real" root, so
+    neither the old behaviour nor the fix can reach the operator's ``~/.hermes``.
+
+    Only homes in a home's ``cache`` or the Kanban scratch workspaces get their own
+    board; every other nested home keeps sharing the native board."""
+
+    @pytest.fixture
+    def probe(self, tmp_path, monkeypatch):
+        import hermes_constants
+        import tests.conftest as _conftest
+
+        native = tmp_path / "native" / ".hermes"
+        deep = native / "profiles" / "p" / "cache" / "scratch" / "h"
+        ws = native / "kanban" / "workspaces" / "t_probe" / "home"
+        deep.mkdir(parents=True)
+        ws.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: native)
+        monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+        monkeypatch.setattr(_conftest, "_REAL_KANBAN_ROOT", (native / "kanban").resolve())
+        monkeypatch.setenv("HERMES_HOME", str(deep))
+        for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT",
+                    "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_HOME",
+                    "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
+                    "HERMES_DELEGATED_CHILD_CONTEXT"):
+            monkeypatch.delenv(var, raising=False)
+        kb._INITIALIZED_PATHS.clear()
+        return native, deep, ws
+
+    def test_probe_home_board_stays_in_probe_home(self, probe):
+        native, deep, _ws = probe
+        assert kb.kanban_home() == deep
+        assert kb.boards_root() == deep / "kanban" / "boards"
+        assert kb.kanban_db_path() == deep / "kanban.db"
+        kb.create_board("one")
+        assert (deep / "kanban" / "boards" / "one" / "board.json").is_file()
+        assert (deep / "kanban" / "boards" / "one" / "kanban.db").is_file()
+        # The fixture's workspace probe home lives under native/kanban/workspaces, so the
+        # native kanban dir exists; its boards dir and the native default DB must not.
+        assert not (native / "kanban" / "boards").exists()
+        assert not (native / "kanban.db").exists()
+
+    def test_workspace_probe_home_board_stays_in_probe_home(self, probe, monkeypatch):
+        import tests.conftest as _conftest
+
+        native, _deep, ws = probe
+        # This probe home is itself under <native>/kanban, so the guard's "real" root moves
+        # down to the live boards dir: a write into the live boards is still refused.
+        monkeypatch.setattr(_conftest, "_REAL_KANBAN_ROOT", (native / "kanban" / "boards").resolve())
+        monkeypatch.setenv("HERMES_HOME", str(ws))
+        assert kb.kanban_home() == ws
+        assert kb.boards_root() == ws / "kanban" / "boards"
+        assert kb.kanban_db_path() == ws / "kanban.db"
+        kb.create_board("two")
+        assert (ws / "kanban" / "boards" / "two" / "board.json").is_file()
+        assert (ws / "kanban" / "boards" / "two" / "kanban.db").is_file()
+        assert not (native / "kanban" / "boards").exists()
+
+    def test_fenced_child_in_a_probe_home_is_still_refused(self, probe, monkeypatch):
+        native, deep, _ws = probe
+        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(native))
+        with pytest.raises(PermissionError, match="cannot mutate Kanban"):
+            kb.create_board("three")
+        assert not (deep / "kanban").exists()
+        assert not (native / "kanban" / "boards").exists()
+
+    def test_kanban_home_override_still_wins(self, probe, tmp_path, monkeypatch):
+        native, deep, _ws = probe
+        shared = tmp_path / "shared"
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(shared))
+        assert kb.kanban_home() == shared
+        kb.create_board("four")
+        assert (shared / "kanban" / "boards" / "four" / "board.json").is_file()
+        assert not (deep / "kanban").exists()
+        assert not (native / "kanban" / "boards").exists()
+        assert not (native / "kanban.db").exists()
+
+    def test_real_profile_homes_still_share_the_native_board(self, probe, tmp_path, monkeypatch):
+        native, _deep, _ws = probe
+        homes = [str(native), str(native / "profiles" / "p"), str(native / "profiles" / "p") + "/"]
+        if sys.platform.startswith("linux"):
+            link = tmp_path / "link-to-profile"
+            link.symlink_to(native / "profiles" / "p")
+            homes.append(str(link))
+        for home in homes:
+            monkeypatch.setenv("HERMES_HOME", home)
+            assert kb.kanban_home() == native, home
+            assert kb.boards_root() == native / "kanban" / "boards", home
+
+    @pytest.mark.parametrize("rel", ["work", "loose", "profiles/work/nested", "profiles/.hidden"])
+    def test_nested_non_probe_homes_still_share_the_native_board(self, probe, monkeypatch, rel):
+        native, _deep, _ws = probe
+        monkeypatch.setenv("HERMES_HOME", str(native / rel))
+        assert kb.kanban_home() == native
+
+
+# ---------------------------------------------------------------------------
 # Board CRUD
 # ---------------------------------------------------------------------------
 
