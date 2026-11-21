@@ -386,22 +386,14 @@ def _require_slug(slug: str) -> str:
 
 
 def kanban_home() -> Path:
-    """``HERMES_KANBAN_HOME``, else a probe home's own root, else ``get_default_hermes_root()``.
-
-    Shared across real homes BY DESIGN: resolving through the active profile's HERMES_HOME
-    would fork the board per profile and break the dispatcher/worker handoff. The one
-    exception is a probe home in a disposable tree (a home's ``cache`` or a Kanban scratch
-    workspace, see ``hermes_constants.kanban_probe_root``): it keeps its own board so a
-    throwaway script cannot write into the live boards (t_b525b742). Any other nested home
-    still shares the native board."""
+    """Share real homes' board; isolate cache/workspace probes to prevent live writes.
+    Override wins; other nested homes retain the default root (see ``kanban_probe_root``)."""
     override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
     if override:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root, kanban_probe_root
     probe = kanban_probe_root()
-    if probe is not None:
-        return probe
-    return get_default_hermes_root()
+    return probe if probe is not None else get_default_hermes_root()
 
 
 def boards_root() -> Path:
